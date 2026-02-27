@@ -421,7 +421,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::process::Command;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use async_imap::Client;
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -434,7 +434,9 @@ mod tests {
     use tokio_rustls::TlsConnector;
 
     use super::{
-        append, fetch_raw_message, list_all_mailboxes, noop, select_mailbox_readonly, uid_search,
+        append, fetch_flags, fetch_raw_message, list_all_mailboxes, noop, select_mailbox_readonly,
+        select_mailbox_readwrite, socket_timeout, uid_copy, uid_expunge, uid_move, uid_search,
+        uid_store,
     };
     use crate::config::{AccountConfig, ServerConfig};
 
@@ -655,6 +657,27 @@ mod tests {
         ))
     }
 
+    async fn create_mailbox_if_missing(
+        config: &ServerConfig,
+        session: &mut super::ImapSession,
+        mailbox: &str,
+    ) -> Result<(), String> {
+        let result = timeout(socket_timeout(config), session.create(mailbox))
+            .await
+            .map_err(|_| format!("CREATE timed out for mailbox '{mailbox}'"))?;
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                if msg.contains("exists") || msg.contains("already") {
+                    Ok(())
+                } else {
+                    Err(format!("CREATE failed for mailbox '{mailbox}': {e}"))
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn greenmail_imap_smoke_test() {
         if std::env::var("RUN_GREENMAIL_TESTS").as_deref() != Ok("1") {
@@ -728,6 +751,151 @@ mod tests {
         assert!(
             raw_text.contains("Subject: Greenmail test"),
             "fetched raw message should contain appended subject"
+        );
+    }
+
+    #[tokio::test]
+    async fn greenmail_imap_write_paths_test() {
+        if std::env::var("RUN_GREENMAIL_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+
+        let external = std::env::var("GREENMAIL_EXTERNAL").as_deref() == Ok("1");
+        let _container = if external {
+            None
+        } else {
+            if !docker_available() {
+                panic!("RUN_GREENMAIL_TESTS=1 but docker is unavailable");
+            }
+            Some(GreenmailContainer::start().expect("failed to start greenmail container"))
+        };
+
+        let config = greenmail_test_config();
+        wait_until_login_works(&config)
+            .await
+            .expect("greenmail did not become ready");
+
+        let account = config
+            .get_account("default")
+            .expect("default account must exist");
+        let mut session = connect_authenticated_greenmail(&config, account)
+            .await
+            .expect("imap login should work");
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be monotonic enough for test")
+            .as_nanos();
+        let subject = format!("Greenmail write path {nonce}");
+        let destination_mailbox = format!("INBOX.greenmail_{nonce}");
+
+        let message = format!(
+            "From: sender@example.com\r\nTo: user@example.com\r\nSubject: {subject}\r\n\r\nWrite-path body\r\n"
+        );
+        append(&config, &mut session, "INBOX", message.as_bytes())
+            .await
+            .expect("APPEND should succeed");
+
+        select_mailbox_readwrite(&config, &mut session, "INBOX")
+            .await
+            .expect("INBOX should be selectable read-write");
+        let source_uids = uid_search(&config, &mut session, &format!("SUBJECT \"{subject}\""))
+            .await
+            .expect("UID SEARCH by SUBJECT should succeed");
+        assert_eq!(source_uids.len(), 1, "expected exactly one source message");
+        let source_uid = source_uids[0];
+
+        uid_store(&config, &mut session, source_uid, "+FLAGS.SILENT (\\Seen)")
+            .await
+            .expect("UID STORE should set \\Seen flag");
+        let flags = fetch_flags(&config, &mut session, source_uid)
+            .await
+            .expect("fetch_flags should succeed after UID STORE");
+        assert!(
+            flags.iter().any(|f| f == "\\Seen"),
+            "expected \\Seen in flags after UID STORE"
+        );
+
+        create_mailbox_if_missing(&config, &mut session, &destination_mailbox)
+            .await
+            .expect("CREATE destination mailbox should succeed");
+
+        uid_copy(&config, &mut session, source_uid, &destination_mailbox)
+            .await
+            .expect("UID COPY should succeed");
+
+        select_mailbox_readonly(&config, &mut session, &destination_mailbox)
+            .await
+            .expect("destination mailbox should be selectable");
+        let copied_uids = uid_search(&config, &mut session, &format!("SUBJECT \"{subject}\""))
+            .await
+            .expect("UID SEARCH in destination should succeed");
+        assert_eq!(
+            copied_uids.len(),
+            1,
+            "expected one copied message in destination mailbox"
+        );
+
+        select_mailbox_readwrite(&config, &mut session, "INBOX")
+            .await
+            .expect("INBOX should be selectable read-write for move");
+        uid_move(&config, &mut session, source_uid, &destination_mailbox)
+            .await
+            .expect("UID MOVE should succeed");
+
+        select_mailbox_readonly(&config, &mut session, "INBOX")
+            .await
+            .expect("INBOX should be selectable readonly after move");
+        let remaining_in_source =
+            uid_search(&config, &mut session, &format!("SUBJECT \"{subject}\""))
+                .await
+                .expect("UID SEARCH in source after move should succeed");
+        assert!(
+            remaining_in_source.is_empty(),
+            "expected no source messages after UID MOVE"
+        );
+
+        select_mailbox_readwrite(&config, &mut session, &destination_mailbox)
+            .await
+            .expect("destination mailbox should be selectable read-write");
+        let moved_and_copied = uid_search(&config, &mut session, &format!("SUBJECT \"{subject}\""))
+            .await
+            .expect("UID SEARCH in destination after move should succeed");
+        assert_eq!(
+            moved_and_copied.len(),
+            2,
+            "expected two messages in destination after copy+move"
+        );
+
+        let uid_to_delete = moved_and_copied[0];
+        uid_store(
+            &config,
+            &mut session,
+            uid_to_delete,
+            "+FLAGS.SILENT (\\Deleted)",
+        )
+        .await
+        .expect("UID STORE should set \\Deleted flag");
+        uid_expunge(&config, &mut session, uid_to_delete)
+            .await
+            .expect("UID EXPUNGE should remove deleted message");
+
+        let after_delete = uid_search(&config, &mut session, &format!("SUBJECT \"{subject}\""))
+            .await
+            .expect("UID SEARCH after delete should succeed");
+        assert_eq!(
+            after_delete.len(),
+            1,
+            "expected one message remaining after delete"
+        );
+
+        let raw = fetch_raw_message(&config, &mut session, after_delete[0])
+            .await
+            .expect("remaining message should be fetchable");
+        let raw_text = String::from_utf8_lossy(&raw);
+        assert!(
+            raw_text.contains(&subject),
+            "remaining message should contain test subject"
         );
     }
 }
