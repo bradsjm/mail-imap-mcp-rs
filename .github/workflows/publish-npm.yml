@@ -68,7 +68,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: npm-bin-${{ matrix.build.PKG_KEY }}
-          path: artifact/${{ matrix.build.PKG_KEY }}
+          path: artifact
 
   publish-npm:
     name: Publish @bradsjm/mail-imap-mcp-rs
