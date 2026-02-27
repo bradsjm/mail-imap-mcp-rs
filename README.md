@@ -47,12 +47,6 @@ curl --proto '=https' --tlsv1.2 -LsSf -o mail-imap-mcp-rs-installer.sh https://g
 sh mail-imap-mcp-rs-installer.sh
 ```
 
-Install location defaults to `~/.local/bin`. Override with:
-
-```bash
-INSTALL_DIR="$HOME/bin" sh mail-imap-mcp-rs-installer.sh --version v0.1.0
-```
-
 ### Using Docker
 
 Pull prebuilt multi-arch image from GHCR:
