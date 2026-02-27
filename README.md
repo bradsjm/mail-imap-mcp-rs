@@ -208,6 +208,8 @@ Search messages with cursor-based pagination.
 - `unread_only`: Boolean filter
 - `last_days`: Integer 1..365
 - `start_date`, `end_date`: ISO 8601 dates (`YYYY-MM-DD`)
+- Search text and mailbox values must not contain ASCII control characters.
+- Searches matching more than 20,000 messages are rejected; narrow filters and retry.
 
 **Pagination**: Use `next_cursor` from response to fetch next page.
 
@@ -416,6 +418,14 @@ Error: invalid input: cursor is invalid or expired
 ```
 
 Rerun the search without a cursor to get a fresh result set.
+
+### Search Too Broad
+
+```
+Error: invalid input: search matched <n> messages; narrow filters to at most 20000 results
+```
+
+Add tighter filters (`last_days`, `from`, `subject`, dates, etc.) and rerun.
 
 ### Mailbox Snapshot Changed
 

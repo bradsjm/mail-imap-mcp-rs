@@ -29,6 +29,8 @@ use crate::pagination::{CursorEntry, CursorStore};
 const MAX_SEARCH_LIMIT: usize = 50;
 /// Maximum attachments to return per message
 const MAX_ATTACHMENTS: usize = 50;
+/// Maximum UID search results stored in a cursor snapshot
+const MAX_CURSOR_UIDS_STORED: usize = 20_000;
 
 /// IMAP MCP server
 ///
@@ -79,11 +81,10 @@ impl MailImapServer {
                 secure: a.secure,
             })
             .collect::<Vec<_>>();
-        Ok(Json(ToolEnvelope {
-            summary: format!("{} account(s) configured", data.len()),
-            data,
-            meta: Meta::now(duration_ms(started)),
-        }))
+        finalize_tool(
+            started,
+            Ok((format!("{} account(s) configured", data.len()), data)),
+        )
     }
 
     /// Tool: Verify account connectivity and capabilities
@@ -99,15 +100,12 @@ impl MailImapServer {
         Parameters(input): Parameters<AccountOnlyInput>,
     ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
         let started = Instant::now();
-        let result = self.verify_account_impl(input).await;
-        match result {
-            Ok(data) => Ok(Json(ToolEnvelope {
-                summary: "Account verification succeeded".to_owned(),
-                data,
-                meta: Meta::now(duration_ms(started)),
-            })),
-            Err(e) => Err(e.to_error_data()),
-        }
+        finalize_tool(
+            started,
+            self.verify_account_impl(input)
+                .await
+                .map(|data| ("Account verification succeeded".to_owned(), data)),
+        )
     }
 
     /// Tool: List mailboxes for an account
@@ -122,18 +120,18 @@ impl MailImapServer {
         Parameters(input): Parameters<AccountOnlyInput>,
     ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
         let started = Instant::now();
-        let result = self.list_mailboxes_impl(input).await;
-        match result {
-            Ok(data) => Ok(Json(ToolEnvelope {
-                summary: format!(
-                    "{} mailbox(es)",
-                    data["mailboxes"].as_array().map_or(0, Vec::len)
-                ),
-                data,
-                meta: Meta::now(duration_ms(started)),
-            })),
-            Err(e) => Err(e.to_error_data()),
-        }
+        finalize_tool(
+            started,
+            self.list_mailboxes_impl(input).await.map(|data| {
+                (
+                    format!(
+                        "{} mailbox(es)",
+                        data["mailboxes"].as_array().map_or(0, Vec::len)
+                    ),
+                    data,
+                )
+            }),
+        )
     }
 
     /// Tool: Search messages with cursor pagination
@@ -150,17 +148,13 @@ impl MailImapServer {
         Parameters(input): Parameters<SearchMessagesInput>,
     ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
         let started = Instant::now();
-        let result = self.search_messages_impl(input).await;
-        match result {
-            Ok(data) => Ok(Json(ToolEnvelope {
-                summary: format!("{} message(s) returned", data.messages.len()),
-                data: serde_json::to_value(data).map_err(|e| {
-                    AppError::Internal(format!("serialization failure: {e}")).to_error_data()
-                })?,
-                meta: Meta::now(duration_ms(started)),
-            })),
-            Err(e) => Err(e.to_error_data()),
-        }
+        let result = self.search_messages_impl(input).await.and_then(|data| {
+            let summary = format!("{} message(s) returned", data.messages.len());
+            let serialized = serde_json::to_value(data)
+                .map_err(|e| AppError::Internal(format!("serialization failure: {e}")))?;
+            Ok((summary, serialized))
+        });
+        finalize_tool(started, result)
     }
 
     /// Tool: Get parsed message details
@@ -173,15 +167,12 @@ impl MailImapServer {
         Parameters(input): Parameters<GetMessageInput>,
     ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
         let started = Instant::now();
-        let result = self.get_message_impl(input).await;
-        match result {
-            Ok(data) => Ok(Json(ToolEnvelope {
-                summary: "Message retrieved".to_owned(),
-                data,
-                meta: Meta::now(duration_ms(started)),
-            })),
-            Err(e) => Err(e.to_error_data()),
-        }
+        finalize_tool(
+            started,
+            self.get_message_impl(input)
+                .await
+                .map(|data| ("Message retrieved".to_owned(), data)),
+        )
     }
 
     /// Tool: Get bounded RFC822 message source
@@ -197,15 +188,12 @@ impl MailImapServer {
         Parameters(input): Parameters<GetMessageRawInput>,
     ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
         let started = Instant::now();
-        let result = self.get_message_raw_impl(input).await;
-        match result {
-            Ok(data) => Ok(Json(ToolEnvelope {
-                summary: "Raw message retrieved".to_owned(),
-                data,
-                meta: Meta::now(duration_ms(started)),
-            })),
-            Err(e) => Err(e.to_error_data()),
-        }
+        finalize_tool(
+            started,
+            self.get_message_raw_impl(input)
+                .await
+                .map(|data| ("Raw message retrieved".to_owned(), data)),
+        )
     }
 
     /// Tool: Add or remove IMAP flags
@@ -221,15 +209,12 @@ impl MailImapServer {
         Parameters(input): Parameters<UpdateMessageFlagsInput>,
     ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
         let started = Instant::now();
-        let result = self.update_flags_impl(input).await;
-        match result {
-            Ok(data) => Ok(Json(ToolEnvelope {
-                summary: "Flags updated".to_owned(),
-                data,
-                meta: Meta::now(duration_ms(started)),
-            })),
-            Err(e) => Err(e.to_error_data()),
-        }
+        finalize_tool(
+            started,
+            self.update_flags_impl(input)
+                .await
+                .map(|data| ("Flags updated".to_owned(), data)),
+        )
     }
 
     /// Tool: Copy message to mailbox
@@ -242,15 +227,12 @@ impl MailImapServer {
         Parameters(input): Parameters<CopyMessageInput>,
     ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
         let started = Instant::now();
-        let result = self.copy_message_impl(input).await;
-        match result {
-            Ok(data) => Ok(Json(ToolEnvelope {
-                summary: "Message copied".to_owned(),
-                data,
-                meta: Meta::now(duration_ms(started)),
-            })),
-            Err(e) => Err(e.to_error_data()),
-        }
+        finalize_tool(
+            started,
+            self.copy_message_impl(input)
+                .await
+                .map(|data| ("Message copied".to_owned(), data)),
+        )
     }
 
     /// Tool: Move message to mailbox
@@ -264,15 +246,12 @@ impl MailImapServer {
         Parameters(input): Parameters<MoveMessageInput>,
     ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
         let started = Instant::now();
-        let result = self.move_message_impl(input).await;
-        match result {
-            Ok(data) => Ok(Json(ToolEnvelope {
-                summary: "Message moved".to_owned(),
-                data,
-                meta: Meta::now(duration_ms(started)),
-            })),
-            Err(e) => Err(e.to_error_data()),
-        }
+        finalize_tool(
+            started,
+            self.move_message_impl(input)
+                .await
+                .map(|data| ("Message moved".to_owned(), data)),
+        )
     }
 
     /// Tool: Delete message from mailbox
@@ -285,15 +264,12 @@ impl MailImapServer {
         Parameters(input): Parameters<DeleteMessageInput>,
     ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
         let started = Instant::now();
-        let result = self.delete_message_impl(input).await;
-        match result {
-            Ok(data) => Ok(Json(ToolEnvelope {
-                summary: "Message deleted".to_owned(),
-                data,
-                meta: Meta::now(duration_ms(started)),
-            })),
-            Err(e) => Err(e.to_error_data()),
-        }
+        finalize_tool(
+            started,
+            self.delete_message_impl(input)
+                .await
+                .map(|data| ("Message deleted".to_owned(), data)),
+        )
     }
 }
 
@@ -385,38 +361,19 @@ impl MailImapServer {
         let uidvalidity =
             imap::select_mailbox_readonly(&self.config, &mut session, &input.mailbox).await?;
 
-        let uids_desc: Vec<u32>;
-        let mut offset = 0usize;
-        let include_snippet: bool;
-        let snippet_max_chars: usize;
-        let cursor_id_from_request = input.cursor.clone();
-
-        if let Some(cursor) = input.cursor {
-            let mut store = self.cursors.lock().await;
-            let entry = store
-                .get(&cursor)
-                .ok_or_else(|| AppError::InvalidInput("cursor is invalid or expired".to_owned()))?;
-            if entry.account_id != input.account_id || entry.mailbox != input.mailbox {
-                return Err(AppError::InvalidInput(
-                    "cursor does not match account/mailbox".to_owned(),
-                ));
-            }
-            if entry.uidvalidity != uidvalidity {
-                store.delete(&cursor);
-                return Err(AppError::Conflict(
-                    "mailbox snapshot changed; rerun search".to_owned(),
-                ));
-            }
-            uids_desc = entry.uids_desc;
-            offset = entry.offset;
-            include_snippet = entry.include_snippet;
-            snippet_max_chars = entry.snippet_max_chars;
+        let snapshot = if let Some(cursor) = input.cursor.clone() {
+            resume_cursor_search(&self.cursors, &input, uidvalidity, cursor).await?
         } else {
-            let query = build_search_query(&input)?;
-            uids_desc = imap::uid_search(&self.config, &mut session, &query).await?;
-            include_snippet = input.include_snippet;
-            snippet_max_chars = input.snippet_max_chars.unwrap_or(200).clamp(50, 500);
-        }
+            start_new_search(&self.config, &mut session, &input).await?
+        };
+
+        let SearchSnapshot {
+            uids_desc,
+            offset,
+            include_snippet,
+            snippet_max_chars,
+            cursor_id_from_request,
+        } = snapshot;
 
         let total = uids_desc.len();
         if offset > total {
@@ -433,49 +390,19 @@ impl MailImapServer {
             .copied()
             .collect::<Vec<_>>();
 
-        let mut messages = Vec::with_capacity(page_uids.len());
-        for uid in page_uids {
-            let (header_bytes, flags) =
-                imap::fetch_headers_and_flags(&self.config, &mut session, uid).await?;
-            let headers = mime::parse_header_bytes(&header_bytes)?;
-            let date = header_value(&headers, "date");
-            let from = header_value(&headers, "from");
-            let subject = header_value(&headers, "subject");
-
-            let snippet = if include_snippet {
-                subject
-                    .clone()
-                    .map(|s| mime::truncate_chars(s, snippet_max_chars))
-            } else {
-                None
-            };
-
-            let message_id = MessageId {
-                account_id: input.account_id.clone(),
-                mailbox: input.mailbox.clone(),
+        let messages = build_message_summaries(
+            &self.config,
+            &mut session,
+            &page_uids,
+            SummaryBuildOptions {
+                account_id: &input.account_id,
+                mailbox: &input.mailbox,
                 uidvalidity,
-                uid,
-            }
-            .encode();
-            let message_uri =
-                build_message_uri(&input.account_id, &input.mailbox, uidvalidity, uid);
-            let message_raw_uri =
-                build_message_raw_uri(&input.account_id, &input.mailbox, uidvalidity, uid);
-
-            messages.push(MessageSummary {
-                message_id,
-                message_uri,
-                message_raw_uri,
-                mailbox: input.mailbox.clone(),
-                uidvalidity,
-                uid,
-                date,
-                from,
-                subject,
-                flags: Some(flags),
-                snippet,
-            });
-        }
+                include_snippet,
+                snippet_max_chars,
+            },
+        )
+        .await?;
 
         let next_offset = offset + messages.len();
         let has_more = next_offset < total;
@@ -531,22 +458,11 @@ impl MailImapServer {
             "attachment_text_max_chars",
         )?;
 
-        let msg_id = MessageId::parse(&input.message_id)?;
-        if msg_id.account_id != input.account_id {
-            return Err(AppError::InvalidInput(
-                "message_id account does not match account_id".to_owned(),
-            ));
-        }
+        let msg_id = parse_and_validate_message_id(&input.account_id, &input.message_id)?;
 
         let account = self.config.get_account(&input.account_id)?;
         let mut session = imap::connect_authenticated(&self.config, account).await?;
-        let current_uidvalidity =
-            imap::select_mailbox_readonly(&self.config, &mut session, &msg_id.mailbox).await?;
-        if current_uidvalidity != msg_id.uidvalidity {
-            return Err(AppError::Conflict(
-                "message uidvalidity no longer matches mailbox".to_owned(),
-            ));
-        }
+        ensure_uidvalidity_matches_readonly(&self.config, &mut session, &msg_id).await?;
 
         let raw = imap::fetch_raw_message(&self.config, &mut session, msg_id.uid).await?;
         let parsed = mime::parse_message(
@@ -614,22 +530,11 @@ impl MailImapServer {
         validate_account_id(&input.account_id)?;
         validate_chars(input.max_bytes, 1_024, 1_000_000, "max_bytes")?;
 
-        let msg_id = MessageId::parse(&input.message_id)?;
-        if msg_id.account_id != input.account_id {
-            return Err(AppError::InvalidInput(
-                "message_id account does not match account_id".to_owned(),
-            ));
-        }
+        let msg_id = parse_and_validate_message_id(&input.account_id, &input.message_id)?;
 
         let account = self.config.get_account(&input.account_id)?;
         let mut session = imap::connect_authenticated(&self.config, account).await?;
-        let current_uidvalidity =
-            imap::select_mailbox_readonly(&self.config, &mut session, &msg_id.mailbox).await?;
-        if current_uidvalidity != msg_id.uidvalidity {
-            return Err(AppError::Conflict(
-                "message uidvalidity no longer matches mailbox".to_owned(),
-            ));
-        }
+        ensure_uidvalidity_matches_readonly(&self.config, &mut session, &msg_id).await?;
 
         let raw = imap::fetch_raw_message(&self.config, &mut session, msg_id.uid).await?;
         if raw.len() > input.max_bytes {
@@ -662,23 +567,14 @@ impl MailImapServer {
                 "at least one of add_flags/remove_flags is required".to_owned(),
             ));
         }
+        validate_flags(&add_flags, "add_flags")?;
+        validate_flags(&remove_flags, "remove_flags")?;
 
-        let msg_id = MessageId::parse(&input.message_id)?;
-        if msg_id.account_id != input.account_id {
-            return Err(AppError::InvalidInput(
-                "message_id account does not match account_id".to_owned(),
-            ));
-        }
+        let msg_id = parse_and_validate_message_id(&input.account_id, &input.message_id)?;
 
         let account = self.config.get_account(&input.account_id)?;
         let mut session = imap::connect_authenticated(&self.config, account).await?;
-        let current_uidvalidity =
-            imap::select_mailbox_readwrite(&self.config, &mut session, &msg_id.mailbox).await?;
-        if current_uidvalidity != msg_id.uidvalidity {
-            return Err(AppError::Conflict(
-                "message uidvalidity no longer matches mailbox".to_owned(),
-            ));
-        }
+        ensure_uidvalidity_matches_readwrite(&self.config, &mut session, &msg_id).await?;
 
         if !add_flags.is_empty() {
             imap::uid_store(
@@ -717,23 +613,12 @@ impl MailImapServer {
             .unwrap_or_else(|| input.account_id.clone());
         validate_account_id(&destination_account_id)?;
 
-        let msg_id = MessageId::parse(&input.message_id)?;
-        if msg_id.account_id != input.account_id {
-            return Err(AppError::InvalidInput(
-                "message_id account does not match account_id".to_owned(),
-            ));
-        }
+        let msg_id = parse_and_validate_message_id(&input.account_id, &input.message_id)?;
 
         if destination_account_id == input.account_id {
             let account = self.config.get_account(&input.account_id)?;
             let mut session = imap::connect_authenticated(&self.config, account).await?;
-            let current_uidvalidity =
-                imap::select_mailbox_readwrite(&self.config, &mut session, &msg_id.mailbox).await?;
-            if current_uidvalidity != msg_id.uidvalidity {
-                return Err(AppError::Conflict(
-                    "message uidvalidity no longer matches mailbox".to_owned(),
-                ));
-            }
+            ensure_uidvalidity_matches_readwrite(&self.config, &mut session, &msg_id).await?;
             imap::uid_copy(
                 &self.config,
                 &mut session,
@@ -744,14 +629,7 @@ impl MailImapServer {
         } else {
             let source = self.config.get_account(&input.account_id)?;
             let mut source_session = imap::connect_authenticated(&self.config, source).await?;
-            let current_uidvalidity =
-                imap::select_mailbox_readonly(&self.config, &mut source_session, &msg_id.mailbox)
-                    .await?;
-            if current_uidvalidity != msg_id.uidvalidity {
-                return Err(AppError::Conflict(
-                    "message uidvalidity no longer matches mailbox".to_owned(),
-                ));
-            }
+            ensure_uidvalidity_matches_readonly(&self.config, &mut source_session, &msg_id).await?;
             let raw =
                 imap::fetch_raw_message(&self.config, &mut source_session, msg_id.uid).await?;
 
@@ -782,22 +660,11 @@ impl MailImapServer {
         validate_account_id(&input.account_id)?;
         validate_mailbox(&input.destination_mailbox)?;
 
-        let msg_id = MessageId::parse(&input.message_id)?;
-        if msg_id.account_id != input.account_id {
-            return Err(AppError::InvalidInput(
-                "message_id account does not match account_id".to_owned(),
-            ));
-        }
+        let msg_id = parse_and_validate_message_id(&input.account_id, &input.message_id)?;
 
         let account = self.config.get_account(&input.account_id)?;
         let mut session = imap::connect_authenticated(&self.config, account).await?;
-        let current_uidvalidity =
-            imap::select_mailbox_readwrite(&self.config, &mut session, &msg_id.mailbox).await?;
-        if current_uidvalidity != msg_id.uidvalidity {
-            return Err(AppError::Conflict(
-                "message uidvalidity no longer matches mailbox".to_owned(),
-            ));
-        }
+        ensure_uidvalidity_matches_readwrite(&self.config, &mut session, &msg_id).await?;
 
         let caps = imap::capabilities(&self.config, &mut session).await?;
         if caps.has_str("MOVE") {
@@ -844,22 +711,11 @@ impl MailImapServer {
             ));
         }
 
-        let msg_id = MessageId::parse(&input.message_id)?;
-        if msg_id.account_id != input.account_id {
-            return Err(AppError::InvalidInput(
-                "message_id account does not match account_id".to_owned(),
-            ));
-        }
+        let msg_id = parse_and_validate_message_id(&input.account_id, &input.message_id)?;
 
         let account = self.config.get_account(&input.account_id)?;
         let mut session = imap::connect_authenticated(&self.config, account).await?;
-        let current_uidvalidity =
-            imap::select_mailbox_readwrite(&self.config, &mut session, &msg_id.mailbox).await?;
-        if current_uidvalidity != msg_id.uidvalidity {
-            return Err(AppError::Conflict(
-                "message uidvalidity no longer matches mailbox".to_owned(),
-            ));
-        }
+        ensure_uidvalidity_matches_readwrite(&self.config, &mut session, &msg_id).await?;
 
         imap::uid_store(
             &self.config,
@@ -881,6 +737,197 @@ impl MailImapServer {
 /// Calculate elapsed milliseconds
 fn duration_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+/// Build a standardized MCP tool response envelope from business logic output
+fn finalize_tool<T>(
+    started: Instant,
+    result: AppResult<(String, T)>,
+) -> Result<Json<ToolEnvelope<T>>, ErrorData>
+where
+    T: schemars::JsonSchema,
+{
+    match result {
+        Ok((summary, data)) => Ok(Json(ToolEnvelope {
+            summary,
+            data,
+            meta: Meta::now(duration_ms(started)),
+        })),
+        Err(e) => Err(e.to_error_data()),
+    }
+}
+
+/// Parse message_id, validate mailbox, and enforce account_id match.
+fn parse_and_validate_message_id(account_id: &str, message_id: &str) -> AppResult<MessageId> {
+    let msg_id = MessageId::parse(message_id)?;
+    validate_mailbox(&msg_id.mailbox)?;
+    if msg_id.account_id != account_id {
+        return Err(AppError::InvalidInput(
+            "message_id account does not match account_id".to_owned(),
+        ));
+    }
+    Ok(msg_id)
+}
+
+/// Select mailbox readonly and ensure uidvalidity still matches message_id.
+async fn ensure_uidvalidity_matches_readonly(
+    config: &ServerConfig,
+    session: &mut imap::ImapSession,
+    msg_id: &MessageId,
+) -> AppResult<()> {
+    let current_uidvalidity =
+        imap::select_mailbox_readonly(config, session, &msg_id.mailbox).await?;
+    if current_uidvalidity != msg_id.uidvalidity {
+        return Err(AppError::Conflict(
+            "message uidvalidity no longer matches mailbox".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Select mailbox readwrite and ensure uidvalidity still matches message_id.
+async fn ensure_uidvalidity_matches_readwrite(
+    config: &ServerConfig,
+    session: &mut imap::ImapSession,
+    msg_id: &MessageId,
+) -> AppResult<()> {
+    let current_uidvalidity =
+        imap::select_mailbox_readwrite(config, session, &msg_id.mailbox).await?;
+    if current_uidvalidity != msg_id.uidvalidity {
+        return Err(AppError::Conflict(
+            "message uidvalidity no longer matches mailbox".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+struct SearchSnapshot {
+    uids_desc: Vec<u32>,
+    offset: usize,
+    include_snippet: bool,
+    snippet_max_chars: usize,
+    cursor_id_from_request: Option<String>,
+}
+
+async fn resume_cursor_search(
+    cursors: &Arc<Mutex<CursorStore>>,
+    input: &SearchMessagesInput,
+    uidvalidity: u32,
+    cursor_id: String,
+) -> AppResult<SearchSnapshot> {
+    let mut store = cursors.lock().await;
+    let entry = store
+        .get(&cursor_id)
+        .ok_or_else(|| AppError::InvalidInput("cursor is invalid or expired".to_owned()))?;
+    if entry.account_id != input.account_id || entry.mailbox != input.mailbox {
+        return Err(AppError::InvalidInput(
+            "cursor does not match account/mailbox".to_owned(),
+        ));
+    }
+    if entry.uidvalidity != uidvalidity {
+        store.delete(&cursor_id);
+        return Err(AppError::Conflict(
+            "mailbox snapshot changed; rerun search".to_owned(),
+        ));
+    }
+    Ok(SearchSnapshot {
+        uids_desc: entry.uids_desc,
+        offset: entry.offset,
+        include_snippet: entry.include_snippet,
+        snippet_max_chars: entry.snippet_max_chars,
+        cursor_id_from_request: Some(cursor_id),
+    })
+}
+
+async fn start_new_search(
+    config: &ServerConfig,
+    session: &mut imap::ImapSession,
+    input: &SearchMessagesInput,
+) -> AppResult<SearchSnapshot> {
+    let query = build_search_query(input)?;
+    let searched_uids = imap::uid_search(config, session, &query).await?;
+    if searched_uids.len() > MAX_CURSOR_UIDS_STORED {
+        return Err(AppError::InvalidInput(format!(
+            "search matched {} messages; narrow filters to at most {} results",
+            searched_uids.len(),
+            MAX_CURSOR_UIDS_STORED
+        )));
+    }
+
+    Ok(SearchSnapshot {
+        uids_desc: searched_uids,
+        offset: 0,
+        include_snippet: input.include_snippet,
+        snippet_max_chars: input.snippet_max_chars.unwrap_or(200).clamp(50, 500),
+        cursor_id_from_request: None,
+    })
+}
+
+async fn build_message_summaries(
+    config: &ServerConfig,
+    session: &mut imap::ImapSession,
+    uids: &[u32],
+    options: SummaryBuildOptions<'_>,
+) -> AppResult<Vec<MessageSummary>> {
+    let mut messages = Vec::with_capacity(uids.len());
+    for uid in uids {
+        let (header_bytes, flags) = imap::fetch_headers_and_flags(config, session, *uid).await?;
+        let headers = mime::parse_header_bytes(&header_bytes)?;
+        let date = header_value(&headers, "date");
+        let from = header_value(&headers, "from");
+        let subject = header_value(&headers, "subject");
+
+        let snippet = if options.include_snippet {
+            subject
+                .clone()
+                .map(|s| mime::truncate_chars(s, options.snippet_max_chars))
+        } else {
+            None
+        };
+
+        let message_id = MessageId {
+            account_id: options.account_id.to_owned(),
+            mailbox: options.mailbox.to_owned(),
+            uidvalidity: options.uidvalidity,
+            uid: *uid,
+        }
+        .encode();
+        let message_uri = build_message_uri(
+            options.account_id,
+            options.mailbox,
+            options.uidvalidity,
+            *uid,
+        );
+        let message_raw_uri = build_message_raw_uri(
+            options.account_id,
+            options.mailbox,
+            options.uidvalidity,
+            *uid,
+        );
+
+        messages.push(MessageSummary {
+            message_id,
+            message_uri,
+            message_raw_uri,
+            mailbox: options.mailbox.to_owned(),
+            uidvalidity: options.uidvalidity,
+            uid: *uid,
+            date,
+            from,
+            subject,
+            flags: Some(flags),
+            snippet,
+        });
+    }
+    Ok(messages)
+}
+
+struct SummaryBuildOptions<'a> {
+    account_id: &'a str,
+    mailbox: &'a str,
+    uidvalidity: u32,
+    include_snippet: bool,
+    snippet_max_chars: usize,
 }
 
 /// Validate account_id format
@@ -907,6 +954,17 @@ fn validate_mailbox(mailbox: &str) -> AppResult<()> {
         return Err(AppError::InvalidInput(
             "mailbox must be 1..256 characters".to_owned(),
         ));
+    }
+    validate_no_controls(mailbox, "mailbox")?;
+    Ok(())
+}
+
+/// Reject IMAP control characters in user-provided values
+fn validate_no_controls(value: &str, field: &str) -> AppResult<()> {
+    if value.chars().any(|ch| ch.is_ascii_control()) {
+        return Err(AppError::InvalidInput(format!(
+            "{field} must not contain control characters"
+        )));
     }
     Ok(())
 }
@@ -941,6 +999,19 @@ fn validate_search_input(input: &SearchMessagesInput) -> AppResult<()> {
         }
     }
 
+    if let Some(v) = &input.query {
+        validate_search_text(v)?;
+    }
+    if let Some(v) = &input.from {
+        validate_search_text(v)?;
+    }
+    if let Some(v) = &input.to {
+        validate_search_text(v)?;
+    }
+    if let Some(v) = &input.subject {
+        validate_search_text(v)?;
+    }
+
     let has_filters = input.query.is_some()
         || input.from.is_some()
         || input.to.is_some()
@@ -972,6 +1043,16 @@ fn validate_search_input(input: &SearchMessagesInput) -> AppResult<()> {
     }
 
     Ok(())
+}
+
+/// Validate search text field bounds and characters
+fn validate_search_text(input: &str) -> AppResult<()> {
+    if input.is_empty() || input.len() > 256 {
+        return Err(AppError::InvalidInput(
+            "search text fields must be 1..256 chars".to_owned(),
+        ));
+    }
+    validate_no_controls(input, "search text")
 }
 
 /// Build IMAP SEARCH query string from input
@@ -1013,12 +1094,45 @@ fn build_search_query(input: &SearchMessagesInput) -> AppResult<String> {
 
 /// Escape backslashes and quotes for IMAP quoted strings
 fn escape_imap_quoted(input: &str) -> AppResult<String> {
-    if input.is_empty() || input.len() > 256 {
-        return Err(AppError::InvalidInput(
-            "search text fields must be 1..256 chars".to_owned(),
-        ));
-    }
+    validate_search_text(input)?;
     Ok(input.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Validate and normalize IMAP flag atoms
+fn validate_flags(flags: &[String], field: &str) -> AppResult<()> {
+    for flag in flags {
+        validate_flag(flag).map_err(|_| {
+            AppError::InvalidInput(format!(
+                "{field} contains invalid flag '{flag}'; flags must not contain whitespace, control chars, quotes, parentheses, or braces"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_flag(flag: &str) -> AppResult<()> {
+    if flag.is_empty() || flag.len() > 64 {
+        return Err(AppError::InvalidInput("invalid flag".to_owned()));
+    }
+
+    let atom = if let Some(rest) = flag.strip_prefix('\\') {
+        if rest.is_empty() {
+            return Err(AppError::InvalidInput("invalid flag".to_owned()));
+        }
+        rest
+    } else {
+        flag
+    };
+
+    if atom.chars().any(|ch| {
+        ch.is_ascii_control()
+            || ch.is_ascii_whitespace()
+            || matches!(ch, '"' | '(' | ')' | '{' | '}' | '\\')
+    }) {
+        return Err(AppError::InvalidInput("invalid flag".to_owned()));
+    }
+
+    Ok(())
 }
 
 /// Format date as IMAP SEARCH date (e.g., "1-Jan-2025")
@@ -1066,4 +1180,40 @@ fn build_message_raw_uri(account_id: &str, mailbox: &str, uidvalidity: u32, uid:
         "{}/raw",
         build_message_uri(account_id, mailbox, uidvalidity, uid)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{escape_imap_quoted, validate_flag, validate_mailbox, validate_search_text};
+
+    #[test]
+    fn rejects_control_chars_in_search_text() {
+        let err = validate_search_text("hello\nworld").expect_err("must fail");
+        assert!(err.to_string().contains("control characters"));
+    }
+
+    #[test]
+    fn rejects_control_chars_in_mailbox() {
+        let err = validate_mailbox("INBOX\r").expect_err("must fail");
+        assert!(err.to_string().contains("control characters"));
+    }
+
+    #[test]
+    fn escape_rejects_linebreaks() {
+        let err = escape_imap_quoted("a\nb").expect_err("must fail");
+        assert!(err.to_string().contains("control characters"));
+    }
+
+    #[test]
+    fn validate_flag_allows_common_flags() {
+        validate_flag("\\Seen").expect("system flag must be valid");
+        validate_flag("Important").expect("keyword flag must be valid");
+        validate_flag("$MailFlagBit0").expect("keyword flag must be valid");
+    }
+
+    #[test]
+    fn validate_flag_rejects_injection_like_value() {
+        let err = validate_flag("\\Seen) UID FETCH 1:* (BODY[]").expect_err("must fail");
+        assert!(err.to_string().contains("invalid flag"));
+    }
 }

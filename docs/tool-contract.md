@@ -134,6 +134,8 @@ Validation:
 - `cursor` cannot be combined with search criteria.
 - `last_days` cannot be combined with `start_date`/`end_date`.
 - `start_date <= end_date`.
+- Search text fields and mailbox values must not contain ASCII control characters.
+- Searches matching more than 20,000 messages are rejected; narrow filters and retry.
 
 Output `data`:
 - `account_id`
