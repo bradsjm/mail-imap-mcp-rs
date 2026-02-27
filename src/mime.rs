@@ -219,7 +219,10 @@ fn parse_all_headers(raw: &[u8]) -> AppResult<Vec<(String, String)>> {
     Ok(to_tuples(headers))
 }
 
-/// Convert mailparse headers to tuples
+/// Convert mailparse headers to key-value tuples
+///
+/// Extracts header keys and values using mailparse's `get_key()` and `get_value()`
+/// methods, which handle encoding and whitespace normalization.
 fn to_tuples(headers: Vec<MailHeader<'_>>) -> Vec<(String, String)> {
     headers
         .into_iter()
@@ -229,7 +232,9 @@ fn to_tuples(headers: Vec<MailHeader<'_>>) -> Vec<(String, String)> {
 
 /// Convert header tuples to case-insensitive map
 ///
-/// Returns first value for each header key (case-insensitive).
+/// Returns the first value for each header key (case-insensitive). If a header
+/// appears multiple times, only the first value is retained. Keys are normalized
+/// to lowercase for case-insensitive lookup.
 fn to_header_map(headers: &[(String, String)]) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for (k, v) in headers {

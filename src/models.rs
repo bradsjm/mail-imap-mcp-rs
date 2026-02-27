@@ -326,16 +326,25 @@ fn default_true() -> bool {
 }
 
 /// Default value for `limit` in search
+///
+/// Chosen as a reasonable balance between response size and pagination overhead.
+/// Most users need to see only the first few relevant messages.
 fn default_limit() -> usize {
     10
 }
 
 /// Default value for `body_max_chars` in get_message
+///
+/// Provides enough context for most use cases without overwhelming output.
+/// 2,000 characters is typically sufficient to understand message content.
 fn default_body_max_chars() -> usize {
     2_000
 }
 
 /// Default value for `max_bytes` in get_message_raw
+///
+/// Large enough to capture full message headers and body for most messages,
+/// but bounded to prevent excessive output. 200KB is a practical limit.
 fn default_raw_max_bytes() -> usize {
     200_000
 }
