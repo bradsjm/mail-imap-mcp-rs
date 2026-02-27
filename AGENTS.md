@@ -111,7 +111,7 @@ The project is distributed as an npm package published by cargo-dist.
 
 - Do not change package scope (`@bradsjm`) unless explicitly requested.
 - Prefer CI-driven publishing via git tags (`v*.*.*`).
-- Keep `NPM_TOKEN` configured for npm publish in GitHub Actions.
+- Prefer npm trusted publishing (GitHub OIDC + provenance) over token-based npm publish.
 
 ## Release Assets (Curl Installer)
 
