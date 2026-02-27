@@ -83,9 +83,34 @@ MCP command config (npx):
 }
 ```
 
+### Using Curl Installer (Linux/macOS)
+
+Install a pinned release directly from GitHub Releases:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/bradsjm/mail-imap-mcp-rs/releases/download/v0.1.0/mail-imap-mcp-rs-installer.sh | sh
+```
+
+Safer alternative (download, inspect, then run):
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf -o mail-imap-mcp-rs-installer.sh https://github.com/bradsjm/mail-imap-mcp-rs/releases/download/v0.1.0/mail-imap-mcp-rs-installer.sh
+sh mail-imap-mcp-rs-installer.sh
+```
+
+Install location defaults to `~/.local/bin`. Override with:
+
+```bash
+INSTALL_DIR="$HOME/bin" sh mail-imap-mcp-rs-installer.sh --version v0.1.0
+```
+
 ## Configuration
 
-All configuration is done via environment variables. Create a `.env` file or set them in your shell.
+All configuration is done via environment variables. Copy `.env.example` to `.env`, then replace placeholder values.
+
+```bash
+cp .env.example .env
+```
 
 ### Single Account Setup
 

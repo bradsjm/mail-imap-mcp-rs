@@ -118,6 +118,37 @@ The project is packaged for npm with a scoped base package and platform-specific
 - Ensure `npm/app/bin/index.js` stays executable and continues to pass through stdio.
 - Prefer CI-driven publishing via git tags (`v*.*.*`) and `NPM_TOKEN` secret.
 
+## Release Assets (Curl Installer)
+
+The repository also publishes GitHub Release binary archives and a curl installer for Linux/macOS users.
+
+### Release Workflow
+
+- Asset workflow: `.github/workflows/release-assets.yml`
+- Trigger: git tags matching `v*.*.*`
+- Required assets:
+  - `mail-imap-mcp-rs-linux-x64.tar.gz`
+  - `mail-imap-mcp-rs-darwin-x64.tar.gz`
+  - `mail-imap-mcp-rs-darwin-arm64.tar.gz`
+- Additional release files:
+  - `checksums.txt`
+  - `mail-imap-mcp-rs-installer.sh`
+
+### Installer Behavior and Guardrails
+
+- Source script: `scripts/install/mail-imap-mcp-rs-installer.sh`
+- Default install directory: `~/.local/bin`.
+- The installer verifies SHA-256 checksums before installation.
+- Linux target selection: `linux-x64`.
+- Keep installer POSIX `sh` compatible (`curl ... | sh` usage).
+- Do not change release asset naming without updating installer mapping logic.
+
+### Tag Publish Flow
+
+- `publish-npm.yml` and `release-assets.yml` both run on `v*.*.*` tags.
+- Keep npm package versions, release tag version, and installer embedded version aligned.
+- If release automation changes, update `README.md` install commands and this file together.
+
 ## Architecture and File Ownership
 
 - `src/main.rs`: process bootstrap, env loading, tracing init, stdio serving.
