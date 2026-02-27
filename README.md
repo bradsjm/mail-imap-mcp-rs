@@ -43,6 +43,13 @@ Run over stdio (for MCP clients that launch a command):
 docker run --rm -i --env-file .env mail-imap-mcp-rs
 ```
 
+Pull prebuilt multi-arch image from GHCR:
+
+```bash
+docker pull ghcr.io/bradsjm/mail-imap-mcp-rs:latest
+docker run --rm -i --env-file .env ghcr.io/bradsjm/mail-imap-mcp-rs:latest
+```
+
 Example MCP command config:
 
 ```json

@@ -88,6 +88,9 @@ The repository includes a minimal multi-stage Dockerfile for running the MCP ser
 - Keep runtime image minimal (current pattern: builder image + `scratch`).
 - If dependencies require a non-scratch runtime, document why in the PR/commit message.
 - Keep `.dockerignore` aligned with repo layout to avoid leaking local files and reduce context size.
+- Docker publish workflow: `.github/workflows/publish-docker.yml`.
+- Docker publish trigger: git tags matching `v*.*.*`.
+- Published image tags include `latest`, `vX.Y.Z`, and `X.Y.Z` on GHCR.
 
 ## NPM / NPX Distribution
 
@@ -145,7 +148,7 @@ The repository also publishes GitHub Release binary archives and a curl installe
 
 ### Tag Publish Flow
 
-- `publish-npm.yml` and `release-assets.yml` both run on `v*.*.*` tags.
+- `publish-npm.yml`, `release-assets.yml`, and `publish-docker.yml` run on `v*.*.*` tags.
 - Keep npm package versions, release tag version, and installer embedded version aligned.
 - If release automation changes, update `README.md` install commands and this file together.
 
