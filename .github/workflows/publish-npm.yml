@@ -1,0 +1,114 @@
+name: Publish NPM Packages
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  publish-npm-binaries:
+    name: Publish binary package (${{ matrix.build.NAME }})
+    runs-on: ${{ matrix.build.OS }}
+    strategy:
+      fail-fast: false
+      matrix:
+        build:
+          - {
+              NAME: linux-x64,
+              OS: ubuntu-24.04,
+              TARGET: x86_64-unknown-linux-gnu,
+              NODE_OS: linux,
+              NODE_ARCH: x64,
+              BIN: mail-imap-mcp-rs,
+            }
+          - {
+              NAME: darwin-x64,
+              OS: macos-13,
+              TARGET: x86_64-apple-darwin,
+              NODE_OS: darwin,
+              NODE_ARCH: x64,
+              BIN: mail-imap-mcp-rs,
+            }
+          - {
+              NAME: darwin-arm64,
+              OS: macos-14,
+              TARGET: aarch64-apple-darwin,
+              NODE_OS: darwin,
+              NODE_ARCH: arm64,
+              BIN: mail-imap-mcp-rs,
+            }
+          - {
+              NAME: windows-x64,
+              OS: windows-2022,
+              TARGET: x86_64-pc-windows-msvc,
+              NODE_OS: windows,
+              NODE_ARCH: x64,
+              BIN: mail-imap-mcp-rs.exe,
+            }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set release version
+        shell: bash
+        run: echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.build.TARGET }}
+
+      - name: Build binary
+        run: cargo build --release --locked --target ${{ matrix.build.TARGET }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Package and publish binary package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd npm
+          export node_os="${{ matrix.build.NODE_OS }}"
+          export node_arch="${{ matrix.build.NODE_ARCH }}"
+          export node_version="${{ env.RELEASE_VERSION }}"
+          export node_pkg="@bradsjm/mail-imap-mcp-rs-${node_os}-${node_arch}"
+          export node_pkg_dir="mail-imap-mcp-rs-${node_os}-${node_arch}"
+          export bin_name="${{ matrix.build.BIN }}"
+
+          mkdir -p "${node_pkg_dir}/bin"
+          node -e 'const fs = require("node:fs"); let t = fs.readFileSync("package.json.tmpl", "utf8"); t = t.replaceAll("${node_pkg}", process.env.node_pkg).replaceAll("${node_version}", process.env.node_version).replaceAll("${node_os}", process.env.node_os).replaceAll("${node_arch}", process.env.node_arch).replaceAll("${bin_name}", process.env.bin_name); fs.writeFileSync(`${process.env.node_pkg_dir}/package.json`, t);'
+          cp "../target/${{ matrix.build.TARGET }}/release/${bin_name}" "${node_pkg_dir}/bin/${bin_name}"
+
+          cd "${node_pkg_dir}"
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-npm-base:
+    name: Publish base package
+    needs: publish-npm-binaries
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set release version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          export version
+          node -e 'const fs = require("node:fs"); const p = "npm/app/package.json"; const pkg = JSON.parse(fs.readFileSync(p, "utf8")); pkg.version = process.env.version; for (const k of Object.keys(pkg.optionalDependencies)) pkg.optionalDependencies[k] = process.env.version; fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + "\n");'
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish base package
+        run: npm publish --access public --prefix npm/app
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

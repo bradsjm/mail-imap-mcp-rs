@@ -1,0 +1,318 @@
+# MCP Tool Contract
+
+This document defines the first build artifact for `mail-imap-mcp-rs`: the server-facing MCP contract.
+It is the source of truth for tool names, input/output shapes, validation bounds, and safety rules.
+
+## Design Decisions
+
+- Transport: stdio only.
+- Auth/config: environment variables only.
+- Message locator: stable `message_id` format `imap:{account_id}:{mailbox}:{uidvalidity}:{uid}`.
+- Destructive/write operations: disabled by default and explicitly gated.
+- Output style: concise summaries with bounded structured data.
+- Compatibility: no backward compatibility requirement with earlier implementations.
+
+## Shared Input Types
+
+### `account_id`
+
+- Type: string
+- Pattern: `^[A-Za-z0-9_-]{1,64}$`
+- Default: `"default"`
+
+### `mailbox`
+
+- Type: string
+- Length: 1..256
+
+### `message_id`
+
+- Type: string
+- Format: `imap:{account_id}:{mailbox}:{uidvalidity}:{uid}`
+- Validation rules:
+  - Prefix must be `imap`.
+  - `uidvalidity` and `uid` must be non-negative integers.
+  - Parsed `account_id` must match requested account.
+
+### `limit`
+
+- Type: integer
+- Range: 1..50
+- Default: 10
+
+## Shared Output Envelope
+
+All tools return:
+
+```json
+{
+  "summary": "human-readable one-line outcome",
+  "data": {},
+  "meta": {
+    "now_utc": "ISO-8601 UTC timestamp",
+    "duration_ms": 0
+  }
+}
+```
+
+Error responses use a consistent shape:
+
+```json
+{
+  "error": {
+    "code": "invalid_input|auth_failed|not_found|timeout|conflict|internal",
+    "message": "actionable message",
+    "details": {}
+  },
+  "meta": {
+    "now_utc": "ISO-8601 UTC timestamp",
+    "duration_ms": 0
+  }
+}
+```
+
+## Tool Set
+
+### 1) `imap_list_accounts`
+
+Purpose: list configured accounts without exposing secrets.
+
+Input:
+- none
+
+Output `data`:
+- `accounts`: array (max 50) of `{ account_id, host, port, secure }`
+
+### 2) `imap_verify_account`
+
+Purpose: verify account connectivity, auth, and capabilities.
+
+Input:
+- `account_id` (optional, default `default`)
+
+Output `data`:
+- `account_id`
+- `ok` (boolean, must be true on success)
+- `latency_ms` (integer)
+- `server`: `{ host, port, secure }`
+- `capabilities`: string[] (max 256)
+
+### 3) `imap_list_mailboxes`
+
+Purpose: list visible mailboxes/folders.
+
+Input:
+- `account_id` (optional)
+
+Output `data`:
+- `account_id`
+- `mailboxes`: array (max 200) of `{ name, delimiter? }`
+
+### 4) `imap_search_messages`
+
+Purpose: search mailbox and return paginated message summaries.
+
+Input:
+- `account_id` (optional)
+- `mailbox` (required)
+- one of:
+  - `cursor` (string, opaque), or
+  - search criteria fields:
+    - `query?` (1..256)
+    - `from?` (1..256)
+    - `to?` (1..256)
+    - `subject?` (1..256)
+    - `unread_only?` (boolean)
+    - `last_days?` (1..365)
+    - `start_date?` (`YYYY-MM-DD`)
+    - `end_date?` (`YYYY-MM-DD`)
+- `limit` (optional)
+- `include_snippet?` (boolean, default false)
+- `snippet_max_chars?` (50..500, default 200; only valid if `include_snippet=true`)
+
+Validation:
+- `cursor` cannot be combined with search criteria.
+- `last_days` cannot be combined with `start_date`/`end_date`.
+- `start_date <= end_date`.
+
+Output `data`:
+- `account_id`
+- `mailbox`
+- `total` (integer)
+- `messages`: array (max 50) of:
+  - `message_id`
+  - `mailbox`
+  - `uidvalidity`
+  - `uid`
+  - `date?`
+  - `from?`
+  - `subject?`
+  - `flags?` (string[])
+  - `snippet?`
+- `next_cursor?` (string)
+- `has_more` (boolean)
+
+### 5) `imap_get_message`
+
+Purpose: return parsed message details with optional bounded enrichments.
+
+Input:
+- `account_id` (optional)
+- `message_id` (required)
+- `body_max_chars?` (100..20000, default 2000)
+- `include_headers?` (boolean, default true)
+- `include_all_headers?` (boolean, default false)
+- `include_html?` (boolean, default false; returned HTML is sanitized)
+- `extract_attachment_text?` (boolean, default false)
+- `attachment_text_max_chars?` (100..50000, default 10000; only valid when extraction is enabled)
+
+Output `data`:
+- `account_id`
+- `message`:
+  - `message_id`
+  - `mailbox`
+  - `uidvalidity`
+  - `uid`
+  - `date?`
+  - `from?`
+  - `to?`
+  - `cc?`
+  - `subject?`
+  - `flags?`
+  - `headers?` (curated by default; full when requested)
+  - `body_text?` (bounded)
+  - `body_html?` (sanitized and bounded)
+  - `attachments?`: array (max 50) of:
+    - `filename?`
+    - `content_type`
+    - `size_bytes`
+    - `part_id`
+    - `extracted_text?` (bounded)
+
+PDF extraction rules:
+- only `application/pdf`
+- max attachment size for extraction: 5 MB
+- extraction failures do not fail the whole tool call
+
+### 6) `imap_get_message_raw`
+
+Purpose: return bounded RFC822 source for diagnostics.
+
+Input:
+- `account_id` (optional)
+- `message_id` (required)
+- `max_bytes?` (1024..1000000, default 200000)
+
+Output `data`:
+- `account_id`
+- `message_id`
+- `size_bytes`
+- `raw_source` (UTF-8 best effort, bounded by `max_bytes`)
+
+### 7) `imap_update_message_flags`
+
+Purpose: add/remove IMAP flags on a message.
+
+Write gate: requires `MAIL_IMAP_WRITE_ENABLED=true`.
+
+Input:
+- `account_id` (optional)
+- `message_id` (required)
+- `add_flags?`: string[] (1..20)
+- `remove_flags?`: string[] (1..20)
+
+Validation:
+- at least one of `add_flags` or `remove_flags` is required.
+
+Output `data`:
+- `account_id`
+- `message_id`
+- `flags`: string[]
+
+### 8) `imap_copy_message`
+
+Purpose: copy message to mailbox in same or different account.
+
+Write gate: requires `MAIL_IMAP_WRITE_ENABLED=true`.
+
+Input:
+- `account_id` (optional, source)
+- `message_id` (required)
+- `destination_mailbox` (required)
+- `destination_account_id?` (defaults to source account)
+
+Output `data`:
+- `source_account_id`
+- `destination_account_id`
+- `source_mailbox`
+- `destination_mailbox`
+- `message_id`
+- `new_message_id?` (present when server returns UID mapping)
+
+### 9) `imap_move_message`
+
+Purpose: move message to mailbox in same account.
+
+Write gate: requires `MAIL_IMAP_WRITE_ENABLED=true`.
+
+Input:
+- `account_id` (optional)
+- `message_id` (required)
+- `destination_mailbox` (required)
+
+Behavior:
+- prefer IMAP MOVE capability
+- fallback to COPY + DELETE when MOVE unsupported
+
+Output `data`:
+- `account_id`
+- `source_mailbox`
+- `destination_mailbox`
+- `message_id`
+- `new_message_id?`
+
+### 10) `imap_delete_message`
+
+Purpose: delete message from mailbox.
+
+Write gate: requires `MAIL_IMAP_WRITE_ENABLED=true`.
+
+Input:
+- `account_id` (optional)
+- `message_id` (required)
+- `confirm` (required literal `true`)
+
+Output `data`:
+- `account_id`
+- `mailbox`
+- `message_id`
+
+## Security and Guardrails
+
+- Never return secrets (`*_PASS`, tokens, cookies, auth headers).
+- Redact secret-like keys in logs.
+- Enforce all bounds before IMAP fetch/download when possible.
+- Limit attachment bytes and text extraction output.
+- Use TLS certificate and hostname verification by default.
+- Reject ambiguous or conflicting inputs with explicit `invalid_input` errors.
+
+## Environment Variables
+
+Per account:
+
+- `MAIL_IMAP_<ACCOUNT>_HOST` (required)
+- `MAIL_IMAP_<ACCOUNT>_PORT` (default `993`)
+- `MAIL_IMAP_<ACCOUNT>_SECURE` (default `true`)
+- `MAIL_IMAP_<ACCOUNT>_USER` (required)
+- `MAIL_IMAP_<ACCOUNT>_PASS` (required)
+
+Server-wide:
+
+- `MAIL_IMAP_WRITE_ENABLED` (default `false`)
+- `MAIL_IMAP_CONNECT_TIMEOUT_MS` (default `30000`)
+- `MAIL_IMAP_GREETING_TIMEOUT_MS` (default `15000`)
+- `MAIL_IMAP_SOCKET_TIMEOUT_MS` (default `300000`)
+
+## Implementation Notes for Next Artifact
+
+Next artifact will generate Rust types and schema definitions from this contract, then register all tools in an `rmcp` stdio server skeleton with unified error handling.
