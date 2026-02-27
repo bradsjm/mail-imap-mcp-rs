@@ -23,7 +23,7 @@ jobs:
             }
           - {
               NAME: darwin-x64,
-              OS: macos-13,
+              OS: macos-latest,
               TARGET: x86_64-apple-darwin,
               NODE_OS: darwin,
               NODE_ARCH: x64,
