@@ -1,0 +1,32 @@
+name: GreenMail Integration
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+jobs:
+  greenmail-tests:
+    runs-on: ubuntu-latest
+    services:
+      greenmail:
+        image: greenmail/standalone:1.6.15
+        env:
+          GREENMAIL_OPTS: -Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled -Dgreenmail.verbose
+        ports:
+          - 3993:3993
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run GreenMail smoke test
+        env:
+          RUN_GREENMAIL_TESTS: "1"
+          GREENMAIL_EXTERNAL: "1"
+          GREENMAIL_HOST: "localhost"
+          GREENMAIL_IMAPS_PORT: "3993"
+        run: cargo test greenmail -- --nocapture

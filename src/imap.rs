@@ -246,7 +246,7 @@ pub async fn fetch_raw_message(
     session: &mut ImapSession,
     uid: u32,
 ) -> AppResult<Vec<u8>> {
-    let fetch = fetch_one(server, session, uid, "UID RFC822").await?;
+    let fetch = fetch_one(server, session, uid, "RFC822").await?;
     let body = fetch
         .body()
         .ok_or_else(|| AppError::Internal("message has no RFC822 body".to_owned()))?;
@@ -266,7 +266,7 @@ pub async fn fetch_headers_and_flags(
         server,
         session,
         uid,
-        "UID FLAGS BODY.PEEK[HEADER.FIELDS (DATE FROM TO CC SUBJECT)]",
+        "FLAGS BODY.PEEK[HEADER.FIELDS (DATE FROM TO CC SUBJECT)]",
     )
     .await?;
     let header_bytes = fetch
@@ -285,7 +285,7 @@ pub async fn fetch_flags(
     session: &mut ImapSession,
     uid: u32,
 ) -> AppResult<Vec<String>> {
-    let fetch = fetch_one(server, session, uid, "UID FLAGS").await?;
+    let fetch = fetch_one(server, session, uid, "FLAGS").await?;
     Ok(flags_to_strings(&fetch))
 }
 
@@ -414,4 +414,320 @@ pub async fn append(
     .await
     .map_err(|_| AppError::Timeout("APPEND timed out".to_owned()))
     .and_then(|r| r.map_err(|e| AppError::Internal(format!("APPEND failed: {e}"))))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::process::Command;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use async_imap::Client;
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
+    use secrecy::{ExposeSecret, SecretString};
+    use tokio::net::TcpStream;
+    use tokio::time::sleep;
+    use tokio::time::timeout;
+    use tokio_rustls::TlsConnector;
+
+    use super::{
+        append, fetch_raw_message, list_all_mailboxes, noop, select_mailbox_readonly, uid_search,
+    };
+    use crate::config::{AccountConfig, ServerConfig};
+
+    const GREENMAIL_IMAGE: &str = "greenmail/standalone:1.6.15";
+    const GREENMAIL_NAME: &str = "mail-imap-mcp-rs-greenmail-test";
+    const GREENMAIL_OPTS: &str = "-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled -Dgreenmail.verbose";
+
+    struct GreenmailContainer {
+        name: String,
+    }
+
+    impl GreenmailContainer {
+        fn start() -> Result<Self, String> {
+            let _ = run_docker(["rm", "-f", GREENMAIL_NAME].as_slice());
+
+            run_docker(["pull", GREENMAIL_IMAGE].as_slice())?;
+            run_docker(
+                [
+                    "run",
+                    "-d",
+                    "--rm",
+                    "--name",
+                    GREENMAIL_NAME,
+                    "-e",
+                    &format!("GREENMAIL_OPTS={GREENMAIL_OPTS}"),
+                    "-p",
+                    "3025:3025",
+                    "-p",
+                    "3110:3110",
+                    "-p",
+                    "3143:3143",
+                    "-p",
+                    "3465:3465",
+                    "-p",
+                    "3993:3993",
+                    "-p",
+                    "3995:3995",
+                    GREENMAIL_IMAGE,
+                ]
+                .as_slice(),
+            )?;
+
+            Ok(Self {
+                name: GREENMAIL_NAME.to_owned(),
+            })
+        }
+    }
+
+    impl Drop for GreenmailContainer {
+        fn drop(&mut self) {
+            let _ = run_docker(["rm", "-f", &self.name].as_slice());
+        }
+    }
+
+    fn run_docker(args: &[&str]) -> Result<(), String> {
+        let output = Command::new("docker")
+            .args(args)
+            .output()
+            .map_err(|e| format!("failed to execute docker {:?}: {e}", args))?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "docker {:?} failed with status {}: {}",
+            args, output.status, stderr
+        ))
+    }
+
+    fn docker_available() -> bool {
+        Command::new("docker")
+            .arg("version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    fn greenmail_test_config() -> ServerConfig {
+        let host = std::env::var("GREENMAIL_HOST").unwrap_or_else(|_| "localhost".to_owned());
+        let port = std::env::var("GREENMAIL_IMAPS_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(3993);
+
+        let account = AccountConfig {
+            account_id: "default".to_owned(),
+            host,
+            port,
+            secure: true,
+            user: "test".to_owned(),
+            pass: SecretString::new("test".to_owned().into()),
+        };
+
+        let mut accounts = BTreeMap::new();
+        accounts.insert(account.account_id.clone(), account);
+
+        ServerConfig {
+            accounts,
+            write_enabled: true,
+            connect_timeout_ms: 5_000,
+            greeting_timeout_ms: 5_000,
+            socket_timeout_ms: 15_000,
+            cursor_ttl_seconds: 600,
+            cursor_max_entries: 128,
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoCertificateVerification;
+
+    impl ServerCertVerifier for NoCertificateVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, RustlsError> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, RustlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, RustlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::ED25519,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PSS_SHA384,
+                SignatureScheme::RSA_PSS_SHA512,
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA384,
+                SignatureScheme::RSA_PKCS1_SHA512,
+            ]
+        }
+    }
+
+    async fn connect_authenticated_greenmail(
+        config: &ServerConfig,
+        account: &AccountConfig,
+    ) -> Result<super::ImapSession, String> {
+        let connect_duration = Duration::from_millis(config.connect_timeout_ms);
+        let greeting_duration = Duration::from_millis(config.greeting_timeout_ms);
+
+        let tcp = timeout(
+            connect_duration,
+            TcpStream::connect((account.host.as_str(), account.port)),
+        )
+        .await
+        .map_err(|_| "tcp connect timeout".to_owned())
+        .and_then(|r| r.map_err(|e| format!("tcp connect failed: {e}")))?;
+
+        let tls_config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(tls_config));
+
+        let server_name = ServerName::try_from(account.host.clone())
+            .map_err(|_| "invalid IMAP host for TLS SNI".to_owned())?;
+        let tls_stream = timeout(greeting_duration, connector.connect(server_name, tcp))
+            .await
+            .map_err(|_| "TLS handshake timeout".to_owned())
+            .and_then(|r| r.map_err(|e| format!("TLS handshake failed: {e}")))?;
+
+        let mut client = Client::new(tls_stream);
+        let greeting = timeout(greeting_duration, client.read_response())
+            .await
+            .map_err(|_| "IMAP greeting timeout".to_owned())
+            .and_then(|r| r.map_err(|e| format!("IMAP greeting failed: {e}")))?;
+        if greeting.is_none() {
+            return Err("IMAP server closed connection before greeting".to_owned());
+        }
+
+        let pass = account.pass.expose_secret();
+        let login = timeout(greeting_duration, client.login(account.user.as_str(), pass))
+            .await
+            .map_err(|_| "IMAP login timeout".to_owned())?;
+        login.map_err(|(e, _)| format!("IMAP login failed: {e}"))
+    }
+
+    async fn wait_until_login_works(config: &ServerConfig) -> Result<(), String> {
+        let account = config
+            .get_account("default")
+            .map_err(|e| format!("missing default account: {e}"))?;
+
+        let mut last_err = String::new();
+        for _ in 0..60 {
+            match connect_authenticated_greenmail(config, account).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    last_err = e.to_string();
+                }
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+        Err(format!(
+            "greenmail did not become ready in time (last error: {last_err})"
+        ))
+    }
+
+    #[tokio::test]
+    async fn greenmail_imap_smoke_test() {
+        if std::env::var("RUN_GREENMAIL_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+
+        let external = std::env::var("GREENMAIL_EXTERNAL").as_deref() == Ok("1");
+        let _container = if external {
+            None
+        } else {
+            if !docker_available() {
+                panic!("RUN_GREENMAIL_TESTS=1 but docker is unavailable");
+            }
+            Some(GreenmailContainer::start().expect("failed to start greenmail container"))
+        };
+
+        let config = greenmail_test_config();
+        wait_until_login_works(&config)
+            .await
+            .expect("greenmail did not become ready");
+
+        let account = config
+            .get_account("default")
+            .expect("default account must exist");
+        let mut session = connect_authenticated_greenmail(&config, account)
+            .await
+            .expect("imap login should work");
+
+        noop(&config, &mut session)
+            .await
+            .expect("NOOP should succeed");
+
+        let mailboxes = list_all_mailboxes(&config, &mut session)
+            .await
+            .expect("LIST should succeed");
+        assert!(
+            !mailboxes.is_empty(),
+            "greenmail should expose at least one mailbox"
+        );
+
+        let uidvalidity = select_mailbox_readonly(&config, &mut session, "INBOX")
+            .await
+            .expect("INBOX should be selectable");
+        assert!(uidvalidity > 0);
+
+        let message = b"From: sender@example.com\r\nTo: user@example.com\r\nSubject: Greenmail test\r\n\r\nHello from test\r\n";
+        append(&config, &mut session, "INBOX", message)
+            .await
+            .expect("APPEND should succeed");
+
+        noop(&config, &mut session)
+            .await
+            .expect("NOOP after APPEND should succeed");
+        select_mailbox_readonly(&config, &mut session, "INBOX")
+            .await
+            .expect("INBOX should be re-selectable after APPEND");
+
+        let uids = uid_search(&config, &mut session, "ALL")
+            .await
+            .expect("UID SEARCH should succeed");
+        assert!(
+            !uids.is_empty(),
+            "UID SEARCH ALL should return at least one message after APPEND"
+        );
+
+        let newest_uid = uids[0];
+        let raw = fetch_raw_message(&config, &mut session, newest_uid)
+            .await
+            .expect("fetching appended message should succeed");
+        let raw_text = String::from_utf8_lossy(&raw);
+        assert!(
+            raw_text.contains("Subject: Greenmail test"),
+            "fetched raw message should contain appended subject"
+        );
+    }
 }

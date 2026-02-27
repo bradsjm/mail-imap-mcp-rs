@@ -443,6 +443,9 @@ See `AGENTS.md` for contributor guidelines and build/lint/test commands.
 # Run tests
 cargo test
 
+# Run GreenMail-backed IMAP integration smoke test
+scripts/test-greenmail.sh
+
 # Format check
 cargo fmt -- --check
 

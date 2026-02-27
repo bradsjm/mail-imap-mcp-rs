@@ -43,6 +43,7 @@ Run commands from repo root.
 
 - Run all tests: `cargo test`
 - List tests: `cargo test -- --list`
+- GreenMail integration smoke test: `scripts/test-greenmail.sh`
 
 ### Run a Single Test
 
@@ -54,6 +55,7 @@ Use a test name substring:
 Run a single test and show stdout:
 
 - `cargo test parses_mailbox_with_colons -- --exact --nocapture`
+- `RUN_GREENMAIL_TESTS=1 cargo test greenmail_imap_smoke_test -- --exact --nocapture`
 
 Run tests in one module/file scope:
 
