@@ -109,6 +109,10 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Publish base package
-        run: npm publish --access public --prefix npm/app
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd npm/app
+          npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
