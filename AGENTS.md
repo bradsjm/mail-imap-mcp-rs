@@ -94,32 +94,30 @@ The repository includes a minimal multi-stage Dockerfile for running the MCP ser
 
 ## NPM / NPX Distribution
 
-The project is packaged for npm with a scoped base package and platform-specific optional binary packages.
+The project is distributed as a single npm package that bundles platform-specific binaries.
 
 ### Package Layout
 
 - Base package: `npm/app/package.json` (`@bradsjm/mail-imap-mcp-rs`)
 - Launcher script: `npm/app/bin/index.js`
-- Target package template: `npm/package.json.tmpl`
 - Publish workflow: `.github/workflows/publish-npm.yml`
 
 ### Runtime Behavior
 
 - End users run via `npx @bradsjm/mail-imap-mcp-rs@latest`.
-- The launcher resolves OS/arch-specific packages and executes the bundled binary.
-- Keep package names consistent with this convention:
-  - `@bradsjm/mail-imap-mcp-rs-linux-x64`
-  - `@bradsjm/mail-imap-mcp-rs-darwin-x64`
-  - `@bradsjm/mail-imap-mcp-rs-darwin-arm64`
-  - `@bradsjm/mail-imap-mcp-rs-windows-x64`
+- The launcher resolves OS/arch and executes the bundled binary from package `bin/<platform>/`.
+- Supported platform bundles are:
+  - `linux-x64`
+  - `darwin-x64`
+  - `darwin-arm64`
+  - `windows-x64`
 
 ### Publishing Rules for Agents
 
-- Publish binary packages before the base package.
-- Keep base package `optionalDependencies` versions in sync with the release version.
 - Do not change package scope (`@bradsjm`) unless explicitly requested.
 - Ensure `npm/app/bin/index.js` stays executable and continues to pass through stdio.
-- Prefer CI-driven publishing via git tags (`v*.*.*`) and `NPM_TOKEN` secret.
+- Prefer CI-driven publishing via git tags (`v*.*.*`).
+- Bootstrap first publish with `NPM_TOKEN`; use npm trusted publishing (OIDC) after package exists.
 
 ## Release Assets (Curl Installer)
 

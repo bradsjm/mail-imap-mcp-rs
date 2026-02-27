@@ -1,26 +1,28 @@
 #!/usr/bin/env node
 
 const { spawnSync } = require("node:child_process");
-
-function packageOs() {
-  return process.platform === "win32" ? "windows" : process.platform;
-}
+const path = require("node:path");
 
 function extension() {
   return process.platform === "win32" ? ".exe" : "";
 }
 
 function resolveBinary() {
-  const os = packageOs();
+  const os = process.platform === "win32" ? "windows" : process.platform;
   const arch = process.arch;
-  const pkg = `@bradsjm/mail-imap-mcp-rs-${os}-${arch}`;
+  const platformKey = `${os}-${arch}`;
   const exe = `mail-imap-mcp-rs${extension()}`;
-  try {
-    return require.resolve(`${pkg}/bin/${exe}`);
-  } catch {
-    throw new Error(
-      `Unsupported platform or missing package: ${os}-${arch}. Expected optional dependency ${pkg}.`
-    );
+
+  switch (platformKey) {
+    case "linux-x64":
+    case "darwin-x64":
+    case "darwin-arm64":
+    case "windows-x64":
+      return path.join(__dirname, platformKey, exe);
+    default:
+      throw new Error(
+        `Unsupported platform: ${platformKey}. Supported platforms are linux-x64, darwin-x64, darwin-arm64, windows-x64.`
+      );
   }
 }
 

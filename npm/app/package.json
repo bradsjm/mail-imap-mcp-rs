@@ -20,12 +20,6 @@
   "engines": {
     "node": ">=18"
   },
-  "optionalDependencies": {
-    "@bradsjm/mail-imap-mcp-rs-linux-x64": "0.1.0",
-    "@bradsjm/mail-imap-mcp-rs-darwin-x64": "0.1.0",
-    "@bradsjm/mail-imap-mcp-rs-darwin-arm64": "0.1.0",
-    "@bradsjm/mail-imap-mcp-rs-windows-x64": "0.1.0"
-  },
   "publishConfig": {
     "access": "public"
   }

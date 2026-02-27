@@ -1,56 +1,50 @@
-name: Publish NPM Packages
+name: Publish NPM Package
 
 on:
   push:
     tags:
       - "v*.*.*"
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
-  publish-npm-binaries:
-    name: Publish binary package (${{ matrix.build.NAME }})
+  build-binaries:
+    name: Build binary (${{ matrix.build.PKG_KEY }})
     runs-on: ${{ matrix.build.OS }}
     strategy:
       fail-fast: false
       matrix:
         build:
           - {
-              NAME: linux-x64,
+              PKG_KEY: linux-x64,
               OS: ubuntu-24.04,
               TARGET: x86_64-unknown-linux-gnu,
-              NODE_OS: linux,
-              NODE_ARCH: x64,
               BIN: mail-imap-mcp-rs,
             }
           - {
-              NAME: darwin-x64,
+              PKG_KEY: darwin-x64,
               OS: macos-latest,
               TARGET: x86_64-apple-darwin,
-              NODE_OS: darwin,
-              NODE_ARCH: x64,
               BIN: mail-imap-mcp-rs,
             }
           - {
-              NAME: darwin-arm64,
+              PKG_KEY: darwin-arm64,
               OS: macos-14,
               TARGET: aarch64-apple-darwin,
-              NODE_OS: darwin,
-              NODE_ARCH: arm64,
               BIN: mail-imap-mcp-rs,
             }
           - {
-              NAME: windows-x64,
+              PKG_KEY: windows-x64,
               OS: windows-2022,
               TARGET: x86_64-pc-windows-msvc,
-              NODE_OS: windows,
-              NODE_ARCH: x64,
               BIN: mail-imap-mcp-rs.exe,
             }
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Set release version
-        shell: bash
-        run: echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -60,59 +54,80 @@ jobs:
       - name: Build binary
         run: cargo build --release --locked --target ${{ matrix.build.TARGET }}
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          registry-url: "https://registry.npmjs.org"
-
-      - name: Package and publish binary package
+      - name: Prepare artifact
         shell: bash
         run: |
           set -euo pipefail
-          cd npm
-          export node_os="${{ matrix.build.NODE_OS }}"
-          export node_arch="${{ matrix.build.NODE_ARCH }}"
-          export node_version="${{ env.RELEASE_VERSION }}"
-          export node_pkg="@bradsjm/mail-imap-mcp-rs-${node_os}-${node_arch}"
-          export node_pkg_dir="mail-imap-mcp-rs-${node_os}-${node_arch}"
-          export bin_name="${{ matrix.build.BIN }}"
+          mkdir -p "artifact/${{ matrix.build.PKG_KEY }}"
+          cp "target/${{ matrix.build.TARGET }}/release/${{ matrix.build.BIN }}" "artifact/${{ matrix.build.PKG_KEY }}/${{ matrix.build.BIN }}"
+          if [ "${{ matrix.build.BIN }}" != "mail-imap-mcp-rs.exe" ]; then
+            chmod +x "artifact/${{ matrix.build.PKG_KEY }}/${{ matrix.build.BIN }}"
+          fi
 
-          mkdir -p "${node_pkg_dir}/bin"
-          node -e 'const fs = require("node:fs"); let t = fs.readFileSync("package.json.tmpl", "utf8"); t = t.replaceAll("${node_pkg}", process.env.node_pkg).replaceAll("${node_version}", process.env.node_version).replaceAll("${node_os}", process.env.node_os).replaceAll("${node_arch}", process.env.node_arch).replaceAll("${bin_name}", process.env.bin_name); fs.writeFileSync(`${process.env.node_pkg_dir}/package.json`, t);'
-          cp "../target/${{ matrix.build.TARGET }}/release/${bin_name}" "${node_pkg_dir}/bin/${bin_name}"
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-bin-${{ matrix.build.PKG_KEY }}
+          path: artifact/${{ matrix.build.PKG_KEY }}
 
-          cd "${node_pkg_dir}"
-          npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-  publish-npm-base:
-    name: Publish base package
-    needs: publish-npm-binaries
+  publish-npm:
+    name: Publish @bradsjm/mail-imap-mcp-rs
+    needs: [build-binaries]
     runs-on: ubuntu-24.04
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set release version
         shell: bash
         run: |
+          set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           export version
-          node -e 'const fs = require("node:fs"); const p = "npm/app/package.json"; const pkg = JSON.parse(fs.readFileSync(p, "utf8")); pkg.version = process.env.version; for (const k of Object.keys(pkg.optionalDependencies)) pkg.optionalDependencies[k] = process.env.version; fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + "\n");'
+          node -e 'const fs = require("node:fs"); const p = "npm/app/package.json"; const pkg = JSON.parse(fs.readFileSync(p, "utf8")); pkg.version = process.env.version; fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + "\n");'
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22.14.0"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Publish base package
+      - name: Ensure npm version for trusted publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm i -g npm@11.5.1
+          npm --version
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: npm-bin-*
+          merge-multiple: true
+          path: npm/app/bin
+
+      - name: Verify bundled binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f npm/app/bin/linux-x64/mail-imap-mcp-rs
+          test -f npm/app/bin/darwin-x64/mail-imap-mcp-rs
+          test -f npm/app/bin/darwin-arm64/mail-imap-mcp-rs
+          test -f npm/app/bin/windows-x64/mail-imap-mcp-rs.exe
+
+      - name: Publish package
         shell: bash
         run: |
           set -euo pipefail
           cd npm/app
-          npm publish --access public
+          if [ -n "${NPM_TOKEN:-}" ]; then
+            echo "Publishing with NPM_TOKEN (bootstrap mode for first package publish)."
+            npm publish --access public
+          else
+            echo "Publishing with npm trusted publishing (OIDC)."
+            npm publish --access public --provenance
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
