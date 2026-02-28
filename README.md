@@ -81,7 +81,8 @@ Use this example MCP configuration and add your credentials:
 {
   "mcpServers": {
     "server-name": {
-      "command": "mail-imap-mcp-rs",
+      "command": "npx",
+      "args": ["-y", "@bradsjm/mail-imap-mcp-rs@latest"],
       "env": {
         "MAIL_IMAP_DEFAULT_HOST": "imap.gmail.com",
         "MAIL_IMAP_DEFAULT_USER": "your-email@gmail.com",
