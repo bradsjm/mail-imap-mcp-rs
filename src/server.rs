@@ -12,6 +12,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ErrorData, ServerCapabilities, ServerInfo};
 use rmcp::{Json, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
+use tracing::{error, warn};
 
 use crate::config::ServerConfig;
 use crate::errors::{AppError, AppResult};
@@ -83,6 +84,7 @@ impl MailImapServer {
             .collect::<Vec<_>>();
         finalize_tool(
             started,
+            "imap_list_accounts",
             Ok((format!("{} account(s) configured", data.len()), data)),
         )
     }
@@ -102,6 +104,7 @@ impl MailImapServer {
         let started = Instant::now();
         finalize_tool(
             started,
+            "imap_verify_account",
             self.verify_account_impl(input)
                 .await
                 .map(|data| ("Account verification succeeded".to_owned(), data)),
@@ -122,6 +125,7 @@ impl MailImapServer {
         let started = Instant::now();
         finalize_tool(
             started,
+            "imap_list_mailboxes",
             self.list_mailboxes_impl(input).await.map(|data| {
                 (
                     format!(
@@ -154,7 +158,7 @@ impl MailImapServer {
                 .map_err(|e| AppError::Internal(format!("serialization failure: {e}")))?;
             Ok((summary, serialized))
         });
-        finalize_tool(started, result)
+        finalize_tool(started, "imap_search_messages", result)
     }
 
     /// Tool: Get parsed message details
@@ -169,6 +173,7 @@ impl MailImapServer {
         let started = Instant::now();
         finalize_tool(
             started,
+            "imap_get_message",
             self.get_message_impl(input)
                 .await
                 .map(|data| ("Message retrieved".to_owned(), data)),
@@ -190,6 +195,7 @@ impl MailImapServer {
         let started = Instant::now();
         finalize_tool(
             started,
+            "imap_get_message_raw",
             self.get_message_raw_impl(input)
                 .await
                 .map(|data| ("Raw message retrieved".to_owned(), data)),
@@ -211,6 +217,7 @@ impl MailImapServer {
         let started = Instant::now();
         finalize_tool(
             started,
+            "imap_update_message_flags",
             self.update_flags_impl(input)
                 .await
                 .map(|data| ("Flags updated".to_owned(), data)),
@@ -229,6 +236,7 @@ impl MailImapServer {
         let started = Instant::now();
         finalize_tool(
             started,
+            "imap_copy_message",
             self.copy_message_impl(input)
                 .await
                 .map(|data| ("Message copied".to_owned(), data)),
@@ -248,6 +256,7 @@ impl MailImapServer {
         let started = Instant::now();
         finalize_tool(
             started,
+            "imap_move_message",
             self.move_message_impl(input)
                 .await
                 .map(|data| ("Message moved".to_owned(), data)),
@@ -266,6 +275,7 @@ impl MailImapServer {
         let started = Instant::now();
         finalize_tool(
             started,
+            "imap_delete_message",
             self.delete_message_impl(input)
                 .await
                 .map(|data| ("Message deleted".to_owned(), data)),
@@ -292,12 +302,74 @@ impl ServerHandler for MailImapServer {
 /// Search result data structure
 #[derive(Debug, serde::Serialize)]
 struct SearchResultData {
+    status: String,
+    issues: Vec<ToolIssue>,
+    next_action: NextAction,
     account_id: String,
     mailbox: String,
     total: usize,
+    attempted: usize,
+    returned: usize,
+    failed: usize,
     messages: Vec<MessageSummary>,
     next_cursor: Option<String>,
     has_more: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct NextAction {
+    instruction: String,
+    tool: String,
+    arguments: serde_json::Value,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ToolIssue {
+    code: String,
+    stage: String,
+    message: String,
+    retryable: bool,
+    uid: Option<u32>,
+    message_id: Option<String>,
+}
+
+impl ToolIssue {
+    fn from_error(stage: &str, error: &AppError) -> Self {
+        let (code, retryable) = match error {
+            AppError::InvalidInput(_) => ("invalid_input", false),
+            AppError::NotFound(_) => ("not_found", false),
+            AppError::AuthFailed(_) => ("auth_failed", false),
+            AppError::Timeout(_) => ("timeout", true),
+            AppError::Conflict(_) => ("conflict", false),
+            AppError::Internal(_) => ("internal", true),
+        };
+        Self {
+            code: code.to_owned(),
+            stage: stage.to_owned(),
+            message: error.to_string(),
+            retryable,
+            uid: None,
+            message_id: None,
+        }
+    }
+
+    fn with_uid(mut self, uid: u32) -> Self {
+        self.uid = Some(uid);
+        self
+    }
+
+    fn with_message_id(mut self, message_id: &str) -> Self {
+        self.message_id = Some(message_id.to_owned());
+        self
+    }
+}
+
+#[derive(Debug)]
+struct SummaryBuildResult {
+    messages: Vec<MessageSummary>,
+    issues: Vec<ToolIssue>,
+    attempted: usize,
+    failed: usize,
 }
 
 /// Tool implementation methods
@@ -308,19 +380,62 @@ impl MailImapServer {
     async fn verify_account_impl(&self, input: AccountOnlyInput) -> AppResult<serde_json::Value> {
         validate_account_id(&input.account_id)?;
         let account = self.config.get_account(&input.account_id)?;
-        let mut session = imap::connect_authenticated(&self.config, account).await?;
-
         let started = Instant::now();
-        imap::noop(&self.config, &mut session).await?;
-        let caps = imap::capabilities(&self.config, &mut session).await?;
+        let mut issues = Vec::new();
 
-        let mut capabilities = caps.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>();
+        let mut session = match imap::connect_authenticated(&self.config, account).await {
+            Ok(session) => session,
+            Err(error) => {
+                issues.push(ToolIssue::from_error("connect_authenticated", &error));
+                log_runtime_issues(
+                    "imap_verify_account",
+                    "failed",
+                    &input.account_id,
+                    None,
+                    &issues,
+                );
+                return Ok(serde_json::json!({
+                    "status": "failed",
+                    "issues": issues,
+                    "next_action": next_action_retry_verify(&input.account_id),
+                    "account_id": account.account_id,
+                    "ok": false,
+                    "latency_ms": duration_ms(started),
+                    "server": { "host": account.host, "port": account.port, "secure": account.secure },
+                    "capabilities": []
+                }));
+            }
+        };
+
+        if let Err(error) = imap::noop(&self.config, &mut session).await {
+            issues.push(ToolIssue::from_error("noop", &error));
+        }
+
+        let mut capabilities = match imap::capabilities(&self.config, &mut session).await {
+            Ok(caps) => caps.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>(),
+            Err(error) => {
+                issues.push(ToolIssue::from_error("capabilities", &error));
+                Vec::new()
+            }
+        };
         capabilities.sort();
         capabilities.truncate(256);
 
+        let status = status_from_counts(issues.is_empty(), true);
+        log_runtime_issues(
+            "imap_verify_account",
+            status,
+            &input.account_id,
+            None,
+            &issues,
+        );
+
         Ok(serde_json::json!({
+            "status": status,
+            "issues": issues,
+            "next_action": next_action_list_mailboxes(&input.account_id),
             "account_id": account.account_id,
-            "ok": true,
+            "ok": status != "failed",
             "latency_ms": duration_ms(started),
             "server": { "host": account.host, "port": account.port, "secure": account.secure },
             "capabilities": capabilities
@@ -330,9 +445,36 @@ impl MailImapServer {
     async fn list_mailboxes_impl(&self, input: AccountOnlyInput) -> AppResult<serde_json::Value> {
         validate_account_id(&input.account_id)?;
         let account = self.config.get_account(&input.account_id)?;
-        let mut session = imap::connect_authenticated(&self.config, account).await?;
+        let mut issues = Vec::new();
 
-        let items = imap::list_all_mailboxes(&self.config, &mut session).await?;
+        let mut session = match imap::connect_authenticated(&self.config, account).await {
+            Ok(session) => session,
+            Err(error) => {
+                issues.push(ToolIssue::from_error("connect_authenticated", &error));
+                log_runtime_issues(
+                    "imap_list_mailboxes",
+                    "failed",
+                    &input.account_id,
+                    None,
+                    &issues,
+                );
+                return Ok(serde_json::json!({
+                    "status": "failed",
+                    "issues": issues,
+                    "next_action": next_action_retry_verify(&input.account_id),
+                    "account_id": account.account_id,
+                    "mailboxes": []
+                }));
+            }
+        };
+
+        let items = match imap::list_all_mailboxes(&self.config, &mut session).await {
+            Ok(items) => items,
+            Err(error) => {
+                issues.push(ToolIssue::from_error("list_mailboxes", &error));
+                Vec::new()
+            }
+        };
 
         let mailboxes = items
             .into_iter()
@@ -343,7 +485,22 @@ impl MailImapServer {
             })
             .collect::<Vec<_>>();
 
+        let status = status_from_counts(issues.is_empty(), !mailboxes.is_empty());
+        log_runtime_issues(
+            "imap_list_mailboxes",
+            status,
+            &input.account_id,
+            None,
+            &issues,
+        );
+        let next_action = preferred_mailbox_name(&mailboxes)
+            .map(|mailbox| next_action_search_mailbox(&input.account_id, &mailbox))
+            .unwrap_or_else(|| next_action_retry_verify(&input.account_id));
+
         Ok(serde_json::json!({
+            "status": status,
+            "issues": issues,
+            "next_action": next_action,
             "account_id": account.account_id,
             "mailboxes": mailboxes,
         }))
@@ -357,14 +514,96 @@ impl MailImapServer {
         validate_account_id(&input.account_id)?;
         validate_mailbox(&input.mailbox)?;
         let account = self.config.get_account(&input.account_id)?;
-        let mut session = imap::connect_authenticated(&self.config, account).await?;
+        let mut session = match imap::connect_authenticated(&self.config, account).await {
+            Ok(session) => session,
+            Err(error) => {
+                let issue = ToolIssue::from_error("connect_authenticated", &error);
+                let issues = vec![issue];
+                log_runtime_issues(
+                    "imap_search_messages",
+                    "failed",
+                    &input.account_id,
+                    Some(&input.mailbox),
+                    &issues,
+                );
+                return Ok(SearchResultData {
+                    status: "failed".to_owned(),
+                    issues,
+                    next_action: next_action_retry_verify(&input.account_id),
+                    account_id: input.account_id,
+                    mailbox: input.mailbox,
+                    total: 0,
+                    attempted: 0,
+                    returned: 0,
+                    failed: 0,
+                    messages: Vec::new(),
+                    next_cursor: None,
+                    has_more: false,
+                });
+            }
+        };
         let uidvalidity =
-            imap::select_mailbox_readonly(&self.config, &mut session, &input.mailbox).await?;
+            match imap::select_mailbox_readonly(&self.config, &mut session, &input.mailbox).await {
+                Ok(uidvalidity) => uidvalidity,
+                Err(error) => {
+                    let issue = ToolIssue::from_error("select_mailbox_readonly", &error);
+                    let issues = vec![issue];
+                    log_runtime_issues(
+                        "imap_search_messages",
+                        "failed",
+                        &input.account_id,
+                        Some(&input.mailbox),
+                        &issues,
+                    );
+                    return Ok(SearchResultData {
+                        status: "failed".to_owned(),
+                        issues,
+                        next_action: next_action_retry_verify(&input.account_id),
+                        account_id: input.account_id,
+                        mailbox: input.mailbox,
+                        total: 0,
+                        attempted: 0,
+                        returned: 0,
+                        failed: 0,
+                        messages: Vec::new(),
+                        next_cursor: None,
+                        has_more: false,
+                    });
+                }
+            };
 
         let snapshot = if let Some(cursor) = input.cursor.clone() {
             resume_cursor_search(&self.cursors, &input, uidvalidity, cursor).await?
         } else {
-            start_new_search(&self.config, &mut session, &input).await?
+            match start_new_search(&self.config, &mut session, &input).await {
+                Ok(snapshot) => snapshot,
+                Err(error) if is_hard_precondition_error(&error) => return Err(error),
+                Err(error) => {
+                    let issue = ToolIssue::from_error("uid_search", &error);
+                    let issues = vec![issue];
+                    log_runtime_issues(
+                        "imap_search_messages",
+                        "failed",
+                        &input.account_id,
+                        Some(&input.mailbox),
+                        &issues,
+                    );
+                    return Ok(SearchResultData {
+                        status: "failed".to_owned(),
+                        issues,
+                        next_action: next_action_retry_verify(&input.account_id),
+                        account_id: input.account_id,
+                        mailbox: input.mailbox,
+                        total: 0,
+                        attempted: 0,
+                        returned: 0,
+                        failed: 0,
+                        messages: Vec::new(),
+                        next_cursor: None,
+                        has_more: false,
+                    });
+                }
+            }
         };
 
         let SearchSnapshot {
@@ -390,7 +629,12 @@ impl MailImapServer {
             .copied()
             .collect::<Vec<_>>();
 
-        let messages = build_message_summaries(
+        let SummaryBuildResult {
+            messages,
+            issues,
+            attempted,
+            failed,
+        } = build_message_summaries(
             &self.config,
             &mut session,
             &page_uids,
@@ -402,9 +646,9 @@ impl MailImapServer {
                 snippet_max_chars,
             },
         )
-        .await?;
+        .await;
 
-        let next_offset = offset + messages.len();
+        let next_offset = offset + page_uids.len();
         let has_more = next_offset < total;
         let next_cursor = if has_more {
             let mut store = self.cursors.lock().await;
@@ -432,10 +676,33 @@ impl MailImapServer {
             None
         };
 
+        let status = status_from_issue_and_counts(&issues, !messages.is_empty()).to_owned();
+        log_runtime_issues(
+            "imap_search_messages",
+            &status,
+            &input.account_id,
+            Some(&input.mailbox),
+            &issues,
+        );
+        let next_action = next_action_for_search_result(
+            &status,
+            &input.account_id,
+            &input.mailbox,
+            input.limit,
+            next_cursor.as_deref(),
+            &messages,
+        );
+
         Ok(SearchResultData {
+            status,
+            issues,
+            next_action,
             account_id: input.account_id,
             mailbox: input.mailbox,
             total,
+            attempted,
+            returned: messages.len(),
+            failed,
             messages,
             next_cursor: next_cursor.clone(),
             has_more: next_cursor.is_some(),
@@ -459,19 +726,91 @@ impl MailImapServer {
         )?;
 
         let msg_id = parse_and_validate_message_id(&input.account_id, &input.message_id)?;
+        let encoded_message_id = msg_id.encode();
 
         let account = self.config.get_account(&input.account_id)?;
-        let mut session = imap::connect_authenticated(&self.config, account).await?;
+        let mut issues = Vec::new();
+
+        let mut session = match imap::connect_authenticated(&self.config, account).await {
+            Ok(session) => session,
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("connect_authenticated", &error)
+                        .with_message_id(&encoded_message_id),
+                );
+                log_runtime_issues(
+                    "imap_get_message",
+                    "failed",
+                    &input.account_id,
+                    Some(&msg_id.mailbox),
+                    &issues,
+                );
+                return Ok(serde_json::json!({
+                    "status": "failed",
+                    "issues": issues,
+                    "account_id": input.account_id,
+                    "message": serde_json::Value::Null,
+                }));
+            }
+        };
         ensure_uidvalidity_matches_readonly(&self.config, &mut session, &msg_id).await?;
 
-        let raw = imap::fetch_raw_message(&self.config, &mut session, msg_id.uid).await?;
+        let raw = match imap::fetch_raw_message(&self.config, &mut session, msg_id.uid).await {
+            Ok(raw) => raw,
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("fetch_raw_message", &error)
+                        .with_uid(msg_id.uid)
+                        .with_message_id(&encoded_message_id),
+                );
+                log_runtime_issues(
+                    "imap_get_message",
+                    "failed",
+                    &input.account_id,
+                    Some(&msg_id.mailbox),
+                    &issues,
+                );
+                return Ok(serde_json::json!({
+                    "status": "failed",
+                    "issues": issues,
+                    "account_id": input.account_id,
+                    "message": serde_json::Value::Null,
+                }));
+            }
+        };
+
         let parsed = mime::parse_message(
             &raw,
             input.body_max_chars,
             input.include_html,
             input.extract_attachment_text,
             attachment_text_max_chars,
-        )?;
+        );
+
+        let parsed = match parsed {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("parse_message", &error)
+                        .with_uid(msg_id.uid)
+                        .with_message_id(&encoded_message_id),
+                );
+                log_runtime_issues(
+                    "imap_get_message",
+                    "failed",
+                    &input.account_id,
+                    Some(&msg_id.mailbox),
+                    &issues,
+                );
+                return Ok(serde_json::json!({
+                    "status": "failed",
+                    "issues": issues,
+                    "account_id": input.account_id,
+                    "message": serde_json::Value::Null,
+                }));
+            }
+        };
+
         let headers = if input.include_headers || input.include_all_headers {
             Some(mime::curated_headers(
                 &parsed.headers_all,
@@ -481,9 +820,20 @@ impl MailImapServer {
             None
         };
 
-        let flags = imap::fetch_flags(&self.config, &mut session, msg_id.uid).await?;
+        let flags = match imap::fetch_flags(&self.config, &mut session, msg_id.uid).await {
+            Ok(flags) => Some(flags),
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("fetch_flags", &error)
+                        .with_uid(msg_id.uid)
+                        .with_message_id(&encoded_message_id),
+                );
+                None
+            }
+        };
+
         let detail = MessageDetail {
-            message_id: msg_id.encode(),
+            message_id: encoded_message_id.clone(),
             message_uri: build_message_uri(
                 &input.account_id,
                 &msg_id.mailbox,
@@ -504,7 +854,7 @@ impl MailImapServer {
             to: parsed.to,
             cc: parsed.cc,
             subject: parsed.subject,
-            flags: Some(flags),
+            flags,
             headers,
             body_text: parsed.body_text,
             body_html: parsed.body_html_sanitized,
@@ -517,7 +867,18 @@ impl MailImapServer {
             ),
         };
 
+        let status = status_from_issue_and_counts(&issues, true);
+        log_runtime_issues(
+            "imap_get_message",
+            status,
+            &input.account_id,
+            Some(&msg_id.mailbox),
+            &issues,
+        );
+
         Ok(serde_json::json!({
+            "status": status,
+            "issues": issues,
             "account_id": input.account_id,
             "message": detail,
         }))
@@ -531,21 +892,84 @@ impl MailImapServer {
         validate_chars(input.max_bytes, 1_024, 1_000_000, "max_bytes")?;
 
         let msg_id = parse_and_validate_message_id(&input.account_id, &input.message_id)?;
+        let encoded_message_id = msg_id.encode();
 
         let account = self.config.get_account(&input.account_id)?;
-        let mut session = imap::connect_authenticated(&self.config, account).await?;
+        let mut issues = Vec::new();
+        let mut session = match imap::connect_authenticated(&self.config, account).await {
+            Ok(session) => session,
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("connect_authenticated", &error)
+                        .with_message_id(&encoded_message_id),
+                );
+                log_runtime_issues(
+                    "imap_get_message_raw",
+                    "failed",
+                    &input.account_id,
+                    Some(&msg_id.mailbox),
+                    &issues,
+                );
+                return Ok(serde_json::json!({
+                    "status": "failed",
+                    "issues": issues,
+                    "account_id": input.account_id,
+                    "message_id": encoded_message_id,
+                    "message_uri": build_message_uri(&msg_id.account_id, &msg_id.mailbox, msg_id.uidvalidity, msg_id.uid),
+                    "message_raw_uri": build_message_raw_uri(&msg_id.account_id, &msg_id.mailbox, msg_id.uidvalidity, msg_id.uid),
+                    "size_bytes": 0,
+                    "raw_source": serde_json::Value::Null,
+                }));
+            }
+        };
         ensure_uidvalidity_matches_readonly(&self.config, &mut session, &msg_id).await?;
 
-        let raw = imap::fetch_raw_message(&self.config, &mut session, msg_id.uid).await?;
+        let raw = match imap::fetch_raw_message(&self.config, &mut session, msg_id.uid).await {
+            Ok(raw) => raw,
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("fetch_raw_message", &error)
+                        .with_uid(msg_id.uid)
+                        .with_message_id(&encoded_message_id),
+                );
+                log_runtime_issues(
+                    "imap_get_message_raw",
+                    "failed",
+                    &input.account_id,
+                    Some(&msg_id.mailbox),
+                    &issues,
+                );
+                return Ok(serde_json::json!({
+                    "status": "failed",
+                    "issues": issues,
+                    "account_id": input.account_id,
+                    "message_id": encoded_message_id,
+                    "message_uri": build_message_uri(&msg_id.account_id, &msg_id.mailbox, msg_id.uidvalidity, msg_id.uid),
+                    "message_raw_uri": build_message_raw_uri(&msg_id.account_id, &msg_id.mailbox, msg_id.uidvalidity, msg_id.uid),
+                    "size_bytes": 0,
+                    "raw_source": serde_json::Value::Null,
+                }));
+            }
+        };
         if raw.len() > input.max_bytes {
             return Err(AppError::InvalidInput(
                 "message exceeds max_bytes; increase max_bytes".to_owned(),
             ));
         }
 
+        log_runtime_issues(
+            "imap_get_message_raw",
+            "ok",
+            &input.account_id,
+            Some(&msg_id.mailbox),
+            &issues,
+        );
+
         Ok(serde_json::json!({
+            "status": "ok",
+            "issues": issues,
             "account_id": input.account_id,
-            "message_id": msg_id.encode(),
+            "message_id": encoded_message_id,
             "message_uri": build_message_uri(&msg_id.account_id, &msg_id.mailbox, msg_id.uidvalidity, msg_id.uid),
             "message_raw_uri": build_message_raw_uri(&msg_id.account_id, &msg_id.mailbox, msg_id.uidvalidity, msg_id.uid),
             "size_bytes": raw.len(),
@@ -571,35 +995,102 @@ impl MailImapServer {
         validate_flags(&remove_flags, "remove_flags")?;
 
         let msg_id = parse_and_validate_message_id(&input.account_id, &input.message_id)?;
+        let encoded_message_id = msg_id.encode();
 
         let account = self.config.get_account(&input.account_id)?;
-        let mut session = imap::connect_authenticated(&self.config, account).await?;
+        let mut issues = Vec::new();
+
+        let mut session = match imap::connect_authenticated(&self.config, account).await {
+            Ok(session) => session,
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("connect_authenticated", &error)
+                        .with_message_id(&encoded_message_id),
+                );
+                log_runtime_issues(
+                    "imap_update_message_flags",
+                    "failed",
+                    &input.account_id,
+                    Some(&msg_id.mailbox),
+                    &issues,
+                );
+                return Ok(serde_json::json!({
+                    "status": "failed",
+                    "issues": issues,
+                    "account_id": input.account_id,
+                    "message_id": encoded_message_id,
+                    "flags": serde_json::Value::Null,
+                    "requested_add_flags": add_flags,
+                    "requested_remove_flags": remove_flags,
+                    "applied_add_flags": false,
+                    "applied_remove_flags": false,
+                }));
+            }
+        };
         ensure_uidvalidity_matches_readwrite(&self.config, &mut session, &msg_id).await?;
 
+        let mut applied_add_flags = false;
         if !add_flags.is_empty() {
-            imap::uid_store(
-                &self.config,
-                &mut session,
-                msg_id.uid,
-                format!("+FLAGS.SILENT ({})", add_flags.join(" ")).as_str(),
-            )
-            .await?;
-        }
-        if !remove_flags.is_empty() {
-            imap::uid_store(
-                &self.config,
-                &mut session,
-                msg_id.uid,
-                format!("-FLAGS.SILENT ({})", remove_flags.join(" ")).as_str(),
-            )
-            .await?;
+            let query = format!("+FLAGS.SILENT ({})", add_flags.join(" "));
+            if let Err(error) =
+                imap::uid_store(&self.config, &mut session, msg_id.uid, query.as_str()).await
+            {
+                issues.push(
+                    ToolIssue::from_error("uid_store_add_flags", &error)
+                        .with_uid(msg_id.uid)
+                        .with_message_id(&encoded_message_id),
+                );
+            } else {
+                applied_add_flags = true;
+            }
         }
 
-        let flags = imap::fetch_flags(&self.config, &mut session, msg_id.uid).await?;
+        let mut applied_remove_flags = false;
+        if !remove_flags.is_empty() {
+            let query = format!("-FLAGS.SILENT ({})", remove_flags.join(" "));
+            if let Err(error) =
+                imap::uid_store(&self.config, &mut session, msg_id.uid, query.as_str()).await
+            {
+                issues.push(
+                    ToolIssue::from_error("uid_store_remove_flags", &error)
+                        .with_uid(msg_id.uid)
+                        .with_message_id(&encoded_message_id),
+                );
+            } else {
+                applied_remove_flags = true;
+            }
+        }
+
+        let flags = match imap::fetch_flags(&self.config, &mut session, msg_id.uid).await {
+            Ok(flags) => Some(flags),
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("fetch_flags", &error)
+                        .with_uid(msg_id.uid)
+                        .with_message_id(&encoded_message_id),
+                );
+                None
+            }
+        };
+
+        let status = status_from_issue_and_counts(&issues, flags.is_some());
+        log_runtime_issues(
+            "imap_update_message_flags",
+            status,
+            &input.account_id,
+            Some(&msg_id.mailbox),
+            &issues,
+        );
         Ok(serde_json::json!({
+            "status": status,
+            "issues": issues,
             "account_id": input.account_id,
-            "message_id": msg_id.encode(),
+            "message_id": encoded_message_id,
             "flags": flags,
+            "requested_add_flags": add_flags,
+            "requested_remove_flags": remove_flags,
+            "applied_add_flags": applied_add_flags,
+            "applied_remove_flags": applied_remove_flags,
         }))
     }
 
@@ -614,44 +1105,207 @@ impl MailImapServer {
         validate_account_id(&destination_account_id)?;
 
         let msg_id = parse_and_validate_message_id(&input.account_id, &input.message_id)?;
+        let encoded_message_id = msg_id.encode();
+        let mut issues = Vec::new();
+        let mut steps_succeeded = 0usize;
+        let mut steps_attempted = 0usize;
 
         if destination_account_id == input.account_id {
             let account = self.config.get_account(&input.account_id)?;
-            let mut session = imap::connect_authenticated(&self.config, account).await?;
+            steps_attempted += 1;
+            let mut session = match imap::connect_authenticated(&self.config, account).await {
+                Ok(session) => {
+                    steps_succeeded += 1;
+                    session
+                }
+                Err(error) => {
+                    issues.push(
+                        ToolIssue::from_error("connect_authenticated_source", &error)
+                            .with_message_id(&encoded_message_id),
+                    );
+                    log_runtime_issues(
+                        "imap_copy_message",
+                        "failed",
+                        &input.account_id,
+                        Some(&msg_id.mailbox),
+                        &issues,
+                    );
+                    return Ok(serde_json::json!({
+                        "status": "failed",
+                        "issues": issues,
+                        "source_account_id": input.account_id,
+                        "destination_account_id": destination_account_id,
+                        "source_mailbox": msg_id.mailbox,
+                        "destination_mailbox": input.destination_mailbox,
+                        "message_id": encoded_message_id,
+                        "new_message_id": serde_json::Value::Null,
+                        "steps_attempted": steps_attempted,
+                        "steps_succeeded": steps_succeeded,
+                    }));
+                }
+            };
             ensure_uidvalidity_matches_readwrite(&self.config, &mut session, &msg_id).await?;
-            imap::uid_copy(
+            steps_attempted += 1;
+            if let Err(error) = imap::uid_copy(
                 &self.config,
                 &mut session,
                 msg_id.uid,
                 input.destination_mailbox.as_str(),
             )
-            .await?;
+            .await
+            {
+                issues.push(
+                    ToolIssue::from_error("uid_copy", &error)
+                        .with_uid(msg_id.uid)
+                        .with_message_id(&encoded_message_id),
+                );
+            } else {
+                steps_succeeded += 1;
+            }
         } else {
             let source = self.config.get_account(&input.account_id)?;
-            let mut source_session = imap::connect_authenticated(&self.config, source).await?;
+            steps_attempted += 1;
+            let mut source_session = match imap::connect_authenticated(&self.config, source).await {
+                Ok(session) => {
+                    steps_succeeded += 1;
+                    session
+                }
+                Err(error) => {
+                    issues.push(
+                        ToolIssue::from_error("connect_authenticated_source", &error)
+                            .with_message_id(&encoded_message_id),
+                    );
+                    log_runtime_issues(
+                        "imap_copy_message",
+                        "failed",
+                        &input.account_id,
+                        Some(&msg_id.mailbox),
+                        &issues,
+                    );
+                    return Ok(serde_json::json!({
+                        "status": "failed",
+                        "issues": issues,
+                        "source_account_id": input.account_id,
+                        "destination_account_id": destination_account_id,
+                        "source_mailbox": msg_id.mailbox,
+                        "destination_mailbox": input.destination_mailbox,
+                        "message_id": encoded_message_id,
+                        "new_message_id": serde_json::Value::Null,
+                        "steps_attempted": steps_attempted,
+                        "steps_succeeded": steps_succeeded,
+                    }));
+                }
+            };
             ensure_uidvalidity_matches_readonly(&self.config, &mut source_session, &msg_id).await?;
-            let raw =
-                imap::fetch_raw_message(&self.config, &mut source_session, msg_id.uid).await?;
+            steps_attempted += 1;
+            let raw = match imap::fetch_raw_message(&self.config, &mut source_session, msg_id.uid)
+                .await
+            {
+                Ok(raw) => {
+                    steps_succeeded += 1;
+                    raw
+                }
+                Err(error) => {
+                    issues.push(
+                        ToolIssue::from_error("fetch_raw_message_source", &error)
+                            .with_uid(msg_id.uid)
+                            .with_message_id(&encoded_message_id),
+                    );
+                    log_runtime_issues(
+                        "imap_copy_message",
+                        "failed",
+                        &input.account_id,
+                        Some(&msg_id.mailbox),
+                        &issues,
+                    );
+                    return Ok(serde_json::json!({
+                        "status": "failed",
+                        "issues": issues,
+                        "source_account_id": input.account_id,
+                        "destination_account_id": destination_account_id,
+                        "source_mailbox": msg_id.mailbox,
+                        "destination_mailbox": input.destination_mailbox,
+                        "message_id": encoded_message_id,
+                        "new_message_id": serde_json::Value::Null,
+                        "steps_attempted": steps_attempted,
+                        "steps_succeeded": steps_succeeded,
+                    }));
+                }
+            };
 
             let destination = self.config.get_account(&destination_account_id)?;
+            steps_attempted += 1;
             let mut destination_session =
-                imap::connect_authenticated(&self.config, destination).await?;
-            imap::append(
+                match imap::connect_authenticated(&self.config, destination).await {
+                    Ok(session) => {
+                        steps_succeeded += 1;
+                        session
+                    }
+                    Err(error) => {
+                        issues.push(
+                            ToolIssue::from_error("connect_authenticated_destination", &error)
+                                .with_message_id(&encoded_message_id),
+                        );
+                        let status = status_from_issue_and_counts(&issues, steps_succeeded > 0);
+                        log_runtime_issues(
+                            "imap_copy_message",
+                            status,
+                            &input.account_id,
+                            Some(&msg_id.mailbox),
+                            &issues,
+                        );
+                        return Ok(serde_json::json!({
+                            "status": status,
+                            "issues": issues,
+                            "source_account_id": input.account_id,
+                            "destination_account_id": destination_account_id,
+                            "source_mailbox": msg_id.mailbox,
+                            "destination_mailbox": input.destination_mailbox,
+                            "message_id": encoded_message_id,
+                            "new_message_id": serde_json::Value::Null,
+                            "steps_attempted": steps_attempted,
+                            "steps_succeeded": steps_succeeded,
+                        }));
+                    }
+                };
+            steps_attempted += 1;
+            if let Err(error) = imap::append(
                 &self.config,
                 &mut destination_session,
                 input.destination_mailbox.as_str(),
                 raw.as_slice(),
             )
-            .await?;
+            .await
+            {
+                issues.push(
+                    ToolIssue::from_error("append_destination", &error)
+                        .with_message_id(&encoded_message_id),
+                );
+            } else {
+                steps_succeeded += 1;
+            }
         }
 
+        let status = status_from_issue_and_counts(&issues, steps_succeeded > 0);
+        log_runtime_issues(
+            "imap_copy_message",
+            status,
+            &input.account_id,
+            Some(&msg_id.mailbox),
+            &issues,
+        );
+
         Ok(serde_json::json!({
+            "status": status,
+            "issues": issues,
             "source_account_id": input.account_id,
             "destination_account_id": destination_account_id,
             "source_mailbox": msg_id.mailbox,
             "destination_mailbox": input.destination_mailbox,
-            "message_id": msg_id.encode(),
+            "message_id": encoded_message_id,
             "new_message_id": serde_json::Value::Null,
+            "steps_attempted": steps_attempted,
+            "steps_succeeded": steps_succeeded,
         }))
     }
 
@@ -661,44 +1315,176 @@ impl MailImapServer {
         validate_mailbox(&input.destination_mailbox)?;
 
         let msg_id = parse_and_validate_message_id(&input.account_id, &input.message_id)?;
+        let encoded_message_id = msg_id.encode();
 
         let account = self.config.get_account(&input.account_id)?;
-        let mut session = imap::connect_authenticated(&self.config, account).await?;
+        let mut issues = Vec::new();
+        let mut steps_attempted = 0usize;
+        let mut steps_succeeded = 0usize;
+
+        steps_attempted += 1;
+        let mut session = match imap::connect_authenticated(&self.config, account).await {
+            Ok(session) => {
+                steps_succeeded += 1;
+                session
+            }
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("connect_authenticated", &error)
+                        .with_message_id(&encoded_message_id),
+                );
+                log_runtime_issues(
+                    "imap_move_message",
+                    "failed",
+                    &input.account_id,
+                    Some(&msg_id.mailbox),
+                    &issues,
+                );
+                return Ok(serde_json::json!({
+                    "status": "failed",
+                    "issues": issues,
+                    "account_id": input.account_id,
+                    "source_mailbox": msg_id.mailbox,
+                    "destination_mailbox": input.destination_mailbox,
+                    "message_id": encoded_message_id,
+                    "new_message_id": serde_json::Value::Null,
+                    "steps_attempted": steps_attempted,
+                    "steps_succeeded": steps_succeeded,
+                }));
+            }
+        };
         ensure_uidvalidity_matches_readwrite(&self.config, &mut session, &msg_id).await?;
 
-        let caps = imap::capabilities(&self.config, &mut session).await?;
+        steps_attempted += 1;
+        let caps = match imap::capabilities(&self.config, &mut session).await {
+            Ok(caps) => {
+                steps_succeeded += 1;
+                caps
+            }
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("capabilities", &error)
+                        .with_uid(msg_id.uid)
+                        .with_message_id(&encoded_message_id),
+                );
+                let status = status_from_issue_and_counts(&issues, steps_succeeded > 0);
+                log_runtime_issues(
+                    "imap_move_message",
+                    status,
+                    &input.account_id,
+                    Some(&msg_id.mailbox),
+                    &issues,
+                );
+                return Ok(serde_json::json!({
+                    "status": status,
+                    "issues": issues,
+                    "account_id": input.account_id,
+                    "source_mailbox": msg_id.mailbox,
+                    "destination_mailbox": input.destination_mailbox,
+                    "message_id": encoded_message_id,
+                    "new_message_id": serde_json::Value::Null,
+                    "steps_attempted": steps_attempted,
+                    "steps_succeeded": steps_succeeded,
+                }));
+            }
+        };
+
         if caps.has_str("MOVE") {
-            imap::uid_move(
+            steps_attempted += 1;
+            if let Err(error) = imap::uid_move(
                 &self.config,
                 &mut session,
                 msg_id.uid,
                 input.destination_mailbox.as_str(),
             )
-            .await?;
+            .await
+            {
+                issues.push(
+                    ToolIssue::from_error("uid_move", &error)
+                        .with_uid(msg_id.uid)
+                        .with_message_id(&encoded_message_id),
+                );
+            } else {
+                steps_succeeded += 1;
+            }
         } else {
-            imap::uid_copy(
+            steps_attempted += 1;
+            let copied = if let Err(error) = imap::uid_copy(
                 &self.config,
                 &mut session,
                 msg_id.uid,
                 input.destination_mailbox.as_str(),
             )
-            .await?;
-            imap::uid_store(
-                &self.config,
-                &mut session,
-                msg_id.uid,
-                "+FLAGS.SILENT (\\Deleted)",
-            )
-            .await?;
-            imap::uid_expunge(&self.config, &mut session, msg_id.uid).await?;
+            .await
+            {
+                issues.push(
+                    ToolIssue::from_error("uid_copy", &error)
+                        .with_uid(msg_id.uid)
+                        .with_message_id(&encoded_message_id),
+                );
+                false
+            } else {
+                steps_succeeded += 1;
+                true
+            };
+
+            if copied {
+                steps_attempted += 1;
+                let deleted = if let Err(error) = imap::uid_store(
+                    &self.config,
+                    &mut session,
+                    msg_id.uid,
+                    "+FLAGS.SILENT (\\Deleted)",
+                )
+                .await
+                {
+                    issues.push(
+                        ToolIssue::from_error("uid_store_deleted", &error)
+                            .with_uid(msg_id.uid)
+                            .with_message_id(&encoded_message_id),
+                    );
+                    false
+                } else {
+                    steps_succeeded += 1;
+                    true
+                };
+
+                if deleted {
+                    steps_attempted += 1;
+                    if let Err(error) =
+                        imap::uid_expunge(&self.config, &mut session, msg_id.uid).await
+                    {
+                        issues.push(
+                            ToolIssue::from_error("uid_expunge", &error)
+                                .with_uid(msg_id.uid)
+                                .with_message_id(&encoded_message_id),
+                        );
+                    } else {
+                        steps_succeeded += 1;
+                    }
+                }
+            }
         }
 
+        let status = status_from_issue_and_counts(&issues, steps_succeeded > 0);
+        log_runtime_issues(
+            "imap_move_message",
+            status,
+            &input.account_id,
+            Some(&msg_id.mailbox),
+            &issues,
+        );
+
         Ok(serde_json::json!({
+            "status": status,
+            "issues": issues,
             "account_id": input.account_id,
             "source_mailbox": msg_id.mailbox,
             "destination_mailbox": input.destination_mailbox,
-            "message_id": msg_id.encode(),
+            "message_id": encoded_message_id,
             "new_message_id": serde_json::Value::Null,
+            "steps_attempted": steps_attempted,
+            "steps_succeeded": steps_succeeded,
         }))
     }
 
@@ -712,24 +1498,94 @@ impl MailImapServer {
         }
 
         let msg_id = parse_and_validate_message_id(&input.account_id, &input.message_id)?;
+        let encoded_message_id = msg_id.encode();
 
         let account = self.config.get_account(&input.account_id)?;
-        let mut session = imap::connect_authenticated(&self.config, account).await?;
+        let mut issues = Vec::new();
+        let mut steps_attempted = 0usize;
+        let mut steps_succeeded = 0usize;
+
+        steps_attempted += 1;
+        let mut session = match imap::connect_authenticated(&self.config, account).await {
+            Ok(session) => {
+                steps_succeeded += 1;
+                session
+            }
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("connect_authenticated", &error)
+                        .with_message_id(&encoded_message_id),
+                );
+                log_runtime_issues(
+                    "imap_delete_message",
+                    "failed",
+                    &input.account_id,
+                    Some(&msg_id.mailbox),
+                    &issues,
+                );
+                return Ok(serde_json::json!({
+                    "status": "failed",
+                    "issues": issues,
+                    "account_id": input.account_id,
+                    "mailbox": msg_id.mailbox,
+                    "message_id": encoded_message_id,
+                    "steps_attempted": steps_attempted,
+                    "steps_succeeded": steps_succeeded,
+                }));
+            }
+        };
         ensure_uidvalidity_matches_readwrite(&self.config, &mut session, &msg_id).await?;
 
-        imap::uid_store(
+        steps_attempted += 1;
+        let flagged_deleted = if let Err(error) = imap::uid_store(
             &self.config,
             &mut session,
             msg_id.uid,
             "+FLAGS.SILENT (\\Deleted)",
         )
-        .await?;
-        imap::uid_expunge(&self.config, &mut session, msg_id.uid).await?;
+        .await
+        {
+            issues.push(
+                ToolIssue::from_error("uid_store_deleted", &error)
+                    .with_uid(msg_id.uid)
+                    .with_message_id(&encoded_message_id),
+            );
+            false
+        } else {
+            steps_succeeded += 1;
+            true
+        };
+
+        if flagged_deleted {
+            steps_attempted += 1;
+            if let Err(error) = imap::uid_expunge(&self.config, &mut session, msg_id.uid).await {
+                issues.push(
+                    ToolIssue::from_error("uid_expunge", &error)
+                        .with_uid(msg_id.uid)
+                        .with_message_id(&encoded_message_id),
+                );
+            } else {
+                steps_succeeded += 1;
+            }
+        }
+
+        let status = status_from_issue_and_counts(&issues, steps_succeeded > 0);
+        log_runtime_issues(
+            "imap_delete_message",
+            status,
+            &input.account_id,
+            Some(&msg_id.mailbox),
+            &issues,
+        );
 
         Ok(serde_json::json!({
+            "status": status,
+            "issues": issues,
             "account_id": input.account_id,
             "mailbox": msg_id.mailbox,
-            "message_id": msg_id.encode(),
+            "message_id": encoded_message_id,
+            "steps_attempted": steps_attempted,
+            "steps_succeeded": steps_succeeded,
         }))
     }
 }
@@ -739,9 +1595,176 @@ fn duration_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+fn status_from_counts(no_issues: bool, has_data: bool) -> &'static str {
+    if no_issues {
+        "ok"
+    } else if has_data {
+        "partial"
+    } else {
+        "failed"
+    }
+}
+
+fn status_from_issue_and_counts(issues: &[ToolIssue], has_data: bool) -> &'static str {
+    status_from_counts(issues.is_empty(), has_data)
+}
+
+fn app_error_code(error: &AppError) -> &'static str {
+    match error {
+        AppError::InvalidInput(_) => "invalid_input",
+        AppError::NotFound(_) => "not_found",
+        AppError::AuthFailed(_) => "auth_failed",
+        AppError::Timeout(_) => "timeout",
+        AppError::Conflict(_) => "conflict",
+        AppError::Internal(_) => "internal",
+    }
+}
+
+fn log_runtime_issues(
+    tool: &str,
+    status: &str,
+    account_id: &str,
+    mailbox: Option<&str>,
+    issues: &[ToolIssue],
+) {
+    for issue in issues {
+        let is_error = status == "failed" || matches!(issue.code.as_str(), "internal" | "timeout");
+        if is_error {
+            error!(
+                tool,
+                stage = %issue.stage,
+                code = %issue.code,
+                retryable = issue.retryable,
+                account_id,
+                mailbox = ?mailbox,
+                uid = ?issue.uid,
+                message_id = ?issue.message_id,
+                message = %issue.message,
+                "runtime imap issue"
+            );
+        } else {
+            warn!(
+                tool,
+                stage = %issue.stage,
+                code = %issue.code,
+                retryable = issue.retryable,
+                account_id,
+                mailbox = ?mailbox,
+                uid = ?issue.uid,
+                message_id = ?issue.message_id,
+                message = %issue.message,
+                "runtime imap issue"
+            );
+        }
+    }
+}
+
+fn next_action(instruction: &str, tool: &str, arguments: serde_json::Value) -> NextAction {
+    NextAction {
+        instruction: instruction.to_owned(),
+        tool: tool.to_owned(),
+        arguments,
+    }
+}
+
+fn next_action_retry_verify(account_id: &str) -> NextAction {
+    next_action(
+        "Re-verify account connectivity before proceeding.",
+        "imap_verify_account",
+        serde_json::json!({
+            "account_id": account_id,
+        }),
+    )
+}
+
+fn next_action_list_mailboxes(account_id: &str) -> NextAction {
+    next_action(
+        "List mailboxes to choose a mailbox for message search.",
+        "imap_list_mailboxes",
+        serde_json::json!({
+            "account_id": account_id,
+        }),
+    )
+}
+
+fn next_action_search_mailbox(account_id: &str, mailbox: &str) -> NextAction {
+    next_action(
+        "Search for messages in the selected mailbox.",
+        "imap_search_messages",
+        serde_json::json!({
+            "account_id": account_id,
+            "mailbox": mailbox,
+            "limit": 10,
+            "include_snippet": false,
+        }),
+    )
+}
+
+fn preferred_mailbox_name(mailboxes: &[MailboxInfo]) -> Option<String> {
+    mailboxes
+        .iter()
+        .find(|m| m.name.eq_ignore_ascii_case("INBOX"))
+        .map(|m| m.name.clone())
+        .or_else(|| mailboxes.first().map(|m| m.name.clone()))
+}
+
+fn next_action_for_search_result(
+    status: &str,
+    account_id: &str,
+    mailbox: &str,
+    limit: usize,
+    cursor: Option<&str>,
+    messages: &[MessageSummary],
+) -> NextAction {
+    if let Some(cursor) = cursor {
+        return next_action(
+            "Continue pagination to retrieve more messages.",
+            "imap_search_messages",
+            serde_json::json!({
+                "account_id": account_id,
+                "mailbox": mailbox,
+                "cursor": cursor,
+                "limit": limit,
+                "include_snippet": false,
+            }),
+        );
+    }
+
+    if status == "failed" {
+        return next_action_retry_verify(account_id);
+    }
+
+    if let Some(first) = messages.first() {
+        return next_action(
+            "Open a message to inspect full content and headers.",
+            "imap_get_message",
+            serde_json::json!({
+                "account_id": account_id,
+                "message_id": first.message_id,
+            }),
+        );
+    }
+
+    next_action(
+        "Retry search with broader criteria.",
+        "imap_search_messages",
+        serde_json::json!({
+            "account_id": account_id,
+            "mailbox": mailbox,
+            "limit": limit,
+            "include_snippet": false,
+        }),
+    )
+}
+
+fn is_hard_precondition_error(error: &AppError) -> bool {
+    matches!(error, AppError::InvalidInput(_) | AppError::Conflict(_))
+}
+
 /// Build a standardized MCP tool response envelope from business logic output
 fn finalize_tool<T>(
     started: Instant,
+    tool: &str,
     result: AppResult<(String, T)>,
 ) -> Result<Json<ToolEnvelope<T>>, ErrorData>
 where
@@ -753,7 +1776,15 @@ where
             data,
             meta: Meta::now(duration_ms(started)),
         })),
-        Err(e) => Err(e.to_error_data()),
+        Err(e) => {
+            error!(
+                tool,
+                code = app_error_code(&e),
+                message = %e,
+                "hard mcp error"
+            );
+            Err(e.to_error_data())
+        }
     }
 }
 
@@ -868,11 +1899,32 @@ async fn build_message_summaries(
     session: &mut imap::ImapSession,
     uids: &[u32],
     options: SummaryBuildOptions<'_>,
-) -> AppResult<Vec<MessageSummary>> {
+) -> SummaryBuildResult {
     let mut messages = Vec::with_capacity(uids.len());
+    let mut issues = Vec::new();
+    let mut failed = 0usize;
+
     for uid in uids {
-        let (header_bytes, flags) = imap::fetch_headers_and_flags(config, session, *uid).await?;
-        let headers = mime::parse_header_bytes(&header_bytes)?;
+        let (header_bytes, flags) = match imap::fetch_headers_and_flags(config, session, *uid).await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                failed += 1;
+                issues
+                    .push(ToolIssue::from_error("fetch_headers_and_flags", &error).with_uid(*uid));
+                continue;
+            }
+        };
+
+        let headers = match mime::parse_header_bytes(&header_bytes) {
+            Ok(headers) => headers,
+            Err(error) => {
+                failed += 1;
+                issues.push(ToolIssue::from_error("parse_header_bytes", &error).with_uid(*uid));
+                continue;
+            }
+        };
+
         let date = header_value(&headers, "date");
         let from = header_value(&headers, "from");
         let subject = header_value(&headers, "subject");
@@ -919,7 +1971,13 @@ async fn build_message_summaries(
             snippet,
         });
     }
-    Ok(messages)
+
+    SummaryBuildResult {
+        messages,
+        issues,
+        attempted: uids.len(),
+        failed,
+    }
 }
 
 struct SummaryBuildOptions<'a> {

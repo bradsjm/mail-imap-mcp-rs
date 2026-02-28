@@ -71,6 +71,16 @@ Error responses use a consistent shape:
 }
 ```
 
+Runtime IMAP command failures are returned in successful `data` payloads whenever
+possible (to preserve partial results for the LLM), using:
+
+- `status`: `ok|partial|failed`
+- `issues`: array of `{ code, stage, message, retryable, uid?, message_id? }`
+- `next_action`: `{ instruction, tool, arguments }`
+
+Hard MCP errors are reserved for validation/precondition failures (for example:
+invalid input, malformed ids, conflicting cursor state, write-gate disabled).
+
 ## Tool Set
 
 ### 1) `imap_list_accounts`
@@ -91,8 +101,11 @@ Input:
 - `account_id` (optional, default `default`)
 
 Output `data`:
+- `status`: `ok|partial|failed`
+- `issues`: array of diagnostic issues
+- `next_action`: `{ instruction, tool, arguments }`
 - `account_id`
-- `ok` (boolean, must be true on success)
+- `ok` (boolean; true unless `status=failed`)
 - `latency_ms` (integer)
 - `server`: `{ host, port, secure }`
 - `capabilities`: string[] (max 256)
@@ -105,6 +118,9 @@ Input:
 - `account_id` (optional)
 
 Output `data`:
+- `status`: `ok|partial|failed`
+- `issues`: array of diagnostic issues
+- `next_action`: `{ instruction, tool, arguments }`
 - `account_id`
 - `mailboxes`: array (max 200) of `{ name, delimiter? }`
 
@@ -138,9 +154,15 @@ Validation:
 - Searches matching more than 20,000 messages are rejected; narrow filters and retry.
 
 Output `data`:
+- `status`: `ok|partial|failed`
+- `issues`: array of diagnostic issues
+- `next_action`: `{ instruction, tool, arguments }`
 - `account_id`
 - `mailbox`
 - `total` (integer)
+- `attempted` (integer)
+- `returned` (integer)
+- `failed` (integer)
 - `messages`: array (max 50) of:
   - `message_id`
   - `mailbox`
@@ -169,6 +191,8 @@ Input:
 - `attachment_text_max_chars?` (100..50000, default 10000; only valid when extraction is enabled)
 
 Output `data`:
+- `status`: `ok|partial|failed`
+- `issues`: array of diagnostic issues
 - `account_id`
 - `message`:
   - `message_id`
@@ -206,6 +230,8 @@ Input:
 - `max_bytes?` (1024..1000000, default 200000)
 
 Output `data`:
+- `status`: `ok|partial|failed`
+- `issues`: array of diagnostic issues
 - `account_id`
 - `message_id`
 - `size_bytes`
@@ -227,9 +253,15 @@ Validation:
 - at least one of `add_flags` or `remove_flags` is required.
 
 Output `data`:
+- `status`: `ok|partial|failed`
+- `issues`: array of diagnostic issues
 - `account_id`
 - `message_id`
-- `flags`: string[]
+- `flags`: string[] (nullable when flag fetch fails)
+- `requested_add_flags`: string[]
+- `requested_remove_flags`: string[]
+- `applied_add_flags`: boolean
+- `applied_remove_flags`: boolean
 
 ### 8) `imap_copy_message`
 
@@ -244,12 +276,16 @@ Input:
 - `destination_account_id?` (defaults to source account)
 
 Output `data`:
+- `status`: `ok|partial|failed`
+- `issues`: array of diagnostic issues
 - `source_account_id`
 - `destination_account_id`
 - `source_mailbox`
 - `destination_mailbox`
 - `message_id`
 - `new_message_id?` (present when server returns UID mapping)
+- `steps_attempted`: integer
+- `steps_succeeded`: integer
 
 ### 9) `imap_move_message`
 
@@ -267,11 +303,15 @@ Behavior:
 - fallback to COPY + DELETE when MOVE unsupported
 
 Output `data`:
+- `status`: `ok|partial|failed`
+- `issues`: array of diagnostic issues
 - `account_id`
 - `source_mailbox`
 - `destination_mailbox`
 - `message_id`
 - `new_message_id?`
+- `steps_attempted`: integer
+- `steps_succeeded`: integer
 
 ### 10) `imap_delete_message`
 
@@ -285,9 +325,13 @@ Input:
 - `confirm` (required literal `true`)
 
 Output `data`:
+- `status`: `ok|partial|failed`
+- `issues`: array of diagnostic issues
 - `account_id`
 - `mailbox`
 - `message_id`
+- `steps_attempted`: integer
+- `steps_succeeded`: integer
 
 ## Security and Guardrails
 
