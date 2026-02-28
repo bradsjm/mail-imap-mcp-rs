@@ -27,8 +27,8 @@ jobs:
         runs-on: "ubuntu-22.04"
         outputs:
             val: ${{ steps.plan.outputs.manifest }}
-            tag: ${{ !github.event.pull_request && github.ref_name || '' }}
-            tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
+            tag: ${{ steps.version.outputs.tag }}
+            tag-flag: ${{ steps.version.outputs.tag_flag }}
             publishing: ${{ !github.event.pull_request }}
         env:
             GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -37,6 +37,30 @@ jobs:
               with:
                   persist-credentials: false
                   submodules: recursive
+            - id: version
+              shell: bash
+              run: |
+                  VERSION=$(awk '
+                    $0 ~ /^\[package\]$/ { in_package=1; next }
+                    $0 ~ /^\[/ { in_package=0 }
+                    in_package && $0 ~ /^version = / {
+                      gsub(/version = "|"/, "", $0)
+                      print $0
+                      exit
+                    }
+                  ' Cargo.toml)
+
+                  if [ -z "$VERSION" ]; then
+                    echo "Failed to read [package].version from Cargo.toml"
+                    exit 1
+                  fi
+
+                  TAG="v${VERSION}"
+                  echo "Resolved release version: $VERSION"
+                  echo "Resolved release tag: $TAG"
+
+                  echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+                  echo "tag_flag=--tag=$TAG" >> "$GITHUB_OUTPUT"
             - name: Install dist
               # we specify bash to get pipefail; it guards against the `curl` command
               # failing. otherwise `sh` won't catch that `curl` returned non-0
@@ -54,7 +78,7 @@ jobs:
             # but also really annoying to build CI around when it needs secrets to work right.)
             - id: plan
               run: |
-                  dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+                  dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', steps.version.outputs.tag)) || 'plan' }} --output-format=json > plan-dist-manifest.json
                   echo "dist ran successfully"
                   cat plan-dist-manifest.json
                   echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"

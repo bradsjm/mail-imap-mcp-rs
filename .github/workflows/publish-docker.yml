@@ -21,14 +21,34 @@ jobs:
             - name: Checkout
               uses: actions/checkout@v6
 
+            - id: version
+              name: Resolve package version tag
+              shell: bash
+              run: |
+                  VERSION=$(awk '
+                    $0 ~ /^\[package\]$/ { in_package=1; next }
+                    $0 ~ /^\[/ { in_package=0 }
+                    in_package && $0 ~ /^version = / {
+                      gsub(/version = "|"/, "", $0)
+                      print $0
+                      exit
+                    }
+                  ' Cargo.toml)
+
+                  if [ -z "$VERSION" ]; then
+                    echo "Failed to read [package].version from Cargo.toml"
+                    exit 1
+                  fi
+
+                  echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
             - name: Extract Docker metadata
               id: meta
               uses: docker/metadata-action@v5
               with:
                   images: ${{ env.IMAGE_NAME }}
                   tags: |
-                      type=ref,event=tag
-                      type=semver,pattern={{version}}
+                      type=raw,value=${{ steps.version.outputs.tag }}
                       type=raw,value=latest
 
     build-amd64:
