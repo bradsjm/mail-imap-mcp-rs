@@ -9,9 +9,9 @@ A secure, efficient Model Context Protocol (MCP) server for IMAP email access ov
 - **Cursor-based pagination**: Efficient message searching across large mailboxes
 - **Message parsing**: Extract text, headers, and attachments with sanitization
 - **Multi-account support**: Configure multiple IMAP accounts via environment variables
-- **Write operations gated**: Copy, move, flag, and delete tools require explicit opt-in
 - **PDF text extraction**: Optional text extraction from PDF attachments
 - **Rust-powered**: Fast, memory-safe async/await implementation with tokio
+- **Write operations**: Copy, move, flag, and delete tools require explicit enable
 
 ## Installation
 
@@ -63,19 +63,13 @@ docker build -t mail-imap-mcp-rs .
 docker run --rm -i --env-file .env mail-imap-mcp-rs
 ```
 
-### Using Cargo
-
-```bash
-cargo install mail-imap-mcp-rs
-```
-
 ### From Source
 
 ```bash
-cargo build --release
+cargo install --path .
 ```
 
-Binary available at `target/release/mail-imap-mcp-rs`.
+Binary available at `$HOME/.cargo/mail-imap-mcp-rs`.
 
 ## Quick Start
 
@@ -102,66 +96,15 @@ MAIL_IMAP_DEFAULT_SECURE=true
 
 **Important:** Use an app-specific password, not your account password. See your email provider's documentation for generating app passwords.
 
-### 2. Verify Connection
+### Enabling Write Operations
 
-Use the MCP client tool to verify your account:
-
-```json
-{
-  "account_id": "default"
-}
-```
-
-This tests connectivity, authentication, and returns server capabilities.
-
-### 3. List Mailboxes
-
-```json
-{
-  "account_id": "default"
-}
-```
-
-### 4. Search Messages
-
-```json
-{
-  "account_id": "default",
-  "mailbox": "INBOX",
-  "limit": 10,
-  "unread_only": true,
-  "last_days": 7
-}
-```
-
-### 5. Fetch a Message
-
-Copy the `message_id` from search results and fetch details:
-
-```json
-{
-  "account_id": "default",
-  "message_id": "imap:default:INBOX:12345:42",
-  "body_max_chars": 2000
-}
-```
-
-## Configuration
-
-### Single Account
+**By default, write operations (copy, move, delete, flag) are disabled**. Enable explicitly:
 
 ```bash
-# Required: connection details
-MAIL_IMAP_DEFAULT_HOST=imap.example.com
-MAIL_IMAP_DEFAULT_USER=your-email@example.com
-MAIL_IMAP_DEFAULT_PASS=your-app-password
-
-# Optional: defaults shown
-MAIL_IMAP_DEFAULT_PORT=993
-MAIL_IMAP_DEFAULT_SECURE=true
+MAIL_IMAP_WRITE_ENABLED=true
 ```
 
-### Multiple Accounts
+## Multiple Accounts
 
 ```bash
 # Default account
@@ -178,14 +121,6 @@ MAIL_IMAP_WORK_PASS=work-password
 MAIL_IMAP_PERSONAL_HOST=imap.fastmail.com
 MAIL_IMAP_PERSONAL_USER=user@fastmail.com
 MAIL_IMAP_PERSONAL_PASS=personal-password
-```
-
-### Enabling Write Operations
-
-By default, write operations (copy, move, delete, flag) are disabled. Enable explicitly:
-
-```bash
-MAIL_IMAP_WRITE_ENABLED=true
 ```
 
 ### Advanced Configuration
@@ -230,99 +165,6 @@ All tools return a consistent envelope:
 Write operations require `MAIL_IMAP_WRITE_ENABLED=true`.
 
 For complete tool contracts, input/output schemas, and validation rules, see [Tool Contract](docs/tool-contract.md).
-
-## Usage Examples
-
-### Search and Read Messages
-
-1. **List accounts**: `imap_list_accounts`
-2. **Search recent unread**:
-   ```json
-   {
-     "account_id": "default",
-     "mailbox": "INBOX",
-     "unread_only": true,
-     "last_days": 7
-   }
-   ```
-3. **Fetch message**: Use `message_id` from search results
-   ```json
-   {
-     "account_id": "default",
-     "message_id": "imap:default:INBOX:12345:42",
-     "body_max_chars": 2000
-   }
-   ```
-
-### Paginate Through Results
-
-1. **Initial search**:
-   ```json
-   {
-     "account_id": "default",
-     "mailbox": "INBOX",
-     "limit": 10
-   }
-   ```
-2. **Next page**: Use `next_cursor` from response
-   ```json
-   {
-     "account_id": "default",
-     "mailbox": "INBOX",
-     "cursor": "550e8400-e29b-41d4-a716-446655440000"
-   }
-   ```
-
-For details on cursor behavior, expiration, and error handling, see [Cursor Pagination](docs/cursor-pagination.md).
-
-### Flag and Archive
-
-Requires `MAIL_IMAP_WRITE_ENABLED=true`.
-
-1. **Mark as flagged**:
-   ```json
-   {
-     "account_id": "default",
-     "message_id": "imap:default:INBOX:12345:42",
-     "add_flags": ["\\Flagged"]
-   }
-   ```
-2. **Copy to archive**:
-   ```json
-   {
-     "account_id": "default",
-     "message_id": "imap:default:INBOX:12345:42",
-     "destination_mailbox": "Archive"
-   }
-   ```
-3. **Delete after processing**:
-   ```json
-   {
-     "account_id": "default",
-     "message_id": "imap:default:INBOX:12345:42",
-     "confirm": true
-   }
-   ```
-
-### Multi-Account Workflow
-
-1. **Search work account**:
-   ```json
-   {
-     "account_id": "work",
-     "mailbox": "INBOX",
-     "subject": "urgent"
-   }
-   ```
-2. **Copy to personal account**:
-   ```json
-   {
-     "account_id": "work",
-     "message_id": "imap:work:INBOX:67890:99",
-     "destination_mailbox": "Inbox",
-     "destination_account_id": "personal"
-   }
-   ```
 
 ## Troubleshooting
 
