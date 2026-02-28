@@ -69,9 +69,9 @@ impl MailImapServer {
         name = "imap_list_accounts",
         description = "List configured IMAP accounts"
     )]
-    async fn list_accounts(&self) -> Result<Json<ToolEnvelope<Vec<AccountInfo>>>, ErrorData> {
+    async fn list_accounts(&self) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
         let started = Instant::now();
-        let data = self
+        let accounts = self
             .config
             .accounts
             .values()
@@ -82,10 +82,24 @@ impl MailImapServer {
                 secure: a.secure,
             })
             .collect::<Vec<_>>();
+        let next_account_id = accounts
+            .first()
+            .map(|a| a.account_id.clone())
+            .unwrap_or_else(|| "default".to_owned());
+        let data = serde_json::json!({
+            "accounts": accounts,
+            "next_action": next_action_list_mailboxes(&next_account_id),
+        });
         finalize_tool(
             started,
             "imap_list_accounts",
-            Ok((format!("{} account(s) configured", data.len()), data)),
+            Ok((
+                format!(
+                    "{} account(s) configured",
+                    self.config.accounts.values().len()
+                ),
+                data,
+            )),
         )
     }
 

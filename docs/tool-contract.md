@@ -92,6 +92,7 @@ Input:
 
 Output `data`:
 - `accounts`: array (max 50) of `{ account_id, host, port, secure }`
+- `next_action`: `{ instruction, tool, arguments }` (recommended follow-up is `imap_list_mailboxes`)
 
 ### 2) `imap_verify_account`
 
