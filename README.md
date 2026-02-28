@@ -73,22 +73,26 @@ Binary available at `$HOME/.cargo/mail-imap-mcp-rs`.
 
 ## Quick Start
 
-### 1. Configure Your Account
+### Configure MCP
 
-Copy the example environment file and add your credentials:
+Use this example MCP configuration and add your credentials:
 
-```bash
-cp .env.example .env
+```json
+{
+  "mcpServers": {
+    "server-name": {
+      "command": "mail-imap-mcp-rs",
+      "env": {
+        "MAIL_IMAP_DEFAULT_HOST": "imap.gmail.com",
+        "MAIL_IMAP_DEFAULT_USER": "your-email@gmail.com",
+        "MAIL_IMAP_DEFAULT_PASS": "your-app-password"
+      }
+    }
+  }
+}
 ```
 
-Edit `.env` with your IMAP details:
-
 ```bash
-# Required: connection details
-MAIL_IMAP_DEFAULT_HOST=imap.gmail.com
-MAIL_IMAP_DEFAULT_USER=your-email@gmail.com
-MAIL_IMAP_DEFAULT_PASS=your-app-password
-
 # Optional: defaults shown
 MAIL_IMAP_DEFAULT_PORT=993
 MAIL_IMAP_DEFAULT_SECURE=true
