@@ -232,10 +232,20 @@ pub async fn fetch_one(
         .map_err(|_| AppError::Timeout("UID FETCH stream timed out".to_owned()))
         .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid fetch stream failed: {e}"))))?;
 
-    fetches
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::NotFound(format!("message uid {uid} not found")))
+    if let Some(fetch) = fetches.into_iter().next() {
+        return Ok(fetch);
+    }
+
+    let existence_query = format!("UID {uid}");
+    match uid_search(server, session, existence_query.as_str()).await {
+        Ok(matches) if matches.contains(&uid) => Err(AppError::Internal(format!(
+            "UID FETCH returned no data for existing uid {uid}; possible server FETCH incompatibility (query: {query})"
+        ))),
+        Ok(_) => Err(AppError::NotFound(format!("message uid {uid} not found"))),
+        Err(error) => Err(AppError::Internal(format!(
+            "UID FETCH returned no data for uid {uid}; failed to verify existence: {error}"
+        ))),
+    }
 }
 
 /// Fetch full RFC822 message source
@@ -266,7 +276,7 @@ pub async fn fetch_headers_and_flags(
         server,
         session,
         uid,
-        "FLAGS BODY.PEEK[HEADER.FIELDS (DATE FROM TO CC SUBJECT)]",
+        "(FLAGS BODY.PEEK[HEADER.FIELDS (DATE FROM TO CC SUBJECT)])",
     )
     .await?;
     let header_bytes = fetch
