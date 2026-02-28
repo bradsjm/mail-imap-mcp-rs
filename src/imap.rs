@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_imap::types::Fetch;
+use async_imap::types::{Fetch, Flag};
 use async_imap::{Client, Session};
 use futures::TryStreamExt;
 use rustls::ClientConfig;
@@ -289,11 +289,24 @@ pub async fn fetch_flags(
     Ok(flags_to_strings(&fetch))
 }
 
-/// Convert fetch flags to string representation
+/// Convert fetch flags to IMAP string representation
 ///
-/// Helper to serialize flag types to `Debug` string format.
+/// Helper to serialize flag types to IMAP wire-format strings.
 pub fn flags_to_strings(fetch: &Fetch) -> Vec<String> {
-    fetch.flags().map(|flag| format!("{flag:?}")).collect()
+    fetch.flags().map(flag_to_string).collect()
+}
+
+fn flag_to_string(flag: Flag<'_>) -> String {
+    match flag {
+        Flag::Seen => "\\Seen".to_owned(),
+        Flag::Answered => "\\Answered".to_owned(),
+        Flag::Flagged => "\\Flagged".to_owned(),
+        Flag::Deleted => "\\Deleted".to_owned(),
+        Flag::Draft => "\\Draft".to_owned(),
+        Flag::Recent => "\\Recent".to_owned(),
+        Flag::MayCreate => "\\*".to_owned(),
+        Flag::Custom(value) => value.into_owned(),
+    }
 }
 
 /// Search for messages matching query
