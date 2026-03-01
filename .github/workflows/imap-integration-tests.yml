@@ -23,8 +23,6 @@ jobs:
 
             - name: Run GreenMail smoke test
               env:
-                  RUN_GREENMAIL_TESTS: "1"
-                  GREENMAIL_EXTERNAL: "1"
                   GREENMAIL_HOST: "localhost"
                   GREENMAIL_IMAPS_PORT: "3993"
-              run: cargo test greenmail -- --nocapture
+              run: scripts/test-greenmail.sh --external

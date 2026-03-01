@@ -442,7 +442,6 @@ pub async fn append(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::process::Command;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -462,81 +461,6 @@ mod tests {
         uid_store,
     };
     use crate::config::{AccountConfig, ServerConfig};
-
-    const GREENMAIL_IMAGE: &str = "greenmail/standalone:2.1.8";
-    const GREENMAIL_NAME: &str = "mail-imap-mcp-rs-greenmail-test";
-    const GREENMAIL_OPTS: &str = "-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled -Dgreenmail.verbose";
-
-    struct GreenmailContainer {
-        name: String,
-    }
-
-    impl GreenmailContainer {
-        fn start() -> Result<Self, String> {
-            let _ = run_docker(["rm", "-f", GREENMAIL_NAME].as_slice());
-
-            run_docker(["pull", GREENMAIL_IMAGE].as_slice())?;
-            run_docker(
-                [
-                    "run",
-                    "-d",
-                    "--rm",
-                    "--name",
-                    GREENMAIL_NAME,
-                    "-e",
-                    &format!("GREENMAIL_OPTS={GREENMAIL_OPTS}"),
-                    "-p",
-                    "3025:3025",
-                    "-p",
-                    "3110:3110",
-                    "-p",
-                    "3143:3143",
-                    "-p",
-                    "3465:3465",
-                    "-p",
-                    "3993:3993",
-                    "-p",
-                    "3995:3995",
-                    GREENMAIL_IMAGE,
-                ]
-                .as_slice(),
-            )?;
-
-            Ok(Self {
-                name: GREENMAIL_NAME.to_owned(),
-            })
-        }
-    }
-
-    impl Drop for GreenmailContainer {
-        fn drop(&mut self) {
-            let _ = run_docker(["rm", "-f", &self.name].as_slice());
-        }
-    }
-
-    fn run_docker(args: &[&str]) -> Result<(), String> {
-        let output = Command::new("docker")
-            .args(args)
-            .output()
-            .map_err(|e| format!("failed to execute docker {:?}: {e}", args))?;
-
-        if output.status.success() {
-            return Ok(());
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!(
-            "docker {:?} failed with status {}: {}",
-            args, output.status, stderr
-        ))
-    }
-
-    fn docker_available() -> bool {
-        Command::new("docker")
-            .arg("version")
-            .output()
-            .is_ok_and(|o| o.status.success())
-    }
 
     fn greenmail_test_config() -> ServerConfig {
         let host = std::env::var("GREENMAIL_HOST").unwrap_or_else(|_| "localhost".to_owned());
@@ -702,21 +626,8 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires running GreenMail IMAPS server"]
     async fn greenmail_imap_smoke_test() {
-        if std::env::var("RUN_GREENMAIL_TESTS").as_deref() != Ok("1") {
-            return;
-        }
-
-        let external = std::env::var("GREENMAIL_EXTERNAL").as_deref() == Ok("1");
-        let _container = if external {
-            None
-        } else {
-            if !docker_available() {
-                panic!("RUN_GREENMAIL_TESTS=1 but docker is unavailable");
-            }
-            Some(GreenmailContainer::start().expect("failed to start greenmail container"))
-        };
-
         let config = greenmail_test_config();
         wait_until_login_works(&config)
             .await
@@ -778,21 +689,8 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires running GreenMail IMAPS server"]
     async fn greenmail_imap_write_paths_test() {
-        if std::env::var("RUN_GREENMAIL_TESTS").as_deref() != Ok("1") {
-            return;
-        }
-
-        let external = std::env::var("GREENMAIL_EXTERNAL").as_deref() == Ok("1");
-        let _container = if external {
-            None
-        } else {
-            if !docker_available() {
-                panic!("RUN_GREENMAIL_TESTS=1 but docker is unavailable");
-            }
-            Some(GreenmailContainer::start().expect("failed to start greenmail container"))
-        };
-
         let config = greenmail_test_config();
         wait_until_login_works(&config)
             .await

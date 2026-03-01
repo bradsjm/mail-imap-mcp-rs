@@ -55,7 +55,7 @@ Use a test name substring:
 Run a single test and show stdout:
 
 - `cargo test parses_mailbox_with_colons -- --exact --nocapture`
-- `RUN_GREENMAIL_TESTS=1 cargo test greenmail_imap_smoke_test -- --exact --nocapture`
+- `cargo test greenmail_imap_smoke_test -- --exact --ignored --nocapture`
 
 Run tests in one module/file scope:
 
