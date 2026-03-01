@@ -2,7 +2,7 @@
 set -euo pipefail
 
 IMAGE="greenmail/standalone:2.1.8"
-NAME="mail-imap-mcp-rs-greenmail-test"
+NAME="mail-imap-mcp-rs-greenmail-inspector"
 GREENMAIL_HOST="${GREENMAIL_HOST:-localhost}"
 GREENMAIL_SMTP_PORT="${GREENMAIL_SMTP_PORT:-3025}"
 GREENMAIL_IMAP_PORT="${GREENMAIL_IMAP_PORT:-3143}"
@@ -12,6 +12,11 @@ GREENMAIL_PRELOAD_DIR="${GREENMAIL_PRELOAD_DIR:-$(pwd)/tests/fixtures/greenmail-
 
 GREENMAIL_OPTS_DEFAULT="-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.users=test:${GREENMAIL_PASS}@localhost -Dgreenmail.users.login=email -Dgreenmail.preload.dir=/greenmail-preload -Dgreenmail.verbose"
 GREENMAIL_OPTS="${GREENMAIL_OPTS:-$GREENMAIL_OPTS_DEFAULT}"
+
+if [[ "$#" -eq 0 ]]; then
+  echo "usage: scripts/test-greenmail-mcp-inspector.sh <command> [args...]" >&2
+  exit 2
+fi
 
 probe_greenmail() {
   python3 - "$GREENMAIL_HOST" "$GREENMAIL_IMAP_PORT" <<'PY'
@@ -79,4 +84,4 @@ GREENMAIL_SMTP_PORT="$GREENMAIL_SMTP_PORT" \
 GREENMAIL_IMAP_PORT="$GREENMAIL_IMAP_PORT" \
 GREENMAIL_USER="$GREENMAIL_USER" \
 GREENMAIL_PASS="$GREENMAIL_PASS" \
-cargo test greenmail -- --ignored --nocapture
+"$@"

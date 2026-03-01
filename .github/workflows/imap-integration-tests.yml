@@ -16,7 +16,8 @@ jobs:
             - name: Run GreenMail smoke test
               env:
                   GREENMAIL_HOST: "localhost"
-                  GREENMAIL_IMAPS_PORT: "3993"
+                  GREENMAIL_SMTP_PORT: "3025"
+                  GREENMAIL_IMAP_PORT: "3143"
                   GREENMAIL_USER: "test@localhost"
                   GREENMAIL_PASS: "test"
               run: scripts/test-greenmail.sh

@@ -462,22 +462,40 @@ mod tests {
     };
     use crate::config::{AccountConfig, ServerConfig};
 
-    fn greenmail_test_config() -> ServerConfig {
-        let host = std::env::var("GREENMAIL_HOST").unwrap_or_else(|_| "localhost".to_owned());
-        let port = std::env::var("GREENMAIL_IMAPS_PORT")
-            .ok()
-            .and_then(|v| v.parse::<u16>().ok())
-            .unwrap_or(3993);
-        let user = std::env::var("GREENMAIL_USER").unwrap_or_else(|_| "test@localhost".to_owned());
-        let pass = std::env::var("GREENMAIL_PASS").unwrap_or_else(|_| "test".to_owned());
+    #[derive(Debug, Clone)]
+    struct GreenmailEndpoints {
+        host: String,
+        smtp_port: u16,
+        imap_port: u16,
+        user: String,
+        pass: String,
+    }
 
+    fn parse_test_port(key: &str, default: u16) -> u16 {
+        std::env::var(key)
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(default)
+    }
+
+    fn greenmail_endpoints() -> GreenmailEndpoints {
+        GreenmailEndpoints {
+            host: std::env::var("GREENMAIL_HOST").unwrap_or_else(|_| "localhost".to_owned()),
+            smtp_port: parse_test_port("GREENMAIL_SMTP_PORT", 3025),
+            imap_port: parse_test_port("GREENMAIL_IMAP_PORT", 3143),
+            user: std::env::var("GREENMAIL_USER").unwrap_or_else(|_| "test@localhost".to_owned()),
+            pass: std::env::var("GREENMAIL_PASS").unwrap_or_else(|_| "test".to_owned()),
+        }
+    }
+
+    fn greenmail_test_config(endpoints: &GreenmailEndpoints) -> ServerConfig {
         let account = AccountConfig {
             account_id: "default".to_owned(),
-            host,
-            port,
+            host: endpoints.host.clone(),
+            port: endpoints.imap_port,
             secure: true,
-            user,
-            pass: SecretString::new(pass.into()),
+            user: endpoints.user.clone(),
+            pass: SecretString::new(endpoints.pass.clone().into()),
         };
 
         let mut accounts = BTreeMap::new();
@@ -544,8 +562,10 @@ mod tests {
 
     async fn connect_authenticated_greenmail(
         config: &ServerConfig,
-        account: &AccountConfig,
     ) -> Result<super::ImapSession, String> {
+        let account = config
+            .get_account("default")
+            .map_err(|e| format!("missing default account: {e}"))?;
         let connect_duration = Duration::from_millis(config.connect_timeout_ms);
         let greeting_duration = Duration::from_millis(config.greeting_timeout_ms);
 
@@ -579,30 +599,62 @@ mod tests {
             return Err("IMAP server closed connection before greeting".to_owned());
         }
 
-        let pass = account.pass.expose_secret();
-        let login = timeout(greeting_duration, client.login(account.user.as_str(), pass))
-            .await
-            .map_err(|_| "IMAP login timeout".to_owned())?;
+        let login = timeout(
+            greeting_duration,
+            client.login(account.user.as_str(), account.pass.expose_secret()),
+        )
+        .await
+        .map_err(|_| "IMAP login timeout".to_owned())?;
+
         login.map_err(|(e, _)| format!("IMAP login failed: {e}"))
     }
 
-    async fn wait_until_login_works(config: &ServerConfig) -> Result<(), String> {
-        let account = config
-            .get_account("default")
-            .map_err(|e| format!("missing default account: {e}"))?;
+    async fn probe_greenmail_imap(endpoints: &GreenmailEndpoints) -> Result<(), String> {
+        timeout(
+            Duration::from_secs(1),
+            TcpStream::connect((endpoints.host.as_str(), endpoints.imap_port)),
+        )
+        .await
+        .map_err(|_| "tcp connect timeout".to_owned())
+        .and_then(|r| r.map_err(|e| format!("tcp connect failed: {e}")))?;
 
-        let mut last_err = String::new();
+        Ok(())
+    }
+
+    async fn wait_until_login_works(
+        config: &ServerConfig,
+        endpoints: &GreenmailEndpoints,
+    ) -> Result<(), String> {
+        let mut last_probe_err = String::new();
+        let mut last_login_err = String::new();
+
         for _ in 0..60 {
-            match connect_authenticated_greenmail(config, account).await {
-                Ok(_) => return Ok(()),
-                Err(e) => {
-                    last_err = e.to_string();
-                }
+            match probe_greenmail_imap(endpoints).await {
+                Ok(()) => match connect_authenticated_greenmail(config).await {
+                    Ok(_) => return Ok(()),
+                    Err(e) => last_login_err = e,
+                },
+                Err(e) => last_probe_err = e,
             }
+
             sleep(Duration::from_secs(1)).await;
         }
+
         Err(format!(
-            "greenmail did not become ready in time (last error: {last_err})"
+            "greenmail unreachable at {}:{} (SMTP={}) after 60s; probe_error='{}'; login_error='{}'",
+            endpoints.host,
+            endpoints.imap_port,
+            endpoints.smtp_port,
+            if last_probe_err.is_empty() {
+                "none"
+            } else {
+                last_probe_err.as_str()
+            },
+            if last_login_err.is_empty() {
+                "none"
+            } else {
+                last_login_err.as_str()
+            }
         ))
     }
 
@@ -628,17 +680,15 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running GreenMail IMAPS server"]
+    #[ignore = "requires running GreenMail IMAP server"]
     async fn greenmail_imap_smoke_test() {
-        let config = greenmail_test_config();
-        wait_until_login_works(&config)
+        let endpoints = greenmail_endpoints();
+        let config = greenmail_test_config(&endpoints);
+        wait_until_login_works(&config, &endpoints)
             .await
             .expect("greenmail did not become ready");
 
-        let account = config
-            .get_account("default")
-            .expect("default account must exist");
-        let mut session = connect_authenticated_greenmail(&config, account)
+        let mut session = connect_authenticated_greenmail(&config)
             .await
             .expect("imap login should work");
 
@@ -732,17 +782,15 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires running GreenMail IMAPS server"]
+    #[ignore = "requires running GreenMail IMAP server"]
     async fn greenmail_imap_write_paths_test() {
-        let config = greenmail_test_config();
-        wait_until_login_works(&config)
+        let endpoints = greenmail_endpoints();
+        let config = greenmail_test_config(&endpoints);
+        wait_until_login_works(&config, &endpoints)
             .await
             .expect("greenmail did not become ready");
 
-        let account = config
-            .get_account("default")
-            .expect("default account must exist");
-        let mut session = connect_authenticated_greenmail(&config, account)
+        let mut session = connect_authenticated_greenmail(&config)
             .await
             .expect("imap login should work");
 
