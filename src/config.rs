@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::env::VarError;
 
 use regex::Regex;
 use secrecy::SecretString;
@@ -105,12 +106,12 @@ impl ServerConfig {
 
         Ok(Self {
             accounts,
-            write_enabled: parse_bool_env("MAIL_IMAP_WRITE_ENABLED", false),
-            connect_timeout_ms: parse_u64_env("MAIL_IMAP_CONNECT_TIMEOUT_MS", 30_000),
-            greeting_timeout_ms: parse_u64_env("MAIL_IMAP_GREETING_TIMEOUT_MS", 15_000),
-            socket_timeout_ms: parse_u64_env("MAIL_IMAP_SOCKET_TIMEOUT_MS", 300_000),
-            cursor_ttl_seconds: parse_u64_env("MAIL_IMAP_CURSOR_TTL_SECONDS", 600),
-            cursor_max_entries: parse_usize_env("MAIL_IMAP_CURSOR_MAX_ENTRIES", 512),
+            write_enabled: parse_bool_env("MAIL_IMAP_WRITE_ENABLED", false)?,
+            connect_timeout_ms: parse_u64_env("MAIL_IMAP_CONNECT_TIMEOUT_MS", 30_000)?,
+            greeting_timeout_ms: parse_u64_env("MAIL_IMAP_GREETING_TIMEOUT_MS", 15_000)?,
+            socket_timeout_ms: parse_u64_env("MAIL_IMAP_SOCKET_TIMEOUT_MS", 300_000)?,
+            cursor_ttl_seconds: parse_u64_env("MAIL_IMAP_CURSOR_TTL_SECONDS", 600)?,
+            cursor_max_entries: parse_usize_env("MAIL_IMAP_CURSOR_MAX_ENTRIES", 512)?,
         })
     }
 
@@ -144,8 +145,8 @@ fn load_account(segment: &str) -> AppResult<AccountConfig> {
             segment.to_ascii_lowercase()
         },
         host,
-        port: parse_u16_env(&format!("{prefix}PORT"), 993),
-        secure: parse_bool_env(&format!("{prefix}SECURE"), true),
+        port: parse_u16_env(&format!("{prefix}PORT"), 993)?,
+        secure: parse_bool_env(&format!("{prefix}SECURE"), true)?,
         user,
         pass: SecretString::new(pass.into()),
     })
@@ -180,45 +181,107 @@ fn sanitize_segment(seg: &str) -> String {
 /// Parse a boolean environment variable with flexible values
 ///
 /// Accepts: `1`, `true`, `yes`, `y`, `on` (truthy) or `0`, `false`, `no`,
-/// `n`, `off` (falsy). Case-insensitive. Returns `default` if unset or
-/// unrecognized.
-fn parse_bool_env(key: &str, default: bool) -> bool {
+/// `n`, `off` (falsy). Case-insensitive. Returns `default` if unset.
+///
+/// # Errors
+///
+/// Returns `InvalidInput` if the variable is set to an unrecognized value.
+fn parse_bool_env(key: &str, default: bool) -> AppResult<bool> {
     match env::var(key) {
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "y" | "on" => true,
-            "0" | "false" | "no" | "n" | "off" => false,
-            _ => default,
-        },
-        Err(_) => default,
+        Ok(v) => parse_bool_value(&v).ok_or_else(|| {
+            AppError::InvalidInput(format!("invalid boolean environment variable {key}: '{v}'"))
+        }),
+        Err(VarError::NotPresent) => Ok(default),
+        Err(VarError::NotUnicode(_)) => Err(AppError::InvalidInput(format!(
+            "environment variable {key} contains non-unicode data"
+        ))),
+    }
+}
+
+fn parse_bool_value(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" | "on" => Some(true),
+        "0" | "false" | "no" | "n" | "off" => Some(false),
+        _ => None,
     }
 }
 
 /// Parse a `u16` environment variable with default fallback
 ///
-/// Returns `default` if unset or invalid.
-fn parse_u16_env(key: &str, default: u16) -> u16 {
-    env::var(key)
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(default)
+/// Returns `default` if unset.
+///
+/// # Errors
+///
+/// Returns `InvalidInput` if the variable is set but not a valid `u16`.
+fn parse_u16_env(key: &str, default: u16) -> AppResult<u16> {
+    match env::var(key) {
+        Ok(v) => v.parse::<u16>().map_err(|_| {
+            AppError::InvalidInput(format!("invalid u16 environment variable {key}: '{v}'"))
+        }),
+        Err(VarError::NotPresent) => Ok(default),
+        Err(VarError::NotUnicode(_)) => Err(AppError::InvalidInput(format!(
+            "environment variable {key} contains non-unicode data"
+        ))),
+    }
 }
 
 /// Parse a `u64` environment variable with default fallback
 ///
-/// Returns `default` if unset or invalid.
-fn parse_u64_env(key: &str, default: u64) -> u64 {
-    env::var(key)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(default)
+/// Returns `default` if unset.
+///
+/// # Errors
+///
+/// Returns `InvalidInput` if the variable is set but not a valid `u64`.
+fn parse_u64_env(key: &str, default: u64) -> AppResult<u64> {
+    match env::var(key) {
+        Ok(v) => v.parse::<u64>().map_err(|_| {
+            AppError::InvalidInput(format!("invalid u64 environment variable {key}: '{v}'"))
+        }),
+        Err(VarError::NotPresent) => Ok(default),
+        Err(VarError::NotUnicode(_)) => Err(AppError::InvalidInput(format!(
+            "environment variable {key} contains non-unicode data"
+        ))),
+    }
 }
 
 /// Parse a `usize` environment variable with default fallback
 ///
-/// Returns `default` if unset or invalid.
-fn parse_usize_env(key: &str, default: usize) -> usize {
-    env::var(key)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(default)
+/// Returns `default` if unset.
+///
+/// # Errors
+///
+/// Returns `InvalidInput` if the variable is set but not a valid `usize`.
+fn parse_usize_env(key: &str, default: usize) -> AppResult<usize> {
+    match env::var(key) {
+        Ok(v) => v.parse::<usize>().map_err(|_| {
+            AppError::InvalidInput(format!("invalid usize environment variable {key}: '{v}'"))
+        }),
+        Err(VarError::NotPresent) => Ok(default),
+        Err(VarError::NotUnicode(_)) => Err(AppError::InvalidInput(format!(
+            "environment variable {key} contains non-unicode data"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bool_value;
+
+    #[test]
+    fn parse_bool_value_accepts_common_truthy_and_falsy_values() {
+        for truthy in ["1", "true", "TRUE", " yes ", "Y", "on"] {
+            assert_eq!(parse_bool_value(truthy), Some(true));
+        }
+
+        for falsy in ["0", "false", "FALSE", " no ", "N", "off"] {
+            assert_eq!(parse_bool_value(falsy), Some(false));
+        }
+    }
+
+    #[test]
+    fn parse_bool_value_rejects_unrecognized_values() {
+        for invalid in ["", "2", "maybe", "enabled", "disabled"] {
+            assert_eq!(parse_bool_value(invalid), None);
+        }
+    }
 }

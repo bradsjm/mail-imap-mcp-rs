@@ -1,6 +1,6 @@
 //! Cursor-based pagination storage
 //!
-//! Manages search cursors with TTL and LRU eviction. Cursors encode
+//! Manages search cursors with TTL and LRU-ish eviction. Cursors encode
 //! search state (UIDs, offset, filters) for efficient pagination
 //! across large result sets.
 
@@ -29,11 +29,11 @@ pub struct CursorEntry {
     pub include_snippet: bool,
     /// Snippet character limit from original search
     pub snippet_max_chars: usize,
-    /// Expiration timestamp (refreshed on access)
+    /// Expiration timestamp (refreshed on read/write access)
     pub expires_at: Instant,
 }
 
-/// Cursor store with TTL and LRU eviction
+/// Cursor store with TTL and LRU-ish eviction
 ///
 /// Manages search cursors with automatic cleanup of expired entries
 /// and eviction when `max_entries` is exceeded.
@@ -79,9 +79,13 @@ impl CursorStore {
     ///
     /// Returns cloned entry if cursor exists and is not expired.
     /// Automatically cleans up expired entries before lookup.
+    ///
+    /// Refreshes cursor expiration on successful access.
     pub fn get(&mut self, cursor: &str) -> Option<CursorEntry> {
         self.cleanup();
-        self.entries.get(cursor).cloned()
+        let entry = self.entries.get_mut(cursor)?;
+        entry.expires_at = Instant::now() + self.ttl;
+        Some(entry.clone())
     }
 
     /// Update cursor offset (for next page)
@@ -114,7 +118,7 @@ impl CursorStore {
     /// Evict cursors if exceeding max_entries
     ///
     /// Removes oldest entries (by expiration time) until under limit.
-    /// Uses LRU-ish behavior since expiration is refreshed on access.
+    /// Uses LRU-ish behavior since expiration is refreshed on get/update.
     fn evict_if_needed(&mut self) {
         if self.entries.len() <= self.max_entries {
             return;
@@ -182,6 +186,18 @@ mod tests {
         let id = store.create(cursor_entry(Instant::now()));
         thread::sleep(Duration::from_millis(1100));
         assert!(store.get(&id).is_none());
+    }
+
+    #[test]
+    fn get_refreshes_cursor_ttl() {
+        let mut store = CursorStore::new(1, 10);
+        let id = store.create(cursor_entry(Instant::now()));
+
+        thread::sleep(Duration::from_millis(700));
+        assert!(store.get(&id).is_some());
+
+        thread::sleep(Duration::from_millis(700));
+        assert!(store.get(&id).is_some());
     }
 
     #[test]

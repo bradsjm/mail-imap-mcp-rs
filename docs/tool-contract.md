@@ -236,7 +236,8 @@ Output `data`:
 - `account_id`
 - `message_id`
 - `size_bytes`
-- `raw_source` (UTF-8 best effort, bounded by `max_bytes`)
+- `raw_source_base64` (byte-faithful RFC822 source, base64 encoded)
+- `raw_source_encoding` (`"base64"` on success)
 
 ### 7) `imap_update_message_flags`
 

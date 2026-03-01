@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use base64::Engine;
 use chrono::{Duration as ChronoDuration, NaiveDate, Utc};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -932,7 +933,8 @@ impl MailImapServer {
                     "message_uri": build_message_uri(&msg_id.account_id, &msg_id.mailbox, msg_id.uidvalidity, msg_id.uid),
                     "message_raw_uri": build_message_raw_uri(&msg_id.account_id, &msg_id.mailbox, msg_id.uidvalidity, msg_id.uid),
                     "size_bytes": 0,
-                    "raw_source": serde_json::Value::Null,
+                    "raw_source_base64": serde_json::Value::Null,
+                    "raw_source_encoding": serde_json::Value::Null,
                 }));
             }
         };
@@ -961,7 +963,8 @@ impl MailImapServer {
                     "message_uri": build_message_uri(&msg_id.account_id, &msg_id.mailbox, msg_id.uidvalidity, msg_id.uid),
                     "message_raw_uri": build_message_raw_uri(&msg_id.account_id, &msg_id.mailbox, msg_id.uidvalidity, msg_id.uid),
                     "size_bytes": 0,
-                    "raw_source": serde_json::Value::Null,
+                    "raw_source_base64": serde_json::Value::Null,
+                    "raw_source_encoding": serde_json::Value::Null,
                 }));
             }
         };
@@ -987,7 +990,8 @@ impl MailImapServer {
             "message_uri": build_message_uri(&msg_id.account_id, &msg_id.mailbox, msg_id.uidvalidity, msg_id.uid),
             "message_raw_uri": build_message_raw_uri(&msg_id.account_id, &msg_id.mailbox, msg_id.uidvalidity, msg_id.uid),
             "size_bytes": raw.len(),
-            "raw_source": String::from_utf8_lossy(&raw).to_string(),
+            "raw_source_base64": encode_raw_source_base64(&raw),
+            "raw_source_encoding": "base64",
         }))
     }
 
@@ -2254,9 +2258,16 @@ fn build_message_raw_uri(account_id: &str, mailbox: &str, uidvalidity: u32, uid:
     )
 }
 
+fn encode_raw_source_base64(raw: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(raw)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{escape_imap_quoted, validate_flag, validate_mailbox, validate_search_text};
+    use super::{
+        encode_raw_source_base64, escape_imap_quoted, validate_flag, validate_mailbox,
+        validate_search_text,
+    };
 
     #[test]
     fn rejects_control_chars_in_search_text() {
@@ -2287,5 +2298,11 @@ mod tests {
     fn validate_flag_rejects_injection_like_value() {
         let err = validate_flag("\\Seen) UID FETCH 1:* (BODY[]").expect_err("must fail");
         assert!(err.to_string().contains("invalid flag"));
+    }
+
+    #[test]
+    fn encodes_raw_source_as_base64() {
+        let raw = [0_u8, 159, 255];
+        assert_eq!(encode_raw_source_base64(&raw), "AJ//");
     }
 }
