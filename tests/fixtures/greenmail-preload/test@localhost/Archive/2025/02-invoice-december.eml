@@ -1,0 +1,9 @@
+From: billing@example.com
+To: test@localhost
+Date: Fri, 19 Dec 2025 10:05:00 +0000
+Subject: Invoice December 2025
+Message-ID: <invoice-20251219@example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+Invoice posted for December 2025.

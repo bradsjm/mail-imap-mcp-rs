@@ -1,0 +1,9 @@
+From: test@localhost
+To: client@example.com
+Date: Mon, 12 Jan 2026 14:20:00 +0000
+Subject: Follow-up on migration
+Message-ID: <sent-followup-20260112@test.local>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+Following up on migration timeline and owner approvals.

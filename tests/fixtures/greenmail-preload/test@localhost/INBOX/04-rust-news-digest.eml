@@ -1,0 +1,12 @@
+From: newsletter@rust-lang.org
+To: test@localhost
+Date: Wed, 14 Jan 2026 06:00:00 +0000
+Subject: Rust Weekly Digest
+Message-ID: <rust-digest-20260114@rust-lang.org>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+This week in Rust:
+- Release candidates
+- New ecosystem tooling
+- Conference updates

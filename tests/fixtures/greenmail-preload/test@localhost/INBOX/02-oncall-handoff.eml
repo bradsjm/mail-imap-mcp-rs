@@ -1,0 +1,13 @@
+From: sre@example.com
+To: test@localhost
+Date: Tue, 13 Jan 2026 07:45:00 +0000
+Subject: On-call Handoff
+Message-ID: <oncall-handoff-20260113@example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+Handoff notes:
+- API latency stable
+- Watch queue backlog after 10:00 UTC
+
+Pager rotation updated.

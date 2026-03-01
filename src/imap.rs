@@ -468,14 +468,16 @@ mod tests {
             .ok()
             .and_then(|v| v.parse::<u16>().ok())
             .unwrap_or(3993);
+        let user = std::env::var("GREENMAIL_USER").unwrap_or_else(|_| "test@localhost".to_owned());
+        let pass = std::env::var("GREENMAIL_PASS").unwrap_or_else(|_| "test".to_owned());
 
         let account = AccountConfig {
             account_id: "default".to_owned(),
             host,
             port,
             secure: true,
-            user: "test".to_owned(),
-            pass: SecretString::new("test".to_owned().into()),
+            user,
+            pass: SecretString::new(pass.into()),
         };
 
         let mut accounts = BTreeMap::new();
@@ -647,9 +649,23 @@ mod tests {
         let mailboxes = list_all_mailboxes(&config, &mut session)
             .await
             .expect("LIST should succeed");
+        let mailbox_names: Vec<String> = mailboxes
+            .into_iter()
+            .map(|mailbox| mailbox.name().to_owned())
+            .collect();
+
+        for required_mailbox in ["INBOX", "Archive", "Spam", "Newsletters"] {
+            assert!(
+                mailbox_names
+                    .iter()
+                    .any(|name| name.contains(required_mailbox)),
+                "expected seeded mailbox {required_mailbox:?}, got {mailbox_names:?}"
+            );
+        }
+
         assert!(
-            !mailboxes.is_empty(),
-            "greenmail should expose at least one mailbox"
+            mailbox_names.len() >= 5,
+            "expected at least five seeded mailboxes, got {mailbox_names:?}"
         );
 
         let uidvalidity = select_mailbox_readonly(&config, &mut session, "INBOX")
@@ -657,34 +673,61 @@ mod tests {
             .expect("INBOX should be selectable");
         assert!(uidvalidity > 0);
 
-        let message = b"From: sender@example.com\r\nTo: user@example.com\r\nSubject: Greenmail test\r\n\r\nHello from test\r\n";
-        append(&config, &mut session, "INBOX", message)
+        let inbox_uids = uid_search(&config, &mut session, "ALL")
             .await
-            .expect("APPEND should succeed");
-
-        noop(&config, &mut session)
-            .await
-            .expect("NOOP after APPEND should succeed");
-        select_mailbox_readonly(&config, &mut session, "INBOX")
-            .await
-            .expect("INBOX should be re-selectable after APPEND");
-
-        let uids = uid_search(&config, &mut session, "ALL")
-            .await
-            .expect("UID SEARCH should succeed");
+            .expect("UID SEARCH ALL should succeed");
         assert!(
-            !uids.is_empty(),
-            "UID SEARCH ALL should return at least one message after APPEND"
+            inbox_uids.len() >= 4,
+            "expected seeded INBOX corpus with at least 4 messages, got {}",
+            inbox_uids.len()
         );
 
-        let newest_uid = uids[0];
-        let raw = fetch_raw_message(&config, &mut session, newest_uid)
+        let unseen_uids = uid_search(&config, &mut session, "UNSEEN")
             .await
-            .expect("fetching appended message should succeed");
+            .expect("UID SEARCH UNSEEN should succeed");
+        assert!(
+            !unseen_uids.is_empty(),
+            "expected at least one unread seeded INBOX message"
+        );
+
+        let roadmap_uids = uid_search(&config, &mut session, "SUBJECT \"Roadmap Review\"")
+            .await
+            .expect("UID SEARCH SUBJECT should find seeded roadmap message");
+        assert_eq!(
+            roadmap_uids.len(),
+            1,
+            "expected exactly one seeded Roadmap Review message"
+        );
+
+        let archive_mailbox = mailbox_names
+            .iter()
+            .find(|name| name.contains("Archive") && name.contains("2025"))
+            .cloned()
+            .expect("expected archive mailbox in seeded dataset");
+
+        select_mailbox_readonly(&config, &mut session, &archive_mailbox)
+            .await
+            .expect("archive mailbox should be selectable");
+        let archive_uids = uid_search(&config, &mut session, "ALL")
+            .await
+            .expect("UID SEARCH in archive should succeed");
+        assert!(
+            archive_uids.len() >= 2,
+            "expected at least two seeded archive messages, got {}",
+            archive_uids.len()
+        );
+
+        select_mailbox_readonly(&config, &mut session, "INBOX")
+            .await
+            .expect("INBOX should be re-selectable");
+
+        let raw = fetch_raw_message(&config, &mut session, roadmap_uids[0])
+            .await
+            .expect("fetching seeded roadmap message should succeed");
         let raw_text = String::from_utf8_lossy(&raw);
         assert!(
-            raw_text.contains("Subject: Greenmail test"),
-            "fetched raw message should contain appended subject"
+            raw_text.contains("Subject: Roadmap Review"),
+            "fetched seeded message should contain expected subject"
         );
     }
 

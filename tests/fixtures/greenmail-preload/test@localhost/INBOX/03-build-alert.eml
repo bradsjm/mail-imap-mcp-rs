@@ -1,0 +1,22 @@
+From: ci-bot@example.com
+To: test@localhost
+Date: Tue, 13 Jan 2026 11:20:00 +0000
+Subject: Build Alert: nightly regression
+Message-ID: <build-alert-20260113@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="boundary-20260113"
+
+--boundary-20260113
+Content-Type: text/plain; charset=UTF-8
+
+Nightly build failed on parser-edge-cases.
+See attached summary.
+
+--boundary-20260113
+Content-Type: text/plain; name="summary.txt"
+Content-Disposition: attachment; filename="summary.txt"
+
+failing test: parse_invalid_uid
+commit: 1a2b3c4d
+
+--boundary-20260113--
