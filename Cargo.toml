@@ -39,3 +39,8 @@ urlencoding = "2.1.3"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[alias]
+fmt-check = "fmt --all -- --check"
+lint = "clippy --all-targets -- -D warnings"
+test-all = "test --all-targets"

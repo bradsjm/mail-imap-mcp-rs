@@ -463,7 +463,7 @@ mod tests {
     };
     use crate::config::{AccountConfig, ServerConfig};
 
-    const GREENMAIL_IMAGE: &str = "greenmail/standalone:1.6.15";
+    const GREENMAIL_IMAGE: &str = "greenmail/standalone:2.1.8";
     const GREENMAIL_NAME: &str = "mail-imap-mcp-rs-greenmail-test";
     const GREENMAIL_OPTS: &str = "-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled -Dgreenmail.verbose";
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE="greenmail/standalone:1.6.15"
+IMAGE="greenmail/standalone:2.1.8"
 NAME="mail-imap-mcp-rs-greenmail-test"
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
