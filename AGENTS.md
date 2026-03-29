@@ -111,7 +111,7 @@ The project is distributed as an npm package published by cargo-dist.
 ### Publishing Rules for Agents
 
 - Do not change package scope (`@bradsjm`) unless explicitly requested.
-- Prefer CI-driven publishing via git tags (`v*.*.*`).
+- Prefer workflow-dispatch releases that compute the release tag from `Cargo.toml`.
 - Prefer npm trusted publishing (GitHub OIDC + provenance) over token-based npm publish.
 
 ## Release Assets (Curl Installer)
@@ -121,7 +121,7 @@ The repository publishes GitHub Release archives/installers via cargo-dist.
 ### Release Workflow
 
 - Release workflow: `.github/workflows/release.yml`
-- Trigger: git tags matching `v*.*.*`
+- Trigger: `workflow_dispatch`
 - Dist generates archives/checksums/installers from `dist-workspace.toml` target and installer settings.
 
 ### Installer Behavior and Guardrails
@@ -132,7 +132,7 @@ The repository publishes GitHub Release archives/installers via cargo-dist.
 
 ### Tag Publish Flow
 
-- `release.yml` and `publish-docker.yml` run on `v*.*.*` tags.
+- `release.yml` and `publish-docker.yml` run on `workflow_dispatch`.
 - Keep package versions, dist artifacts, and release tags aligned.
 - If release automation changes, update `README.md` install commands and this file together.
 
