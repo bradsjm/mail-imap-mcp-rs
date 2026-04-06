@@ -36,6 +36,10 @@ fn nonnegative_integer_schema(_: &mut schemars::SchemaGenerator) -> schemars::Sc
     })
 }
 
+fn remove_format(schema: &mut schemars::Schema) {
+    schema.remove("format");
+}
+
 /// Standard response envelope for all tools
 ///
 /// Wraps tool-specific data with human-readable summary and execution metadata.
@@ -175,6 +179,7 @@ pub struct MessageDetail {
 pub struct AccountOnlyInput {
     /// Account identifier (defaults to `"default"`)
     #[serde(default = "default_account_id")]
+    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
     pub account_id: String,
 }
 
@@ -186,34 +191,45 @@ pub struct AccountOnlyInput {
 pub struct SearchMessagesInput {
     /// Account identifier (defaults to `"default"`)
     #[serde(default = "default_account_id")]
+    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
     pub account_id: String,
     /// Mailbox to search (e.g., `INBOX`, `Sent`, `Archive`)
+    #[schemars(length(min = 1, max = 256))]
     pub mailbox: String,
     /// Pagination cursor from previous search result
     pub cursor: Option<String>,
     /// Full-text search query
+    #[schemars(length(min = 1, max = 256))]
     pub query: Option<String>,
     /// Filter by From header
+    #[schemars(length(min = 1, max = 256))]
     pub from: Option<String>,
     /// Filter by To header
+    #[schemars(length(min = 1, max = 256))]
     pub to: Option<String>,
     /// Filter by Subject header
+    #[schemars(length(min = 1, max = 256))]
     pub subject: Option<String>,
     /// Filter to unread messages only
     pub unread_only: Option<bool>,
     /// Filter to messages from last N days
+    #[schemars(range(min = 1, max = 365), transform = remove_format)]
     pub last_days: Option<u16>,
     /// Filter to messages on or after this date (YYYY-MM-DD)
+    #[schemars(pattern(r"^\d{4}-\d{2}-\d{2}$"))]
     pub start_date: Option<String>,
     /// Filter to messages before this date (YYYY-MM-DD)
+    #[schemars(pattern(r"^\d{4}-\d{2}-\d{2}$"))]
     pub end_date: Option<String>,
     /// Maximum messages to return (1..50, default 10)
     #[serde(default = "default_limit")]
+    #[schemars(range(min = 1, max = 50), transform = remove_format)]
     pub limit: usize,
     /// Include subject snippet in results
     #[serde(default)]
     pub include_snippet: bool,
     /// Maximum snippet length (50..500, requires `include_snippet=true`)
+    #[schemars(range(min = 50, max = 500), transform = remove_format)]
     pub snippet_max_chars: Option<usize>,
 }
 
@@ -225,11 +241,13 @@ pub struct SearchMessagesInput {
 pub struct GetMessageInput {
     /// Account identifier (defaults to `"default"`)
     #[serde(default = "default_account_id")]
+    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
     pub account_id: String,
     /// Stable message identifier (format: `imap:{account}:{mailbox}:{uidvalidity}:{uid}`)
     pub message_id: String,
     /// Maximum body characters (100..20000, default 2000)
     #[serde(default = "default_body_max_chars")]
+    #[schemars(range(min = 100, max = 20_000), transform = remove_format)]
     pub body_max_chars: usize,
     /// Include headers in response
     #[serde(default = "default_true")]
@@ -244,6 +262,7 @@ pub struct GetMessageInput {
     #[serde(default)]
     pub extract_attachment_text: bool,
     /// Maximum attachment text length (100..50000, requires `extract_attachment_text=true`)
+    #[schemars(range(min = 100, max = 50_000), transform = remove_format)]
     pub attachment_text_max_chars: Option<usize>,
 }
 
@@ -254,11 +273,13 @@ pub struct GetMessageInput {
 pub struct GetMessageRawInput {
     /// Account identifier (defaults to `"default"`)
     #[serde(default = "default_account_id")]
+    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
     pub account_id: String,
     /// Stable message identifier
     pub message_id: String,
     /// Maximum message bytes to return (1024..1000000, default 200000)
     #[serde(default = "default_raw_max_bytes")]
+    #[schemars(range(min = 1_024, max = 1_000_000), transform = remove_format)]
     pub max_bytes: usize,
 }
 
@@ -269,6 +290,7 @@ pub struct GetMessageRawInput {
 pub struct UpdateMessageFlagsInput {
     /// Account identifier (defaults to `"default"`)
     #[serde(default = "default_account_id")]
+    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
     pub account_id: String,
     /// Stable message identifier
     pub message_id: String,
@@ -286,12 +308,15 @@ pub struct UpdateMessageFlagsInput {
 pub struct CopyMessageInput {
     /// Account identifier (defaults to `"default"`)
     #[serde(default = "default_account_id")]
+    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
     pub account_id: String,
     /// Stable message identifier
     pub message_id: String,
     /// Destination mailbox name
+    #[schemars(length(min = 1, max = 256))]
     pub destination_mailbox: String,
     /// Destination account (if omitted, copies within same account)
+    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
     pub destination_account_id: Option<String>,
 }
 
@@ -302,10 +327,12 @@ pub struct CopyMessageInput {
 pub struct MoveMessageInput {
     /// Account identifier (defaults to `"default"`)
     #[serde(default = "default_account_id")]
+    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
     pub account_id: String,
     /// Stable message identifier
     pub message_id: String,
     /// Destination mailbox name
+    #[schemars(length(min = 1, max = 256))]
     pub destination_mailbox: String,
 }
 
@@ -316,6 +343,7 @@ pub struct MoveMessageInput {
 pub struct DeleteMessageInput {
     /// Account identifier (defaults to `"default"`)
     #[serde(default = "default_account_id")]
+    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
     pub account_id: String,
     /// Stable message identifier
     pub message_id: String,
@@ -355,4 +383,186 @@ fn default_body_max_chars() -> usize {
 /// but bounded to prevent excessive output. 200KB is a practical limit.
 fn default_raw_max_bytes() -> usize {
     200_000
+}
+
+#[cfg(test)]
+mod tests {
+    use rmcp::handler::server::common::schema_for_type;
+    use serde_json::{Map, Value};
+
+    use super::{
+        AccountOnlyInput, CopyMessageInput, DeleteMessageInput, GetMessageInput,
+        GetMessageRawInput, MoveMessageInput, SearchMessagesInput, UpdateMessageFlagsInput,
+    };
+
+    #[test]
+    fn input_schemas_do_not_publish_nonstandard_unsigned_formats() {
+        for schema in [
+            schema_for_type::<AccountOnlyInput>(),
+            schema_for_type::<SearchMessagesInput>(),
+            schema_for_type::<GetMessageInput>(),
+            schema_for_type::<GetMessageRawInput>(),
+            schema_for_type::<UpdateMessageFlagsInput>(),
+            schema_for_type::<CopyMessageInput>(),
+            schema_for_type::<MoveMessageInput>(),
+            schema_for_type::<DeleteMessageInput>(),
+        ] {
+            assert_no_nonstandard_integer_formats(&Value::Object((*schema).clone()));
+        }
+    }
+
+    #[test]
+    fn search_messages_schema_matches_runtime_bounds() {
+        let schema = schema_for_type::<SearchMessagesInput>();
+        let properties = schema["properties"]
+            .as_object()
+            .expect("search schema must expose properties");
+
+        assert_eq!(
+            schema_string_property(properties, "account_id", "pattern"),
+            Some("^[A-Za-z0-9_-]+$")
+        );
+        assert_eq!(
+            schema_numeric_property(properties, "limit", "minimum"),
+            Some(1)
+        );
+        assert_eq!(
+            schema_numeric_property(properties, "limit", "maximum"),
+            Some(50)
+        );
+        assert_eq!(
+            schema_numeric_property(properties, "last_days", "minimum"),
+            Some(1)
+        );
+        assert_eq!(
+            schema_numeric_property(properties, "last_days", "maximum"),
+            Some(365)
+        );
+        assert_eq!(
+            schema_numeric_property(properties, "snippet_max_chars", "minimum"),
+            Some(50)
+        );
+        assert_eq!(
+            schema_numeric_property(properties, "snippet_max_chars", "maximum"),
+            Some(500)
+        );
+        assert_eq!(
+            schema_string_property(properties, "start_date", "pattern"),
+            Some("^\\d{4}-\\d{2}-\\d{2}$")
+        );
+    }
+
+    #[test]
+    fn message_input_schemas_publish_account_and_size_constraints() {
+        let message_schema = schema_for_type::<GetMessageInput>();
+        let message_props = message_schema["properties"]
+            .as_object()
+            .expect("get_message schema must expose properties");
+        assert_eq!(
+            schema_string_property(message_props, "account_id", "pattern"),
+            Some("^[A-Za-z0-9_-]+$")
+        );
+        assert_eq!(
+            schema_numeric_property(message_props, "body_max_chars", "minimum"),
+            Some(100)
+        );
+        assert_eq!(
+            schema_numeric_property(message_props, "body_max_chars", "maximum"),
+            Some(20_000)
+        );
+        assert_eq!(
+            schema_numeric_property(message_props, "attachment_text_max_chars", "minimum"),
+            Some(100)
+        );
+        assert_eq!(
+            schema_numeric_property(message_props, "attachment_text_max_chars", "maximum"),
+            Some(50_000)
+        );
+
+        let raw_schema = schema_for_type::<GetMessageRawInput>();
+        let raw_props = raw_schema["properties"]
+            .as_object()
+            .expect("get_message_raw schema must expose properties");
+        assert_eq!(
+            schema_numeric_property(raw_props, "max_bytes", "minimum"),
+            Some(1_024)
+        );
+        assert_eq!(
+            schema_numeric_property(raw_props, "max_bytes", "maximum"),
+            Some(1_000_000)
+        );
+    }
+
+    fn assert_no_nonstandard_integer_formats(value: &Value) {
+        match value {
+            Value::Object(object) => {
+                if let Some(format) = object.get("format").and_then(Value::as_str) {
+                    assert!(
+                        !matches!(
+                            format,
+                            "uint"
+                                | "uint8"
+                                | "uint16"
+                                | "uint32"
+                                | "uint64"
+                                | "uint128"
+                                | "int8"
+                                | "int16"
+                                | "int32"
+                                | "int64"
+                                | "int128"
+                                | "int"
+                        ),
+                        "published schema contains nonstandard numeric format {format}"
+                    );
+                }
+                for value in object.values() {
+                    assert_no_nonstandard_integer_formats(value);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    assert_no_nonstandard_integer_formats(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn schema_numeric_property(
+        properties: &Map<String, Value>,
+        key: &str,
+        field: &str,
+    ) -> Option<u64> {
+        schema_variant_for(properties, key)?.get(field)?.as_u64()
+    }
+
+    fn schema_string_property<'a>(
+        properties: &'a Map<String, Value>,
+        key: &str,
+        field: &str,
+    ) -> Option<&'a str> {
+        schema_variant_for(properties, key)?.get(field)?.as_str()
+    }
+
+    fn schema_variant_for<'a>(properties: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
+        let schema = properties.get(key)?;
+        if schema
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|ty| ty != "null")
+        {
+            return Some(schema);
+        }
+        schema
+            .get("anyOf")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|variant| {
+                variant
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|ty| ty != "null")
+            })
+    }
 }
