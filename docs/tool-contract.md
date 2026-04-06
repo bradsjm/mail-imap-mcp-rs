@@ -207,7 +207,7 @@ Output `data`:
   - `subject?`
   - `flags?`
   - `headers?` (curated by default; full when requested)
-  - `body_text?` (bounded)
+  - `body_text?` (bounded; prefers `text/plain`, otherwise derived from sanitized HTML when no meaningful plain-text body exists)
   - `body_html?` (sanitized and bounded)
   - `attachments?`: array (max 50) of:
     - `filename?`

@@ -7,7 +7,7 @@ A secure, efficient Model Context Protocol (MCP) server for IMAP email access ov
 - **Secure by default**: TLS-only connections, password secrets never logged or returned
 - **Structured output**: Consistent tool response envelope with summaries and metadata
 - **Cursor-based pagination**: Efficient message searching across large mailboxes
-- **Message parsing**: Extract text, headers, and attachments with sanitization
+- **Message parsing**: Extract text, HTML, headers, and attachments with sanitization
 - **Multi-account support**: Configure multiple IMAP accounts via environment variables
 - **PDF text extraction**: Optional text extraction from PDF attachments
 - **Rust-powered**: Fast, memory-safe async/await implementation with tokio

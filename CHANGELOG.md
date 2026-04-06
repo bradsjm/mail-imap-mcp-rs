@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.2]
+
+### Added
+
+- Added HTML-to-text fallback for `imap_get_message` so HTML-only messages still return `body_text`.
+- Added MIME parsing regression tests covering HTML-only bodies and whitespace-only `text/plain` alternatives.
+
+### Changed
+
+- `body_text` now prefers meaningful `text/plain` content and otherwise derives text from sanitized HTML.
+
 ## [0.2.1]
 
 ### Added

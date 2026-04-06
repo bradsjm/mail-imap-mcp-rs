@@ -1,8 +1,8 @@
 //! Message parsing and MIME handling
 //!
 //! Parses RFC822 messages using `mailparse`, extracts body text/HTML,
-//! and handles attachments. Sanitizes HTML with `ammonia` and supports
-//! optional PDF text extraction.
+//! and handles attachments. Sanitizes HTML, derives fallback text from HTML,
+//! and supports optional PDF text extraction.
 
 use std::collections::BTreeMap;
 
@@ -78,7 +78,8 @@ pub fn parse_message(
         attachment_text_max_chars,
     )?;
 
-    let text = body_text.map(|t| truncate_chars(t, body_max_chars));
+    let text = select_body_text(body_text, body_html.as_deref())
+        .map(|t| truncate_chars(t, body_max_chars));
     let html = if include_html {
         body_html.map(|h| truncate_chars(h, body_max_chars))
     } else {
@@ -97,6 +98,32 @@ pub fn parse_message(
         body_html_sanitized: html,
         attachments,
     })
+}
+
+/// Choose the message text body, preferring a meaningful text/plain part.
+///
+/// Falls back to text derived from sanitized HTML when plain text is missing
+/// or only contains whitespace.
+fn select_body_text(body_text: Option<String>, body_html: Option<&str>) -> Option<String> {
+    if let Some(text) = body_text.filter(|text| has_meaningful_content(text)) {
+        return Some(text);
+    }
+
+    body_html
+        .and_then(html_to_text)
+        .filter(|text| has_meaningful_content(text))
+}
+
+/// Convert sanitized HTML to plain text without artificial wrapping.
+fn html_to_text(html: &str) -> Option<String> {
+    let text = html2text::from_read(html.as_bytes(), usize::MAX).ok()?;
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Return true when the body contains non-whitespace characters.
+fn has_meaningful_content(body: &str) -> bool {
+    body.chars().any(|ch| !ch.is_whitespace())
 }
 
 /// Walk MIME part tree recursively
@@ -295,5 +322,103 @@ mod tests {
         assert_eq!(parsed.to.as_deref(), Some("user@example.com"));
         assert_eq!(parsed.body_text.as_deref(), Some("Hello there"));
         assert!(parsed.attachments.is_empty());
+    }
+
+    #[test]
+    fn derives_body_text_from_html_only_message() {
+        let raw = concat!(
+            "From: sender@example.com\r\n",
+            "To: user@example.com\r\n",
+            "Subject: HTML\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n",
+            "\r\n",
+            "<html><body><p>Hello <b>there</b></p></body></html>"
+        )
+        .as_bytes();
+
+        let parsed = parse_message(raw, 2000, false, false, 10000).expect("parse should succeed");
+
+        assert_eq!(parsed.body_text.as_deref(), Some("Hello there"));
+        assert_eq!(parsed.body_html_sanitized, None);
+    }
+
+    #[test]
+    fn includes_html_body_when_requested_for_html_only_message() {
+        let raw = concat!(
+            "From: sender@example.com\r\n",
+            "To: user@example.com\r\n",
+            "Subject: HTML\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n",
+            "\r\n",
+            "<html><body><p>Hello <b>there</b></p></body></html>"
+        )
+        .as_bytes();
+
+        let parsed = parse_message(raw, 2000, true, false, 10000).expect("parse should succeed");
+
+        assert_eq!(parsed.body_text.as_deref(), Some("Hello there"));
+        assert_eq!(
+            parsed.body_html_sanitized.as_deref(),
+            Some("<p>Hello <b>there</b></p>")
+        );
+    }
+
+    #[test]
+    fn prefers_meaningful_plain_text_over_html() {
+        let raw = concat!(
+            "From: sender@example.com\r\n",
+            "To: user@example.com\r\n",
+            "Subject: Alt\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/alternative; boundary=\"alt\"\r\n",
+            "\r\n",
+            "--alt\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "Hello from plain text\r\n",
+            "--alt\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n",
+            "\r\n",
+            "<html><body><p>Hello from <b>HTML</b></p></body></html>\r\n",
+            "--alt--\r\n"
+        )
+        .as_bytes();
+
+        let parsed = parse_message(raw, 2000, true, false, 10000).expect("parse should succeed");
+
+        assert_eq!(parsed.body_text.as_deref(), Some("Hello from plain text"));
+        assert_eq!(
+            parsed.body_html_sanitized.as_deref(),
+            Some("<p>Hello from <b>HTML</b></p>")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_html_when_plain_text_is_whitespace_only() {
+        let raw = concat!(
+            "From: sender@example.com\r\n",
+            "To: user@example.com\r\n",
+            "Subject: Alt\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/alternative; boundary=\"alt\"\r\n",
+            "\r\n",
+            "--alt\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "  \r\n\t\r\n",
+            "--alt\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n",
+            "\r\n",
+            "<html><body><p>Hello from <b>HTML</b></p></body></html>\r\n",
+            "--alt--\r\n"
+        )
+        .as_bytes();
+
+        let parsed = parse_message(raw, 2000, false, false, 10000).expect("parse should succeed");
+
+        assert_eq!(parsed.body_text.as_deref(), Some("Hello from HTML"));
+        assert_eq!(parsed.body_html_sanitized, None);
     }
 }
