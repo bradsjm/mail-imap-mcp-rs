@@ -80,6 +80,27 @@ MAIL_IMAP_SOCKET_TIMEOUT_MS=300000
 - Require faster failure detection
 - Implement custom retry logic
 
+## TLS Trust Configuration
+
+### Custom CA Bundle
+
+Use a PEM bundle when the IMAP server certificate chains to a private CA or a self-signed test CA that is not in the default WebPKI roots.
+
+```bash
+# Default: unset
+MAIL_IMAP_CA_CERT_PATH=/path/to/ca-certificates.pem
+```
+
+Rules:
+- The file must contain one or more PEM-encoded certificates.
+- Default WebPKI roots remain enabled; this file adds trust anchors, it does not replace them.
+- Hostname verification still applies.
+
+Use cases:
+- Internal mail servers with private PKI
+- Test fixtures such as GreenMail with self-signed certificates
+- Enterprise TLS interception environments where a private root CA is required
+
 ## Write Operations Configuration
 
 ### Enabling Write Operations
@@ -159,6 +180,7 @@ MAIL_IMAP_<ACCOUNT>_SECURE=true
 
 3. **Server-wide**: Apply globally to all operations
    - `MAIL_IMAP_WRITE_ENABLED=false`
+   - `MAIL_IMAP_CA_CERT_PATH` unset
    - `MAIL_IMAP_CONNECT_TIMEOUT_MS=30000`
    - `MAIL_IMAP_GREETING_TIMEOUT_MS=15000`
    - `MAIL_IMAP_SOCKET_TIMEOUT_MS=300000`

@@ -7,8 +7,12 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::env::VarError;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::PathBuf;
 
 use regex::Regex;
+use rustls_pki_types::CertificateDer;
 use secrecy::SecretString;
 
 use crate::errors::{AppError, AppResult};
@@ -41,6 +45,8 @@ pub struct AccountConfig {
 pub struct ServerConfig {
     /// All configured accounts, keyed by `account_id`
     pub accounts: BTreeMap<String, AccountConfig>,
+    /// Additional CA certificates trusted for IMAP TLS verification
+    pub trusted_ca_certs: Vec<CertificateDer<'static>>,
     /// Whether write operations (copy, move, delete, flag updates) are enabled
     pub write_enabled: bool,
     /// TCP connection timeout in milliseconds
@@ -106,6 +112,7 @@ impl ServerConfig {
 
         Ok(Self {
             accounts,
+            trusted_ca_certs: load_ca_certs_env("MAIL_IMAP_CA_CERT_PATH")?,
             write_enabled: parse_bool_env("MAIL_IMAP_WRITE_ENABLED", false)?,
             connect_timeout_ms: parse_u64_env("MAIL_IMAP_CONNECT_TIMEOUT_MS", 30_000)?,
             greeting_timeout_ms: parse_u64_env("MAIL_IMAP_GREETING_TIMEOUT_MS", 15_000)?,
@@ -267,9 +274,52 @@ fn parse_usize_env(key: &str, default: usize) -> AppResult<usize> {
     }
 }
 
+fn load_ca_certs_env(key: &str) -> AppResult<Vec<CertificateDer<'static>>> {
+    match env::var(key) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(AppError::InvalidInput(format!(
+                    "environment variable {key} must not be empty"
+                )));
+            }
+
+            let path = PathBuf::from(trimmed);
+            let file = File::open(&path).map_err(|e| {
+                AppError::InvalidInput(format!(
+                    "failed to open CA certificate bundle {key} at {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let mut reader = BufReader::new(file);
+            let certs = rustls_pemfile::certs(&mut reader)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    AppError::InvalidInput(format!(
+                        "failed to parse CA certificate bundle {key} at {}: {e}",
+                        path.display()
+                    ))
+                })?;
+
+            if certs.is_empty() {
+                return Err(AppError::InvalidInput(format!(
+                    "CA certificate bundle {key} at {} did not contain any PEM certificates",
+                    path.display()
+                )));
+            }
+
+            Ok(certs)
+        }
+        Err(VarError::NotPresent) => Ok(Vec::new()),
+        Err(VarError::NotUnicode(_)) => Err(AppError::InvalidInput(format!(
+            "environment variable {key} contains non-unicode data"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_bool_value;
+    use super::{load_ca_certs_env, parse_bool_value};
 
     #[test]
     fn parse_bool_value_accepts_common_truthy_and_falsy_values() {
@@ -287,5 +337,16 @@ mod tests {
         for invalid in ["", "2", "maybe", "enabled", "disabled"] {
             assert_eq!(parse_bool_value(invalid), None);
         }
+    }
+
+    #[test]
+    fn load_ca_certs_env_rejects_empty_value() {
+        let key = "MAIL_IMAP_CA_CERT_PATH";
+        unsafe { std::env::set_var(key, "   ") };
+
+        let err = load_ca_certs_env(key).expect_err("empty CA path must fail");
+        assert!(err.to_string().contains("must not be empty"));
+
+        unsafe { std::env::remove_var(key) };
     }
 }

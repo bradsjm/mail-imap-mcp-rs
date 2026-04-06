@@ -139,6 +139,12 @@ MAIL_IMAP_PERSONAL_PASS=personal-password
 
 For timeouts, cursor settings, and other advanced options, see [Advanced Configuration](docs/advanced-configuration.md).
 
+To trust a private or self-signed IMAP server certificate without disabling TLS verification, set:
+
+```bash
+MAIL_IMAP_CA_CERT_PATH=/path/to/ca-certificates.pem
+```
+
 ## Tool Reference
 
 All tools return a consistent envelope:

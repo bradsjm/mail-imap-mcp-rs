@@ -132,6 +132,7 @@ fn build_help_output(env_map: &BTreeMap<String, String>) -> String {
 
     out.push_str("Global policy defaults\n");
     out.push_str("  MAIL_IMAP_WRITE_ENABLED=false\n");
+    out.push_str("  MAIL_IMAP_CA_CERT_PATH=<unset>\n");
     out.push_str("  MAIL_IMAP_CONNECT_TIMEOUT_MS=30000\n");
     out.push_str("  MAIL_IMAP_GREETING_TIMEOUT_MS=15000\n");
     out.push_str("  MAIL_IMAP_SOCKET_TIMEOUT_MS=300000\n");
@@ -254,6 +255,7 @@ mod tests {
         let help = build_help_output(&env_map);
         assert!(help.contains("Global policy defaults"));
         assert!(help.contains("MAIL_IMAP_WRITE_ENABLED=false"));
+        assert!(help.contains("MAIL_IMAP_CA_CERT_PATH=<unset>"));
         assert!(help.contains("Send/write gate policy"));
         assert!(help.contains("MAIL_IMAP_DEFAULT_PASS=<redacted>"));
     }

@@ -23,7 +23,15 @@ GREENMAIL_OPTS_DEFAULT="-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 
 GREENMAIL_OPTS="${GREENMAIL_OPTS:-$GREENMAIL_OPTS_DEFAULT}"
 
 started_local_container=0
+GREENMAIL_TLS_DIR=""
+GREENMAIL_CA_CERT=""
 cleanup() {
+  if [[ -n "$GREENMAIL_TLS_DIR" ]]; then
+    rm -rf "$GREENMAIL_TLS_DIR" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$GREENMAIL_CA_CERT" ]]; then
+    rm -f "$GREENMAIL_CA_CERT" >/dev/null 2>&1 || true
+  fi
   if [[ "$started_local_container" -eq 1 ]]; then
     docker rm -f "$NAME" >/dev/null 2>&1 || true
   fi
@@ -46,6 +54,71 @@ for port in ports:
         print(exc)
         sys.exit(1)
 PY
+}
+
+make_temp_dir() {
+  mktemp -d "${TMPDIR:-/tmp}/$1.XXXXXX"
+}
+
+make_temp_file() {
+  mktemp "${TMPDIR:-/tmp}/$1.XXXXXX"
+}
+
+create_greenmail_tls_bundle() {
+  GREENMAIL_TLS_DIR="$(make_temp_dir greenmail-tls)"
+  local ca_cert_path="$GREENMAIL_TLS_DIR/test-ca-cert.pem"
+  local ca_key_path="$GREENMAIL_TLS_DIR/test-ca-key.pem"
+  local cert_path="$GREENMAIL_TLS_DIR/localhost-cert.pem"
+  local csr_path="$GREENMAIL_TLS_DIR/localhost.csr"
+  local key_path="$GREENMAIL_TLS_DIR/localhost-key.pem"
+  local ext_path="$GREENMAIL_TLS_DIR/localhost-ext.cnf"
+  local p12_path="$GREENMAIL_TLS_DIR/greenmail.p12"
+
+  openssl req \
+    -x509 \
+    -newkey rsa:2048 \
+    -keyout "$ca_key_path" \
+    -out "$ca_cert_path" \
+    -days 2 \
+    -nodes \
+    -subj "/CN=GreenMail Test CA" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1
+
+  openssl req \
+    -newkey rsa:2048 \
+    -keyout "$key_path" \
+    -out "$csr_path" \
+    -nodes \
+    -subj "/CN=localhost" >/dev/null 2>&1
+
+  cat >"$ext_path" <<'EOF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:localhost,IP:127.0.0.1
+EOF
+
+  openssl x509 \
+    -req \
+    -in "$csr_path" \
+    -CA "$ca_cert_path" \
+    -CAkey "$ca_key_path" \
+    -CAcreateserial \
+    -out "$cert_path" \
+    -days 2 \
+    -extfile "$ext_path" >/dev/null 2>&1
+
+  openssl pkcs12 \
+    -export \
+    -inkey "$key_path" \
+    -in "$cert_path" \
+    -certfile "$ca_cert_path" \
+    -out "$p12_path" \
+    -name greenmail \
+    -passout pass:changeit >/dev/null 2>&1
+
+  GREENMAIL_CA_CERT="$ca_cert_path"
 }
 
 wait_for_greenmail() {
@@ -94,12 +167,16 @@ else
     exit 1
   fi
 
+  create_greenmail_tls_bundle
+  GREENMAIL_OPTS="$GREENMAIL_OPTS -Dgreenmail.tls.keystore.file=/greenmail-tls/greenmail.p12 -Dgreenmail.tls.keystore.password=changeit -Dgreenmail.tls.key.password=changeit"
+
   docker rm -f "$NAME" >/dev/null 2>&1 || true
   docker pull "$IMAGE"
 
   docker run -d --rm --name "$NAME" \
     -e GREENMAIL_OPTS="$GREENMAIL_OPTS" \
     -v "$GREENMAIL_PRELOAD_DIR:/greenmail-preload:ro" \
+    -v "$GREENMAIL_TLS_DIR:/greenmail-tls:ro" \
     -p "$GREENMAIL_SMTP_PORT:3025" \
     -p "$GREENMAIL_IMAP_PORT:3993" \
     "$IMAGE"
@@ -119,6 +196,11 @@ if ! command -v npx >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v openssl >/dev/null 2>&1; then
+  echo "openssl is required to extract the GreenMail test certificate" >&2
+  exit 1
+fi
+
 cd "$REPO_ROOT"
 
 echo "Building server binary"
@@ -126,11 +208,31 @@ cargo build --quiet
 
 SERVER_BIN="$REPO_ROOT/target/debug/mail-imap-mcp-rs"
 
+if [[ -z "$GREENMAIL_CA_CERT" ]]; then
+  GREENMAIL_CA_CERT="$(make_temp_file greenmail-ca-cert)"
+  openssl s_client \
+    -showcerts \
+    -connect "${GREENMAIL_HOST}:${GREENMAIL_IMAP_PORT}" \
+    -servername "${GREENMAIL_HOST}" \
+    </dev/null 2>/dev/null \
+    | awk '
+        /-----BEGIN CERTIFICATE-----/ { capture=1 }
+        capture { print }
+        /-----END CERTIFICATE-----/ { exit }
+      ' >"$GREENMAIL_CA_CERT"
+fi
+
+if [[ ! -s "$GREENMAIL_CA_CERT" ]]; then
+  echo "failed to extract GreenMail TLS certificate from ${GREENMAIL_HOST}:${GREENMAIL_IMAP_PORT}" >&2
+  exit 1
+fi
+
 export MAIL_IMAP_DEFAULT_HOST="$GREENMAIL_HOST"
 export MAIL_IMAP_DEFAULT_PORT="$GREENMAIL_IMAP_PORT"
 export MAIL_IMAP_DEFAULT_SECURE="true"
 export MAIL_IMAP_DEFAULT_USER="$GREENMAIL_USER"
 export MAIL_IMAP_DEFAULT_PASS="$GREENMAIL_PASS"
+export MAIL_IMAP_CA_CERT_PATH="$GREENMAIL_CA_CERT"
 export MAIL_IMAP_WRITE_ENABLED="true"
 
 run_inspector() {
@@ -183,8 +285,7 @@ LIST_ACCOUNTS_JSON=$(run_inspector --method tools/call --tool-name imap_list_acc
 printf '%s\n' "$LIST_ACCOUNTS_JSON" | jq -e '
   (.structuredContent.data // .data) as $data
   | (.isError != true)
-    and ($data.status == "ok")
-    and ((($data.accounts // []) | map(.id)) | index("default") != null)
+    and ((($data.accounts // []) | map(.account_id)) | index("default") != null)
 ' >/dev/null
 
 echo "Checking imap_verify_account"
@@ -235,8 +336,8 @@ printf '%s\n' "$GET_JSON" | jq -e '
   (.structuredContent.data // .data) as $data
   | (.isError != true)
     and ($data.status == "ok")
-    and ($data.message_id != null)
-    and ($data.subject != null)
+    and ($data.message.message_id != null)
+    and ($data.message.subject != null)
 ' >/dev/null
 
 echo "Checking imap_get_message_raw"

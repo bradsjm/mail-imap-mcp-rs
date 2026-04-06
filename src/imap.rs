@@ -81,6 +81,7 @@ pub async fn connect_authenticated(
 
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots.add_parsable_certificates(server.trusted_ca_certs.iter().cloned());
     let tls_config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
@@ -515,6 +516,7 @@ mod tests {
 
         ServerConfig {
             accounts,
+            trusted_ca_certs: Vec::new(),
             write_enabled: true,
             connect_timeout_ms: 5_000,
             greeting_timeout_ms: 5_000,

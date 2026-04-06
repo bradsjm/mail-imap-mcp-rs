@@ -44,6 +44,7 @@ Run commands from repo root.
 - Run all tests: `cargo test`
 - List tests: `cargo test -- --list`
 - GreenMail integration smoke test: `scripts/test-greenmail.sh`
+- GreenMail integration smoke test: `scripts/test-greenmail-mcp-inspector.sh`
 
 ### Run a Single Test
 
@@ -206,6 +207,7 @@ The repository publishes GitHub Release archives/installers via cargo-dist.
 
 - Never log or return secrets (`*_PASS`, tokens, auth headers).
 - Preserve TLS-only behavior unless a deliberate security design change is requested.
+- Additional trusted IMAP CAs may be configured only via `MAIL_IMAP_CA_CERT_PATH`; do not disable hostname verification or global certificate validation.
 - Maintain HTML sanitization for message HTML (`ammonia`).
 - Keep attachment extraction bounded and failure-tolerant.
 
@@ -229,6 +231,7 @@ The repository publishes GitHub Release archives/installers via cargo-dist.
 - Do not silently alter public tool contracts.
 - Update docs when behavior or bounds change.
 - If adding env vars, document them in `docs/tool-contract.md` and this file.
+- Current extra trust anchor env var: `MAIL_IMAP_CA_CERT_PATH` (server-wide optional PEM CA bundle).
 
 ## Quick Pre-Commit Checklist
 
