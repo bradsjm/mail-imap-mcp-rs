@@ -18,6 +18,7 @@ use tracing::{error, warn};
 use crate::config::ServerConfig;
 use crate::errors::{AppError, AppResult};
 use crate::imap;
+use crate::mailbox_codec::{decode_mailbox_name_for_display, normalize_mailbox_name};
 use crate::message_id::MessageId;
 use crate::mime;
 use crate::models::{
@@ -495,7 +496,7 @@ impl MailImapServer {
             .into_iter()
             .take(200)
             .map(|item| MailboxInfo {
-                name: item.name().to_owned(),
+                name: decode_mailbox_name_for_display(item.name()),
                 delimiter: item.delimiter().map(|d| d.to_string()),
             })
             .collect::<Vec<_>>();
@@ -1868,7 +1869,9 @@ async fn resume_cursor_search(
     let entry = store
         .get(&cursor_id)
         .ok_or_else(|| AppError::InvalidInput("cursor is invalid or expired".to_owned()))?;
-    if entry.account_id != input.account_id || entry.mailbox != input.mailbox {
+    if entry.account_id != input.account_id
+        || normalize_mailbox_name(&entry.mailbox) != normalize_mailbox_name(&input.mailbox)
+    {
         return Err(AppError::InvalidInput(
             "cursor does not match account/mailbox".to_owned(),
         ));
@@ -2265,10 +2268,17 @@ fn encode_raw_source_base64(raw: &[u8]) -> String {
 #[cfg(test)]
 /// Tests for server-side validation and encoding helpers.
 mod tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use tokio::sync::Mutex;
+
     use super::{
-        encode_raw_source_base64, escape_imap_quoted, validate_flag, validate_mailbox,
-        validate_search_text,
+        encode_raw_source_base64, escape_imap_quoted, resume_cursor_search, validate_flag,
+        validate_mailbox, validate_search_text,
     };
+    use crate::models::SearchMessagesInput;
+    use crate::pagination::{CursorEntry, CursorStore};
 
     /// Tests that control characters in search text are rejected.
     #[test]
@@ -2311,5 +2321,87 @@ mod tests {
     fn encodes_raw_source_as_base64() {
         let raw = [0_u8, 159, 255];
         assert_eq!(encode_raw_source_base64(&raw), "AJ//");
+    }
+
+    #[tokio::test]
+    async fn resume_cursor_accepts_legacy_encoded_mailbox_with_decoded_input() {
+        let cursors = Arc::new(Mutex::new(CursorStore::new(600, 8)));
+        let cursor_id = {
+            let mut store = cursors.lock().await;
+            store.create(CursorEntry {
+                account_id: "default".to_owned(),
+                mailbox: "&ZeVnLIqe-".to_owned(),
+                uidvalidity: 42,
+                uids_desc: vec![10, 9],
+                offset: 1,
+                include_snippet: false,
+                snippet_max_chars: 200,
+                expires_at: Instant::now(),
+            })
+        };
+
+        let input = SearchMessagesInput {
+            account_id: "default".to_owned(),
+            mailbox: "日本語".to_owned(),
+            cursor: Some(cursor_id.clone()),
+            query: None,
+            from: None,
+            to: None,
+            subject: None,
+            unread_only: None,
+            last_days: None,
+            start_date: None,
+            end_date: None,
+            limit: 10,
+            include_snippet: false,
+            snippet_max_chars: None,
+        };
+
+        let snapshot = resume_cursor_search(&cursors, &input, 42, cursor_id)
+            .await
+            .expect("legacy encoded cursor should resume");
+        assert_eq!(snapshot.offset, 1);
+        assert_eq!(snapshot.uids_desc, vec![10, 9]);
+    }
+
+    #[tokio::test]
+    async fn resume_cursor_accepts_decoded_mailbox_with_legacy_encoded_input() {
+        let cursors = Arc::new(Mutex::new(CursorStore::new(600, 8)));
+        let cursor_id = {
+            let mut store = cursors.lock().await;
+            store.create(CursorEntry {
+                account_id: "default".to_owned(),
+                mailbox: "日本語".to_owned(),
+                uidvalidity: 42,
+                uids_desc: vec![10, 9],
+                offset: 1,
+                include_snippet: true,
+                snippet_max_chars: 120,
+                expires_at: Instant::now(),
+            })
+        };
+
+        let input = SearchMessagesInput {
+            account_id: "default".to_owned(),
+            mailbox: "&ZeVnLIqe-".to_owned(),
+            cursor: Some(cursor_id.clone()),
+            query: None,
+            from: None,
+            to: None,
+            subject: None,
+            unread_only: None,
+            last_days: None,
+            start_date: None,
+            end_date: None,
+            limit: 10,
+            include_snippet: false,
+            snippet_max_chars: None,
+        };
+
+        let snapshot = resume_cursor_search(&cursors, &input, 42, cursor_id)
+            .await
+            .expect("decoded cursor should resume from legacy encoded request");
+        assert!(snapshot.include_snippet);
+        assert_eq!(snapshot.snippet_max_chars, 120);
     }
 }

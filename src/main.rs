@@ -19,6 +19,7 @@
 mod config;
 mod errors;
 mod imap;
+mod mailbox_codec;
 mod message_id;
 mod mime;
 mod models;

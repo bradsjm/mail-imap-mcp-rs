@@ -19,6 +19,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::config::{AccountConfig, ServerConfig};
 use crate::errors::{AppError, AppResult};
+use crate::mailbox_codec::encode_mailbox_name_for_command;
 
 /// Type alias for authenticated IMAP session over TLS
 ///
@@ -174,7 +175,8 @@ pub async fn select_mailbox_readonly(
     session: &mut ImapSession,
     mailbox: &str,
 ) -> AppResult<u32> {
-    let selected = timeout(socket_timeout(server), session.examine(mailbox))
+    let encoded_mailbox = encode_mailbox_name_for_command(mailbox);
+    let selected = timeout(socket_timeout(server), session.examine(&encoded_mailbox))
         .await
         .map_err(|_| AppError::Timeout(format!("EXAMINE timed out for mailbox '{mailbox}'")))
         .and_then(|r| {
@@ -194,7 +196,8 @@ pub async fn select_mailbox_readwrite(
     session: &mut ImapSession,
     mailbox: &str,
 ) -> AppResult<u32> {
-    let selected = timeout(socket_timeout(server), session.select(mailbox))
+    let encoded_mailbox = encode_mailbox_name_for_command(mailbox);
+    let selected = timeout(socket_timeout(server), session.select(&encoded_mailbox))
         .await
         .map_err(|_| AppError::Timeout(format!("SELECT timed out for mailbox '{mailbox}'")))
         .and_then(|r| {
@@ -248,7 +251,7 @@ pub async fn fetch_one(
     }
 }
 
-/// Fetch full RFC822 message source
+/// Fetch full message source without setting `\Seen`
 ///
 /// Returns raw bytes of the entire message.
 pub async fn fetch_raw_message(
@@ -256,10 +259,10 @@ pub async fn fetch_raw_message(
     session: &mut ImapSession,
     uid: u32,
 ) -> AppResult<Vec<u8>> {
-    let fetch = fetch_one(server, session, uid, "RFC822").await?;
+    let fetch = fetch_one(server, session, uid, "BODY.PEEK[]").await?;
     let body = fetch
         .body()
-        .ok_or_else(|| AppError::Internal("message has no RFC822 body".to_owned()))?;
+        .ok_or_else(|| AppError::Internal("message has no full message body".to_owned()))?;
     Ok(body.to_vec())
 }
 
@@ -371,9 +374,10 @@ pub async fn uid_copy(
     uid: u32,
     mailbox: &str,
 ) -> AppResult<()> {
+    let encoded_mailbox = encode_mailbox_name_for_command(mailbox);
     timeout(
         socket_timeout(server),
-        session.uid_copy(uid.to_string(), mailbox),
+        session.uid_copy(uid.to_string(), &encoded_mailbox),
     )
     .await
     .map_err(|_| AppError::Timeout("UID COPY timed out".to_owned()))
@@ -390,9 +394,10 @@ pub async fn uid_move(
     uid: u32,
     mailbox: &str,
 ) -> AppResult<()> {
+    let encoded_mailbox = encode_mailbox_name_for_command(mailbox);
     timeout(
         socket_timeout(server),
-        session.uid_mv(uid.to_string(), mailbox),
+        session.uid_mv(uid.to_string(), &encoded_mailbox),
     )
     .await
     .map_err(|_| AppError::Timeout("UID MOVE timed out".to_owned()))
@@ -430,9 +435,10 @@ pub async fn append(
     mailbox: &str,
     content: &[u8],
 ) -> AppResult<()> {
+    let encoded_mailbox = encode_mailbox_name_for_command(mailbox);
     timeout(
         socket_timeout(server),
-        session.append(mailbox, None, None, content),
+        session.append(&encoded_mailbox, None, None, content),
     )
     .await
     .map_err(|_| AppError::Timeout("APPEND timed out".to_owned()))
@@ -454,6 +460,8 @@ mod tests {
     use tokio::time::sleep;
     use tokio::time::timeout;
     use tokio_rustls::TlsConnector;
+
+    use crate::mailbox_codec::encode_mailbox_name_for_command;
 
     use super::{
         append, fetch_flags, fetch_raw_message, list_all_mailboxes, noop, select_mailbox_readonly,
@@ -676,7 +684,8 @@ mod tests {
         session: &mut super::ImapSession,
         mailbox: &str,
     ) -> Result<(), String> {
-        let result = timeout(socket_timeout(config), session.create(mailbox))
+        let encoded_mailbox = encode_mailbox_name_for_command(mailbox);
+        let result = timeout(socket_timeout(config), session.create(&encoded_mailbox))
             .await
             .map_err(|_| format!("CREATE timed out for mailbox '{mailbox}'"))?;
         match result {
@@ -796,6 +805,14 @@ mod tests {
         assert!(
             raw_text.contains("Subject: Roadmap Review"),
             "fetched seeded message should contain expected subject"
+        );
+
+        let unseen_after_fetch = uid_search(&config, &mut session, "UNSEEN")
+            .await
+            .expect("UID SEARCH UNSEEN should succeed after raw fetch");
+        assert!(
+            unseen_after_fetch.contains(&roadmap_uids[0]),
+            "raw message fetch should not mark the message as seen"
         );
     }
 

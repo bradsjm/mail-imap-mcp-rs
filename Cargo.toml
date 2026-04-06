@@ -31,6 +31,7 @@ tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "net", "i
 tokio-rustls = "0.26.2"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter"] }
+utf7-imap = "0.3.2"
 uuid = { version = "1.18.1", features = ["v4"] }
 webpki-roots = "1.0.2"
 urlencoding = "2.1.3"
