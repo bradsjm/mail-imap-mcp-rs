@@ -2062,6 +2062,11 @@ fn validate_chars(value: usize, min: usize, max: usize, field: &str) -> AppResul
 fn validate_search_input(input: &SearchMessagesInput) -> AppResult<()> {
     validate_mailbox(&input.mailbox)?;
     validate_chars(input.limit, 1, 50, "limit")?;
+
+    if input.cursor.is_some() {
+        return Ok(());
+    }
+
     if let Some(v) = input.last_days
         && !(1..=365).contains(&v)
     {
@@ -2089,20 +2094,6 @@ fn validate_search_input(input: &SearchMessagesInput) -> AppResult<()> {
     }
     if let Some(v) = &input.subject {
         validate_search_text(v)?;
-    }
-
-    let has_filters = input.query.is_some()
-        || input.from.is_some()
-        || input.to.is_some()
-        || input.subject.is_some()
-        || input.unread_only.is_some()
-        || input.last_days.is_some()
-        || input.start_date.is_some()
-        || input.end_date.is_some();
-    if input.cursor.is_some() && has_filters {
-        return Err(AppError::InvalidInput(
-            "cursor cannot be combined with search criteria".to_owned(),
-        ));
     }
 
     if input.last_days.is_some() && (input.start_date.is_some() || input.end_date.is_some()) {
@@ -2275,7 +2266,7 @@ mod tests {
 
     use super::{
         encode_raw_source_base64, escape_imap_quoted, resume_cursor_search, validate_flag,
-        validate_mailbox, validate_search_text,
+        validate_mailbox, validate_search_input, validate_search_text,
     };
     use crate::models::SearchMessagesInput;
     use crate::pagination::{CursorEntry, CursorStore};
@@ -2321,6 +2312,81 @@ mod tests {
     fn encodes_raw_source_as_base64() {
         let raw = [0_u8, 159, 255];
         assert_eq!(encode_raw_source_base64(&raw), "AJ//");
+    }
+
+    #[test]
+    fn validate_search_input_allows_replayed_criteria_when_cursor_present() {
+        let input = SearchMessagesInput {
+            account_id: "default".to_owned(),
+            mailbox: "Donations".to_owned(),
+            cursor: Some("cursor-id".to_owned()),
+            query: Some(".*".to_owned()),
+            from: Some(".*".to_owned()),
+            to: Some(".*".to_owned()),
+            subject: Some(".*".to_owned()),
+            unread_only: Some(false),
+            last_days: Some(365),
+            start_date: Some("2025-01-01".to_owned()),
+            end_date: Some("2025-12-31".to_owned()),
+            limit: 50,
+            include_snippet: false,
+            snippet_max_chars: Some(200),
+        };
+
+        validate_search_input(&input).expect("cursor mode should ignore replayed criteria");
+    }
+
+    #[test]
+    fn validate_search_input_still_rejects_conflicting_dates_without_cursor() {
+        let input = SearchMessagesInput {
+            account_id: "default".to_owned(),
+            mailbox: "Donations".to_owned(),
+            cursor: None,
+            query: None,
+            from: None,
+            to: None,
+            subject: None,
+            unread_only: None,
+            last_days: Some(30),
+            start_date: Some("2025-01-01".to_owned()),
+            end_date: Some("2025-12-31".to_owned()),
+            limit: 50,
+            include_snippet: false,
+            snippet_max_chars: None,
+        };
+
+        let err = validate_search_input(&input).expect_err("must reject conflicting date filters");
+        assert!(
+            err.to_string()
+                .contains("last_days cannot be combined with start_date/end_date")
+        );
+    }
+
+    #[test]
+    fn validate_search_input_still_rejects_snippet_size_without_snippets_on_new_search() {
+        let input = SearchMessagesInput {
+            account_id: "default".to_owned(),
+            mailbox: "Donations".to_owned(),
+            cursor: None,
+            query: None,
+            from: None,
+            to: None,
+            subject: None,
+            unread_only: None,
+            last_days: None,
+            start_date: None,
+            end_date: None,
+            limit: 50,
+            include_snippet: false,
+            snippet_max_chars: Some(200),
+        };
+
+        let err = validate_search_input(&input)
+            .expect_err("must reject snippet_max_chars without include_snippet");
+        assert!(
+            err.to_string()
+                .contains("snippet_max_chars requires include_snippet=true")
+        );
     }
 
     #[tokio::test]

@@ -132,23 +132,22 @@ Purpose: search mailbox and return paginated message summaries.
 Input:
 - `account_id` (optional)
 - `mailbox` (required)
-- one of:
-  - `cursor` (string, opaque), or
-  - search criteria fields:
-    - `query?` (1..256)
-    - `from?` (1..256)
-    - `to?` (1..256)
-    - `subject?` (1..256)
-    - `unread_only?` (boolean)
-    - `last_days?` (1..365)
-    - `start_date?` (`YYYY-MM-DD`)
-    - `end_date?` (`YYYY-MM-DD`)
+- `cursor?` (string, opaque)
+- search criteria fields:
+  - `query?` (1..256)
+  - `from?` (1..256)
+  - `to?` (1..256)
+  - `subject?` (1..256)
+  - `unread_only?` (boolean)
+  - `last_days?` (1..365)
+  - `start_date?` (`YYYY-MM-DD`)
+  - `end_date?` (`YYYY-MM-DD`)
 - `limit` (optional)
 - `include_snippet?` (boolean, default false)
 - `snippet_max_chars?` (50..500, default 200; only valid if `include_snippet=true`)
 
 Validation:
-- `cursor` cannot be combined with search criteria.
+- When `cursor` is present, pagination resumes the stored cursor snapshot and ignores search criteria fields plus request-level snippet settings.
 - `last_days` cannot be combined with `start_date`/`end_date`.
 - `start_date <= end_date`.
 - Search text fields and mailbox values must not contain ASCII control characters.

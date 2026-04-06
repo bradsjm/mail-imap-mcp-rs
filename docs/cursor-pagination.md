@@ -43,7 +43,7 @@ Search responses include pagination metadata in the `data` field:
 
 ## Fetching Next Pages
 
-To fetch the next page, pass the `cursor` parameter instead of search criteria:
+To fetch the next page, pass the `cursor` parameter. Clients may resend the original search payload; the server resumes the stored cursor snapshot and ignores replayed search criteria.
 
 ```json
 {
@@ -54,8 +54,9 @@ To fetch the next page, pass the `cursor` parameter instead of search criteria:
 ```
 
 **Important rules:**
-- `cursor` cannot be combined with search criteria (`query`, `from`, `to`, `subject`, `unread_only`, `last_days`, `start_date`, `end_date`)
 - Always pass the same `account_id` and `mailbox` used in the original search
+- When `cursor` is present, `query`, `from`, `to`, `subject`, `unread_only`, `last_days`, `start_date`, `end_date`, `include_snippet`, and `snippet_max_chars` are ignored
+- `limit` still applies to the page size for the resumed cursor request
 - Cursors are opaque strings; do not attempt to parse or construct them
 
 ## Cursor Expiration
@@ -90,7 +91,6 @@ When the limit is reached, the oldest unused cursors are evicted first (LRU poli
 | Error | Cause | Resolution |
 |-------|-------|------------|
 | `invalid input: cursor is invalid or expired` | Cursor expired, malformed, or evicted | Rerun original search |
-| `invalid input: cursor cannot be combined with search criteria` | Both `cursor` and search fields provided | Use only `cursor` for pagination |
 | `conflict: mailbox snapshot changed; rerun search` | UIDVALIDITY changed between pages | Rerun original search |
 
 ## Best Practices
