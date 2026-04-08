@@ -55,7 +55,7 @@ To fetch the next page, pass the `cursor` parameter. Clients may resend the orig
 
 **Important rules:**
 - Always pass the same `account_id` and `mailbox` used in the original search
-- When `cursor` is present, `query`, `from`, `to`, `subject`, `unread_only`, `last_days`, `start_date`, `end_date`, `include_snippet`, and `snippet_max_chars` are ignored
+- When `cursor` is present, `query`, `from`, `to`, `subject`, `unread_only`, `last_days`, `start_date`, `end_date`, and `snippet_max_chars` are ignored
 - `limit` still applies to the page size for the resumed cursor request
 - Cursors are opaque strings; do not attempt to parse or construct them
 

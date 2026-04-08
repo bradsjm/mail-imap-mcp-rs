@@ -25,10 +25,8 @@ pub struct CursorEntry {
     pub uids_desc: Vec<u32>,
     /// Current offset into `uids_desc` (next page starts here)
     pub offset: usize,
-    /// Whether snippet was included in original search
-    pub include_snippet: bool,
-    /// Snippet character limit from original search
-    pub snippet_max_chars: usize,
+    /// Snippet character limit from original search. `None` means snippets are disabled.
+    pub snippet_max_chars: Option<usize>,
     /// Expiration timestamp (refreshed on read/write access)
     pub expires_at: Instant,
 }
@@ -155,8 +153,7 @@ mod tests {
             uidvalidity: 1,
             uids_desc: vec![5, 4, 3, 2, 1],
             offset: 0,
-            include_snippet: false,
-            snippet_max_chars: 200,
+            snippet_max_chars: None,
             expires_at,
         }
     }

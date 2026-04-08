@@ -3,6 +3,7 @@
 //! Provides timeout-bounded wrappers around `async-imap` operations. All network
 //! calls are enforced to use TLS, and timeouts are derived from server config.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -400,6 +401,32 @@ pub async fn fetch_flags(
     Ok(flags_to_strings(&fetch))
 }
 
+/// Fetch flags for a UID set in one round trip.
+pub async fn fetch_flags_by_uid_set(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid_set: &str,
+) -> AppResult<HashMap<u32, Vec<String>>> {
+    let stream = timeout(
+        socket_timeout(server),
+        session.uid_fetch(uid_set, "(UID FLAGS)"),
+    )
+    .await
+    .map_err(|_| AppError::Timeout("UID FETCH timed out".to_owned()))
+    .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid fetch failed: {e}"))))?;
+    let fetches: Vec<Fetch> = timeout(socket_timeout(server), stream.try_collect())
+        .await
+        .map_err(|_| AppError::Timeout("UID FETCH stream timed out".to_owned()))
+        .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid fetch stream failed: {e}"))))?;
+    let mut by_uid = HashMap::new();
+    for fetch in fetches {
+        if let Some(uid) = fetch.uid {
+            by_uid.insert(uid, flags_to_strings(&fetch));
+        }
+    }
+    Ok(by_uid)
+}
+
 /// Convert fetch flags to IMAP string representation
 ///
 /// Helper to serialize flag types to IMAP wire-format strings.
@@ -442,19 +469,27 @@ pub async fn uid_search(
 ///
 /// Runs `UID STORE` with a flag query string. Use `+FLAGS.SILENT` to add
 /// flags or `-FLAGS.SILENT` to remove flags.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn uid_store(
     server: &ServerConfig,
     session: &mut ImapSession,
     uid: u32,
     query: &str,
 ) -> AppResult<()> {
-    let stream = timeout(
-        socket_timeout(server),
-        session.uid_store(uid.to_string(), query),
-    )
-    .await
-    .map_err(|_| AppError::Timeout("UID STORE timed out".to_owned()))
-    .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid store failed: {e}"))))?;
+    uid_store_sequence(server, session, &uid.to_string(), query).await
+}
+
+/// Store flags on a UID sequence.
+pub async fn uid_store_sequence(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid_set: &str,
+    query: &str,
+) -> AppResult<()> {
+    let stream = timeout(socket_timeout(server), session.uid_store(uid_set, query))
+        .await
+        .map_err(|_| AppError::Timeout("UID STORE timed out".to_owned()))
+        .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid store failed: {e}"))))?;
     let _: Vec<Fetch> = timeout(socket_timeout(server), stream.try_collect())
         .await
         .map_err(|_| AppError::Timeout("UID STORE stream timed out".to_owned()))
@@ -466,16 +501,27 @@ pub async fn uid_store(
 ///
 /// Runs `UID COPY` to duplicate the message. Returns the new UID on success
 /// (currently not captured due to protocol limitations).
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn uid_copy(
     server: &ServerConfig,
     session: &mut ImapSession,
     uid: u32,
     mailbox: &str,
 ) -> AppResult<()> {
+    uid_copy_sequence(server, session, &uid.to_string(), mailbox).await
+}
+
+/// Copy a UID sequence to another mailbox.
+pub async fn uid_copy_sequence(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid_set: &str,
+    mailbox: &str,
+) -> AppResult<()> {
     let encoded_mailbox = encode_mailbox_name_for_command(mailbox);
     timeout(
         socket_timeout(server),
-        session.uid_copy(uid.to_string(), &encoded_mailbox),
+        session.uid_copy(uid_set, &encoded_mailbox),
     )
     .await
     .map_err(|_| AppError::Timeout("UID COPY timed out".to_owned()))
@@ -486,16 +532,27 @@ pub async fn uid_copy(
 ///
 /// Runs `UID MOVE` if server supports it (RFC 6851). More efficient than
 /// copy+delete as it's atomic.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn uid_move(
     server: &ServerConfig,
     session: &mut ImapSession,
     uid: u32,
     mailbox: &str,
 ) -> AppResult<()> {
+    uid_move_sequence(server, session, &uid.to_string(), mailbox).await
+}
+
+/// Move a UID sequence to another mailbox.
+pub async fn uid_move_sequence(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid_set: &str,
+    mailbox: &str,
+) -> AppResult<()> {
     let encoded_mailbox = encode_mailbox_name_for_command(mailbox);
     timeout(
         socket_timeout(server),
-        session.uid_mv(uid.to_string(), &encoded_mailbox),
+        session.uid_mv(uid_set, &encoded_mailbox),
     )
     .await
     .map_err(|_| AppError::Timeout("UID MOVE timed out".to_owned()))
@@ -505,12 +562,22 @@ pub async fn uid_move(
 /// Permanently delete a message
 ///
 /// Runs `UID EXPUNGE` to immediately remove the message marked as `\Deleted`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn uid_expunge(
     server: &ServerConfig,
     session: &mut ImapSession,
     uid: u32,
 ) -> AppResult<()> {
-    let stream = timeout(socket_timeout(server), session.uid_expunge(uid.to_string()))
+    uid_expunge_sequence(server, session, &uid.to_string()).await
+}
+
+/// Permanently delete a UID sequence already marked as `\Deleted`.
+pub async fn uid_expunge_sequence(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid_set: &str,
+) -> AppResult<()> {
+    let stream = timeout(socket_timeout(server), session.uid_expunge(uid_set))
         .await
         .map_err(|_| AppError::Timeout("UID EXPUNGE timed out".to_owned()))
         .and_then(|r| r.map_err(|e| AppError::Internal(format!("UID EXPUNGE failed: {e}"))))?;
@@ -527,6 +594,7 @@ pub async fn uid_expunge(
 ///
 /// Used for cross-account copy operations. Does not return the new UID
 /// directly (would require `UIDPLUS` capability).
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn append(
     server: &ServerConfig,
     session: &mut ImapSession,

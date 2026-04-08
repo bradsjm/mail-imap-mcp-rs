@@ -51,9 +51,10 @@ Solution: Rerun `imap_search_messages` to obtain fresh `message_id`s.
 
 ## Usage in Tools
 
-The `message_id` is required by:
+The `message_id` is required by the ID-based message tools, and the encoded account component is used to infer scope:
 - `imap_get_message` - Fetch message details
 - `imap_get_message_raw` - Fetch RFC822 source
-- `imap_apply_to_messages` - Apply `move`, `copy`, `delete`, or `update_flags` to selected messages
+- `imap_apply_to_messages` - Apply `move`, `copy`, or `delete` to explicit messages
+- `imap_update_message_flags` - Add, remove, or replace flags on explicit messages
 
 Always obtain `message_id`s from `imap_search_messages` output rather than constructing them manually.

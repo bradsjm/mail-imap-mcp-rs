@@ -109,7 +109,7 @@ pub struct MessageSummary {
     pub subject: Option<String>,
     /// IMAP flags (e.g., `\Seen`, `\Flagged`)
     pub flags: Option<Vec<String>>,
-    /// Optional subject snippet (if `include_snippet=true`)
+    /// Optional subject snippet (present when `snippet_max_chars` was requested)
     pub snippet: Option<String>,
 }
 
@@ -224,10 +224,7 @@ pub struct SearchMessagesInput {
     #[serde(default = "default_limit")]
     #[schemars(range(min = 1, max = 50), transform = remove_format)]
     pub limit: usize,
-    /// Include subject snippet in results
-    #[serde(default)]
-    pub include_snippet: bool,
-    /// Maximum snippet length (50..500, requires `include_snippet=true`)
+    /// Maximum snippet length (50..500). When omitted, snippets are not included.
     #[schemars(range(min = 50, max = 500), transform = remove_format)]
     pub snippet_max_chars: Option<usize>,
 }
@@ -238,10 +235,6 @@ pub struct SearchMessagesInput {
 /// optional HTML, optional attachment text extraction).
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GetMessageInput {
-    /// Account identifier (defaults to `"default"`)
-    #[serde(default = "default_account_id")]
-    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
-    pub account_id: String,
     /// Stable message identifier (format: `imap:{account}:{mailbox}:{uidvalidity}:{uid}`)
     pub message_id: String,
     /// Maximum body characters (100..20000, default 2000)
@@ -270,10 +263,6 @@ pub struct GetMessageInput {
 /// Used by `imap_get_message_raw`. Returns bounded message bytes.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GetMessageRawInput {
-    /// Account identifier (defaults to `"default"`)
-    #[serde(default = "default_account_id")]
-    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
-    pub account_id: String,
     /// Stable message identifier
     pub message_id: String,
     /// Maximum message bytes to return (1024..1000000, default 200000)
@@ -282,85 +271,35 @@ pub struct GetMessageRawInput {
     pub max_bytes: usize,
 }
 
-/// Input: apply a bulk action to selected messages.
+/// Input: apply a bulk action to explicit messages.
 ///
-/// Used by `imap_apply_to_messages`. Message selection may be explicit by
-/// `message_ids` or derived from mailbox search criteria.
+/// Used by `imap_apply_to_messages`. Message discovery happens via read tools;
+/// this command mutates only the provided stable message ids.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ApplyToMessagesInput {
-    /// Account identifier (defaults to `"default"`)
-    #[serde(default = "default_account_id")]
-    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
-    pub account_id: String,
-    /// Message selector (either explicit ids or a mailbox search)
-    pub selector: MessageSelectorInput,
-    /// Action to apply to the selected messages
+    /// Stable message identifiers to mutate
+    #[schemars(length(min = 1, max = 250))]
+    pub message_ids: Vec<String>,
+    /// Action to apply to the provided messages
     #[schemars(schema_with = "message_action_schema")]
     pub action: String,
     /// Destination mailbox for `move` and `copy`
     #[schemars(length(min = 1, max = 256))]
     pub destination_mailbox: Option<String>,
-    /// Destination account for `copy` (defaults to source account)
-    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
-    pub destination_account_id: Option<String>,
-    /// Flags to add for `update_flags`
-    pub add_flags: Option<Vec<String>>,
-    /// Flags to remove for `update_flags`
-    pub remove_flags: Option<Vec<String>>,
-    /// Maximum allowed matched messages
-    #[serde(default = "default_max_messages")]
-    #[schemars(range(min = 1, max = 1_000), transform = remove_format)]
-    pub max_messages: usize,
-    /// When true, validate and preview without mutating messages
-    #[serde(default)]
-    pub dry_run: bool,
 }
 
-/// Selects target messages by explicit ids or by mailbox search criteria.
+/// Input: update flags on explicit messages.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct MessageSelectorInput {
-    /// Stable message identifiers to target
-    #[serde(default)]
-    #[schemars(length(max = 1_000))]
+pub struct UpdateMessageFlagsInput {
+    /// Stable message identifiers to mutate
+    #[schemars(length(min = 1, max = 250))]
     pub message_ids: Vec<String>,
-    /// Mailbox search criteria
-    #[serde(default)]
-    pub search: SearchSelectorInput,
-}
-
-/// Search criteria used by `imap_apply_to_messages`.
-///
-/// Mirrors `imap_search_messages` without pagination limit or snippet options.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
-pub struct SearchSelectorInput {
-    /// Mailbox to search (e.g., `INBOX`, `Sent`, `Archive`)
-    #[schemars(length(min = 1, max = 256))]
-    pub mailbox: Option<String>,
-    /// Pagination cursor from previous search result
-    pub cursor: Option<String>,
-    /// Full-text search query
-    #[schemars(length(min = 1, max = 256))]
-    pub query: Option<String>,
-    /// Filter by From header
-    #[schemars(length(min = 1, max = 256))]
-    pub from: Option<String>,
-    /// Filter by To header
-    #[schemars(length(min = 1, max = 256))]
-    pub to: Option<String>,
-    /// Filter by Subject header
-    #[schemars(length(min = 1, max = 256))]
-    pub subject: Option<String>,
-    /// Filter to unread messages only
-    pub unread_only: Option<bool>,
-    /// Filter to messages from last N days
-    #[schemars(range(min = 1, max = 365), transform = remove_format)]
-    pub last_days: Option<u16>,
-    /// Filter to messages on or after this date (YYYY-MM-DD)
-    #[schemars(pattern(r"^\d{4}-\d{2}-\d{2}$"))]
-    pub start_date: Option<String>,
-    /// Filter to messages before this date (YYYY-MM-DD)
-    #[schemars(pattern(r"^\d{4}-\d{2}-\d{2}$"))]
-    pub end_date: Option<String>,
+    /// Flag mutation mode
+    #[schemars(schema_with = "flag_operation_schema")]
+    pub operation: String,
+    /// Standard IMAP system flags or server-defined keywords
+    #[schemars(length(min = 1, max = 32))]
+    pub flags: Vec<String>,
 }
 
 /// Input: create, rename, or delete a mailbox.
@@ -379,6 +318,14 @@ pub struct ManageMailboxInput {
     /// Destination mailbox name for `rename`
     #[schemars(length(min = 1, max = 256))]
     pub destination_mailbox: Option<String>,
+}
+
+/// Input: fetch or cancel a previously started write operation.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OperationIdInput {
+    /// Opaque operation identifier returned by a write tool.
+    #[schemars(length(min = 1, max = 64))]
+    pub operation_id: String,
 }
 
 /// Default value for `account_id` field
@@ -415,15 +362,10 @@ fn default_raw_max_bytes() -> usize {
     200_000
 }
 
-/// Default value for maximum messages allowed in bulk selection.
-fn default_max_messages() -> usize {
-    100
-}
-
 fn message_action_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": "string",
-        "enum": ["move", "copy", "delete", "update_flags"]
+        "enum": ["move", "copy", "delete"]
     })
 }
 
@@ -431,6 +373,13 @@ fn mailbox_action_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema 
     schemars::json_schema!({
         "type": "string",
         "enum": ["create", "rename", "delete"]
+    })
+}
+
+fn flag_operation_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "enum": ["add", "remove", "replace"]
     })
 }
 
@@ -512,7 +461,8 @@ mod tests {
 
     use super::{
         AccountOnlyInput, ApplyToMessagesInput, GetMessageInput, GetMessageRawInput,
-        ManageMailboxInput, SearchMessagesInput, validate_client_safe_input_schema,
+        ManageMailboxInput, OperationIdInput, SearchMessagesInput, UpdateMessageFlagsInput,
+        validate_client_safe_input_schema,
     };
 
     #[test]
@@ -523,7 +473,9 @@ mod tests {
             schema_for_type::<GetMessageInput>(),
             schema_for_type::<GetMessageRawInput>(),
             schema_for_type::<ApplyToMessagesInput>(),
+            schema_for_type::<UpdateMessageFlagsInput>(),
             schema_for_type::<ManageMailboxInput>(),
+            schema_for_type::<OperationIdInput>(),
         ] {
             assert_no_nonstandard_integer_formats(&Value::Object((*schema).clone()));
         }
@@ -571,15 +523,11 @@ mod tests {
     }
 
     #[test]
-    fn message_input_schemas_publish_account_and_size_constraints() {
+    fn message_input_schemas_publish_size_and_batch_constraints() {
         let message_schema = schema_for_type::<GetMessageInput>();
         let message_props = message_schema["properties"]
             .as_object()
             .expect("get_message schema must expose properties");
-        assert_eq!(
-            schema_string_property(message_props, "account_id", "pattern"),
-            Some("^[A-Za-z0-9_-]+$")
-        );
         assert_eq!(
             schema_numeric_property(message_props, "body_max_chars", "minimum"),
             Some(100)
@@ -615,12 +563,33 @@ mod tests {
             .as_object()
             .expect("apply_to_messages schema must expose properties");
         assert_eq!(
-            schema_numeric_property(apply_props, "max_messages", "minimum"),
+            schema_numeric_property(apply_props, "message_ids", "minItems"),
             Some(1)
         );
         assert_eq!(
-            schema_numeric_property(apply_props, "max_messages", "maximum"),
-            Some(1_000)
+            schema_numeric_property(apply_props, "message_ids", "maxItems"),
+            Some(250)
+        );
+        assert!(
+            !apply_props.contains_key("dry_run"),
+            "apply_to_messages schema must not publish dry_run"
+        );
+
+        let flag_schema = schema_for_type::<UpdateMessageFlagsInput>();
+        let flag_props = flag_schema["properties"]
+            .as_object()
+            .expect("update_message_flags schema must expose properties");
+        assert_eq!(
+            schema_numeric_property(flag_props, "message_ids", "maxItems"),
+            Some(250)
+        );
+        assert_eq!(
+            schema_numeric_property(flag_props, "flags", "minItems"),
+            Some(1)
+        );
+        assert!(
+            !flag_props.contains_key("dry_run"),
+            "update_message_flags schema must not publish dry_run"
         );
     }
 
@@ -628,7 +597,9 @@ mod tests {
     fn formerly_broken_write_tool_model_schemas_are_client_safe() {
         for schema in [
             schema_for_type::<ApplyToMessagesInput>(),
+            schema_for_type::<UpdateMessageFlagsInput>(),
             schema_for_type::<ManageMailboxInput>(),
+            schema_for_type::<OperationIdInput>(),
         ] {
             validate_client_safe_input_schema(&Value::Object((*schema).clone()))
                 .expect("write tool input schema must be client-safe");

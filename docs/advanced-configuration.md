@@ -112,6 +112,7 @@ MAIL_IMAP_WRITE_ENABLED=true
 
 **Enables:**
 - `imap_apply_to_messages` - Bulk message mutation
+- `imap_update_message_flags` - Bulk message flag updates
 - `imap_manage_mailbox` - Mailbox lifecycle operations
 
 **Security consideration:** Only enable if you need these operations. The server is safer with writes disabled.
