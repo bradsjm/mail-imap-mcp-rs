@@ -267,15 +267,12 @@ printf '%s\n' "$TOOLS_JSON" | jq -e '
   .tools | map(.name) as $names
   | [
       "imap_list_accounts",
-      "imap_verify_account",
       "imap_list_mailboxes",
       "imap_search_messages",
       "imap_get_message",
       "imap_get_message_raw",
-      "imap_update_message_flags",
-      "imap_copy_message",
-      "imap_move_message",
-      "imap_delete_message"
+      "imap_apply_to_messages",
+      "imap_manage_mailbox"
     ]
   | all(. as $tool | ($names | index($tool) != null))
 ' >/dev/null
@@ -286,15 +283,6 @@ printf '%s\n' "$LIST_ACCOUNTS_JSON" | jq -e '
   (.structuredContent.data // .data) as $data
   | (.isError != true)
     and ((($data.accounts // []) | map(.account_id)) | index("default") != null)
-' >/dev/null
-
-echo "Checking imap_verify_account"
-VERIFY_JSON=$(run_inspector --method tools/call --tool-name imap_verify_account --tool-arg account_id=default)
-printf '%s\n' "$VERIFY_JSON" | jq -e '
-  (.structuredContent.data // .data) as $data
-  | (.isError != true)
-    and ($data.status == "ok")
-    and ($data.account_id == "default")
 ' >/dev/null
 
 echo "Checking imap_list_mailboxes"
@@ -355,35 +343,88 @@ printf '%s\n' "$RAW_JSON" | jq -e '
     and (($data.raw_source_base64 // "") | length > 0)
 ' >/dev/null
 
+echo "Checking imap_apply_to_messages dry run"
+APPLY_DRY_RUN_JSON=$(run_inspector \
+  --method tools/call \
+  --tool-name imap_apply_to_messages \
+  --tool-arg account_id=default \
+  --tool-arg "selector={\"message_ids\":[\"${MESSAGE_ID}\"]}" \
+  --tool-arg action=update_flags \
+  --tool-arg 'add_flags=["\\Seen"]' \
+  --tool-arg dry_run=true)
+printf '%s\n' "$APPLY_DRY_RUN_JSON" | jq -e '
+  (.structuredContent.data // .data) as $data
+  | (.isError != true)
+    and ($data.status == "ok")
+    and ($data.dry_run == true)
+    and ($data.matched == 1)
+    and (($data.results | length) == 1)
+    and ($data.results[0].status == "planned")
+' >/dev/null
+
+MAILBOX_BASE="Inspector MCP $(date +%s)"
+MAILBOX_CREATE="${MAILBOX_BASE}/Child"
+MAILBOX_RENAME="${MAILBOX_BASE}/Renamed"
+
+echo "Checking imap_manage_mailbox create"
+MANAGE_CREATE_JSON=$(run_inspector \
+  --method tools/call \
+  --tool-name imap_manage_mailbox \
+  --tool-arg account_id=default \
+  --tool-arg action=create \
+  --tool-arg "mailbox=${MAILBOX_CREATE}")
+printf '%s\n' "$MANAGE_CREATE_JSON" | jq -e '
+  (.structuredContent.data // .data) as $data
+  | (.isError != true)
+    and ($data.status == "ok")
+    and ($data.action == "create")
+' >/dev/null
+
+echo "Checking imap_manage_mailbox rename"
+MANAGE_RENAME_JSON=$(run_inspector \
+  --method tools/call \
+  --tool-name imap_manage_mailbox \
+  --tool-arg account_id=default \
+  --tool-arg action=rename \
+  --tool-arg "mailbox=${MAILBOX_CREATE}" \
+  --tool-arg "destination_mailbox=${MAILBOX_RENAME}")
+printf '%s\n' "$MANAGE_RENAME_JSON" | jq -e '
+  (.structuredContent.data // .data) as $data
+  | (.isError != true)
+    and ($data.status == "ok")
+    and ($data.action == "rename")
+' >/dev/null
+
+echo "Checking imap_manage_mailbox delete"
+MANAGE_DELETE_JSON=$(run_inspector \
+  --method tools/call \
+  --tool-name imap_manage_mailbox \
+  --tool-arg account_id=default \
+  --tool-arg action=delete \
+  --tool-arg "mailbox=${MAILBOX_RENAME}")
+printf '%s\n' "$MANAGE_DELETE_JSON" | jq -e '
+  (.structuredContent.data // .data) as $data
+  | (.isError != true)
+    and ($data.status == "ok")
+    and ($data.action == "delete")
+' >/dev/null
+
 echo "Checking write-path policy enforcement over MCP"
 export MAIL_IMAP_WRITE_ENABLED="false"
 
 expect_failure_with_text "write tools are disabled; set MAIL_IMAP_WRITE_ENABLED=true" \
   --method tools/call \
-  --tool-name imap_update_message_flags \
+  --tool-name imap_apply_to_messages \
   --tool-arg account_id=default \
-  --tool-arg "message_id=${MESSAGE_ID}" \
-  --tool-arg add_flags='["\\Seen"]'
+  --tool-arg "selector={\"message_ids\":[\"${MESSAGE_ID}\"]}" \
+  --tool-arg action=update_flags \
+  --tool-arg 'add_flags=["\\Seen"]'
 
 expect_failure_with_text "write tools are disabled; set MAIL_IMAP_WRITE_ENABLED=true" \
   --method tools/call \
-  --tool-name imap_copy_message \
+  --tool-name imap_manage_mailbox \
   --tool-arg account_id=default \
-  --tool-arg "message_id=${MESSAGE_ID}" \
-  --tool-arg destination_mailbox=INBOX
-
-expect_failure_with_text "write tools are disabled; set MAIL_IMAP_WRITE_ENABLED=true" \
-  --method tools/call \
-  --tool-name imap_move_message \
-  --tool-arg account_id=default \
-  --tool-arg "message_id=${MESSAGE_ID}" \
-  --tool-arg destination_mailbox=INBOX
-
-expect_failure_with_text "write tools are disabled; set MAIL_IMAP_WRITE_ENABLED=true" \
-  --method tools/call \
-  --tool-name imap_delete_message \
-  --tool-arg account_id=default \
-  --tool-arg "message_id=${MESSAGE_ID}" \
-  --tool-arg confirm=true
+  --tool-arg action=create \
+  --tool-arg "mailbox=${MAILBOX_BASE}/Disabled"
 
 echo "MCP inspector GreenMail integration checks passed"

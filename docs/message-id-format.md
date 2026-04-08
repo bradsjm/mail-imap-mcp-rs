@@ -54,9 +54,6 @@ Solution: Rerun `imap_search_messages` to obtain fresh `message_id`s.
 The `message_id` is required by:
 - `imap_get_message` - Fetch message details
 - `imap_get_message_raw` - Fetch RFC822 source
-- `imap_update_message_flags` - Modify flags
-- `imap_copy_message` - Copy to another mailbox
-- `imap_move_message` - Move to another mailbox
-- `imap_delete_message` - Delete message
+- `imap_apply_to_messages` - Apply `move`, `copy`, `delete`, or `update_flags` to selected messages
 
 Always obtain `message_id`s from `imap_search_messages` output rather than constructing them manually.

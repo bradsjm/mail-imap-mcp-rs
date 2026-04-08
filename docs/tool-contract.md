@@ -94,24 +94,7 @@ Output `data`:
 - `accounts`: array (max 50) of `{ account_id, host, port, secure }`
 - `next_action`: `{ instruction, tool, arguments }` (recommended follow-up is `imap_list_mailboxes`)
 
-### 2) `imap_verify_account`
-
-Purpose: verify account connectivity, auth, and capabilities.
-
-Input:
-- `account_id` (optional, default `default`)
-
-Output `data`:
-- `status`: `ok|partial|failed`
-- `issues`: array of diagnostic issues
-- `next_action`: `{ instruction, tool, arguments }`
-- `account_id`
-- `ok` (boolean; true unless `status=failed`)
-- `latency_ms` (integer)
-- `server`: `{ host, port, secure }`
-- `capabilities`: string[] (max 256)
-
-### 3) `imap_list_mailboxes`
+### 2) `imap_list_mailboxes`
 
 Purpose: list visible mailboxes/folders.
 
@@ -125,7 +108,7 @@ Output `data`:
 - `account_id`
 - `mailboxes`: array (max 200) of `{ name, delimiter? }`
 
-### 4) `imap_search_messages`
+### 3) `imap_search_messages`
 
 Purpose: search mailbox and return paginated message summaries.
 
@@ -176,7 +159,7 @@ Output `data`:
 - `next_cursor?` (string)
 - `has_more` (boolean)
 
-### 5) `imap_get_message`
+### 4) `imap_get_message`
 
 Purpose: return parsed message details with optional bounded enrichments.
 
@@ -220,7 +203,7 @@ PDF extraction rules:
 - max attachment size for extraction: 5 MB
 - extraction failures do not fail the whole tool call
 
-### 6) `imap_get_message_raw`
+### 5) `imap_get_message_raw`
 
 Purpose: return bounded RFC822 source for diagnostics.
 
@@ -238,101 +221,87 @@ Output `data`:
 - `raw_source_base64` (byte-faithful RFC822 source, base64 encoded)
 - `raw_source_encoding` (`"base64"` on success)
 
-### 7) `imap_update_message_flags`
+### 6) `imap_apply_to_messages`
 
-Purpose: add/remove IMAP flags on a message.
+Purpose: apply one mutation action to a selected set of messages.
 
 Write gate: requires `MAIL_IMAP_WRITE_ENABLED=true`.
 
 Input:
 - `account_id` (optional)
-- `message_id` (required)
-- `add_flags?`: string[] (1..20)
-- `remove_flags?`: string[] (1..20)
+- `selector` (required), exactly one of:
+  - `message_ids`: string[] (1..1000)
+  - `search`: object with:
+    - `mailbox` (required)
+    - `cursor?` (string, opaque)
+    - `query?` (1..256)
+    - `from?` (1..256)
+    - `to?` (1..256)
+    - `subject?` (1..256)
+    - `unread_only?` (boolean)
+    - `last_days?` (1..365)
+    - `start_date?` (`YYYY-MM-DD`)
+    - `end_date?` (`YYYY-MM-DD`)
+- `action` (required), one of:
+  - `move` with `destination_mailbox`
+  - `copy` with `destination_mailbox`, `destination_account_id?`
+  - `delete`
+  - `update_flags` with `add_flags?`, `remove_flags?`
+- `max_messages` (optional, default `100`, range `1..1000`)
+- `dry_run` (optional, default `false`)
 
 Validation:
-- at least one of `add_flags` or `remove_flags` is required.
+- selector must include exactly one of `message_ids` or `search`
+- when `search.cursor` is present, search criteria replay is accepted and ignored
+- `update_flags` requires at least one of `add_flags` or `remove_flags`
+- `move` is same-account only
+- the resolved selection must not exceed `max_messages`
 
 Output `data`:
 - `status`: `ok|partial|failed`
 - `issues`: array of diagnostic issues
 - `account_id`
-- `message_id`
-- `flags`: string[] (nullable when flag fetch fails)
-- `requested_add_flags`: string[]
-- `requested_remove_flags`: string[]
-- `applied_add_flags`: boolean
-- `applied_remove_flags`: boolean
+- `action`: `move|copy|delete|update_flags`
+- `dry_run` (boolean)
+- `matched`: integer
+- `attempted`: integer
+- `succeeded`: integer
+- `failed`: integer
+- `results`: array of:
+  - `message_id`
+  - `status`: `planned|ok|partial|failed`
+  - `issues`
+  - `source_mailbox`
+  - `destination_mailbox?`
+  - `destination_account_id?`
+  - `flags?`
+  - `new_message_id?`
 
-### 8) `imap_copy_message`
+### 7) `imap_manage_mailbox`
 
-Purpose: copy message to mailbox in same or different account.
-
-Write gate: requires `MAIL_IMAP_WRITE_ENABLED=true`.
-
-Input:
-- `account_id` (optional, source)
-- `message_id` (required)
-- `destination_mailbox` (required)
-- `destination_account_id?` (defaults to source account)
-
-Output `data`:
-- `status`: `ok|partial|failed`
-- `issues`: array of diagnostic issues
-- `source_account_id`
-- `destination_account_id`
-- `source_mailbox`
-- `destination_mailbox`
-- `message_id`
-- `new_message_id?` (present when server returns UID mapping)
-- `steps_attempted`: integer
-- `steps_succeeded`: integer
-
-### 9) `imap_move_message`
-
-Purpose: move message to mailbox in same account.
+Purpose: create, rename, or delete a mailbox.
 
 Write gate: requires `MAIL_IMAP_WRITE_ENABLED=true`.
 
 Input:
 - `account_id` (optional)
-- `message_id` (required)
-- `destination_mailbox` (required)
+- `action` (required), one of:
+  - `create` with `mailbox`
+  - `rename` with `mailbox`, `destination_mailbox`
+  - `delete` with `mailbox`
 
 Behavior:
-- prefer IMAP MOVE capability
-- fallback to COPY + DELETE when MOVE unsupported
+- `create` auto-creates missing parent mailboxes before the target mailbox
+- `rename` is the mailbox move primitive and auto-creates missing destination parents
+- `delete` is non-recursive and surfaces the server error for non-empty mailboxes or mailboxes with children
 
 Output `data`:
 - `status`: `ok|partial|failed`
 - `issues`: array of diagnostic issues
 - `account_id`
-- `source_mailbox`
-- `destination_mailbox`
-- `message_id`
-- `new_message_id?`
-- `steps_attempted`: integer
-- `steps_succeeded`: integer
-
-### 10) `imap_delete_message`
-
-Purpose: delete message from mailbox.
-
-Write gate: requires `MAIL_IMAP_WRITE_ENABLED=true`.
-
-Input:
-- `account_id` (optional)
-- `message_id` (required)
-- `confirm` (required literal `true`)
-
-Output `data`:
-- `status`: `ok|partial|failed`
-- `issues`: array of diagnostic issues
-- `account_id`
+- `action`: `create|rename|delete`
 - `mailbox`
-- `message_id`
-- `steps_attempted`: integer
-- `steps_succeeded`: integer
+- `destination_mailbox?`
 
 ## Security and Guardrails
 

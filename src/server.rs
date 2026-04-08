@@ -1,8 +1,9 @@
 //! MCP server implementation with tool handlers
 //!
-//! Implements the `ServerHandler` trait and registers 10 MCP tools. Handles
+//! Implements the `ServerHandler` trait and registers 7 MCP tools. Handles
 //! input validation, business logic orchestration, and response formatting.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -22,9 +23,9 @@ use crate::mailbox_codec::{decode_mailbox_name_for_display, normalize_mailbox_na
 use crate::message_id::MessageId;
 use crate::mime;
 use crate::models::{
-    AccountInfo, AccountOnlyInput, CopyMessageInput, DeleteMessageInput, GetMessageInput,
-    GetMessageRawInput, MailboxInfo, MessageDetail, MessageSummary, Meta, MoveMessageInput,
-    SearchMessagesInput, ToolEnvelope, UpdateMessageFlagsInput,
+    AccountInfo, AccountOnlyInput, ApplyToMessagesInput, GetMessageInput, GetMessageRawInput,
+    MailboxAction, MailboxInfo, ManageMailboxInput, MessageActionInput, MessageDetail,
+    MessageSummary, Meta, SearchMessagesInput, SearchSelectorInput, ToolEnvelope,
 };
 use crate::pagination::{CursorEntry, CursorStore};
 
@@ -102,28 +103,6 @@ impl MailImapServer {
                 ),
                 data,
             )),
-        )
-    }
-
-    /// Tool: Verify account connectivity and capabilities
-    ///
-    /// Tests TCP/TLS connection, authentication, and retrieves server
-    /// capabilities list.
-    #[tool(
-        name = "imap_verify_account",
-        description = "Verify account connectivity and capabilities"
-    )]
-    async fn verify_account(
-        &self,
-        Parameters(input): Parameters<AccountOnlyInput>,
-    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
-        let started = Instant::now();
-        finalize_tool(
-            started,
-            "imap_verify_account",
-            self.verify_account_impl(input)
-                .await
-                .map(|data| ("Account verification succeeded".to_owned(), data)),
         )
     }
 
@@ -218,83 +197,45 @@ impl MailImapServer {
         )
     }
 
-    /// Tool: Add or remove IMAP flags
-    ///
-    /// Modifies message flags (e.g., `\Seen`, `\Flagged`, `\Draft`,
-    /// custom flags). Requires `MAIL_IMAP_WRITE_ENABLED=true`.
+    /// Tool: Apply one mutation to selected messages.
     #[tool(
-        name = "imap_update_message_flags",
-        description = "Add or remove IMAP flags"
+        name = "imap_apply_to_messages",
+        description = "Apply one mutation action to selected messages"
     )]
-    async fn update_message_flags(
+    async fn apply_to_messages(
         &self,
-        Parameters(input): Parameters<UpdateMessageFlagsInput>,
+        Parameters(input): Parameters<ApplyToMessagesInput>,
     ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
         let started = Instant::now();
         finalize_tool(
             started,
-            "imap_update_message_flags",
-            self.update_flags_impl(input)
-                .await
-                .map(|data| ("Flags updated".to_owned(), data)),
+            "imap_apply_to_messages",
+            self.apply_to_messages_impl(input).await.map(|data| {
+                let matched = data["matched"].as_u64().unwrap_or(0);
+                let action = data["action"].as_str().unwrap_or("mutation");
+                (format!("{matched} message(s) processed for {action}"), data)
+            }),
         )
     }
 
-    /// Tool: Copy message to mailbox
-    ///
-    /// Copies message to same or different account. Cross-account copy uses
-    /// `APPEND`. Requires `MAIL_IMAP_WRITE_ENABLED=true`.
-    #[tool(name = "imap_copy_message", description = "Copy a message to mailbox")]
-    async fn copy_message(
+    /// Tool: Create, rename, or delete a mailbox.
+    #[tool(
+        name = "imap_manage_mailbox",
+        description = "Create, rename, or delete a mailbox"
+    )]
+    async fn manage_mailbox(
         &self,
-        Parameters(input): Parameters<CopyMessageInput>,
+        Parameters(input): Parameters<ManageMailboxInput>,
     ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
         let started = Instant::now();
         finalize_tool(
             started,
-            "imap_copy_message",
-            self.copy_message_impl(input)
-                .await
-                .map(|data| ("Message copied".to_owned(), data)),
-        )
-    }
-
-    /// Tool: Move message to mailbox
-    ///
-    /// Moves message within same account. Prefers `MOVE` capability,
-    /// falls back to `COPY` + `DELETE`. Requires
-    /// `MAIL_IMAP_WRITE_ENABLED=true`.
-    #[tool(name = "imap_move_message", description = "Move a message to mailbox")]
-    async fn move_message(
-        &self,
-        Parameters(input): Parameters<MoveMessageInput>,
-    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
-        let started = Instant::now();
-        finalize_tool(
-            started,
-            "imap_move_message",
-            self.move_message_impl(input)
-                .await
-                .map(|data| ("Message moved".to_owned(), data)),
-        )
-    }
-
-    /// Tool: Delete message from mailbox
-    ///
-    /// Marks message as `\Deleted` and immediately expunges. Requires
-    /// explicit `confirm=true` and `MAIL_IMAP_WRITE_ENABLED=true`.
-    #[tool(name = "imap_delete_message", description = "Delete a message")]
-    async fn delete_message(
-        &self,
-        Parameters(input): Parameters<DeleteMessageInput>,
-    ) -> Result<Json<ToolEnvelope<serde_json::Value>>, ErrorData> {
-        let started = Instant::now();
-        finalize_tool(
-            started,
-            "imap_delete_message",
-            self.delete_message_impl(input)
-                .await
-                .map(|data| ("Message deleted".to_owned(), data)),
+            "imap_manage_mailbox",
+            self.manage_mailbox_impl(input).await.map(|data| {
+                let action = data["action"].as_str().unwrap_or("manage");
+                let mailbox = data["mailbox"].as_str().unwrap_or("mailbox");
+                (format!("{action} completed for {mailbox}"), data)
+            }),
         )
     }
 }
@@ -388,76 +329,33 @@ struct SummaryBuildResult {
     failed: usize,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct MessageMutationResult {
+    message_id: String,
+    status: String,
+    issues: Vec<ToolIssue>,
+    source_mailbox: String,
+    destination_mailbox: Option<String>,
+    destination_account_id: Option<String>,
+    flags: Option<Vec<String>>,
+    new_message_id: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct MailboxManagementResult {
+    status: String,
+    issues: Vec<ToolIssue>,
+    account_id: String,
+    action: String,
+    mailbox: String,
+    destination_mailbox: Option<String>,
+}
+
 /// Tool implementation methods
 ///
 /// Private methods handle the actual business logic for each tool, separated
 /// from the public `#[tool]` methods that handle response formatting.
 impl MailImapServer {
-    async fn verify_account_impl(&self, input: AccountOnlyInput) -> AppResult<serde_json::Value> {
-        validate_account_id(&input.account_id)?;
-        let account = self.config.get_account(&input.account_id)?;
-        let started = Instant::now();
-        let mut issues = Vec::new();
-
-        let mut session = match imap::connect_authenticated(&self.config, account).await {
-            Ok(session) => session,
-            Err(error) => {
-                issues.push(ToolIssue::from_error("connect_authenticated", &error));
-                log_runtime_issues(
-                    "imap_verify_account",
-                    "failed",
-                    &input.account_id,
-                    None,
-                    &issues,
-                );
-                return Ok(serde_json::json!({
-                    "status": "failed",
-                    "issues": issues,
-                    "next_action": next_action_retry_verify(&input.account_id),
-                    "account_id": account.account_id,
-                    "ok": false,
-                    "latency_ms": duration_ms(started),
-                    "server": { "host": account.host, "port": account.port, "secure": account.secure },
-                    "capabilities": []
-                }));
-            }
-        };
-
-        if let Err(error) = imap::noop(&self.config, &mut session).await {
-            issues.push(ToolIssue::from_error("noop", &error));
-        }
-
-        let mut capabilities = match imap::capabilities(&self.config, &mut session).await {
-            Ok(caps) => caps.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>(),
-            Err(error) => {
-                issues.push(ToolIssue::from_error("capabilities", &error));
-                Vec::new()
-            }
-        };
-        capabilities.sort();
-        capabilities.truncate(256);
-
-        let status = status_from_counts(issues.is_empty(), true);
-        log_runtime_issues(
-            "imap_verify_account",
-            status,
-            &input.account_id,
-            None,
-            &issues,
-        );
-
-        Ok(serde_json::json!({
-            "status": status,
-            "issues": issues,
-            "next_action": next_action_list_mailboxes(&input.account_id),
-            "account_id": account.account_id,
-            "ok": status != "failed",
-            "latency_ms": duration_ms(started),
-            "server": { "host": account.host, "port": account.port, "secure": account.secure },
-            "capabilities": capabilities
-        }))
-    }
-
     async fn list_mailboxes_impl(&self, input: AccountOnlyInput) -> AppResult<serde_json::Value> {
         validate_account_id(&input.account_id)?;
         let account = self.config.get_account(&input.account_id)?;
@@ -477,7 +375,7 @@ impl MailImapServer {
                 return Ok(serde_json::json!({
                     "status": "failed",
                     "issues": issues,
-                    "next_action": next_action_retry_verify(&input.account_id),
+                    "next_action": next_action_list_accounts(),
                     "account_id": account.account_id,
                     "mailboxes": []
                 }));
@@ -511,7 +409,7 @@ impl MailImapServer {
         );
         let next_action = preferred_mailbox_name(&mailboxes)
             .map(|mailbox| next_action_search_mailbox(&input.account_id, &mailbox))
-            .unwrap_or_else(|| next_action_retry_verify(&input.account_id));
+            .unwrap_or_else(next_action_list_accounts);
 
         Ok(serde_json::json!({
             "status": status,
@@ -545,7 +443,7 @@ impl MailImapServer {
                 return Ok(SearchResultData {
                     status: "failed".to_owned(),
                     issues,
-                    next_action: next_action_retry_verify(&input.account_id),
+                    next_action: next_action_list_mailboxes(&input.account_id),
                     account_id: input.account_id,
                     mailbox: input.mailbox,
                     total: 0,
@@ -574,7 +472,7 @@ impl MailImapServer {
                     return Ok(SearchResultData {
                         status: "failed".to_owned(),
                         issues,
-                        next_action: next_action_retry_verify(&input.account_id),
+                        next_action: next_action_list_mailboxes(&input.account_id),
                         account_id: input.account_id,
                         mailbox: input.mailbox,
                         total: 0,
@@ -607,7 +505,7 @@ impl MailImapServer {
                     return Ok(SearchResultData {
                         status: "failed".to_owned(),
                         issues,
-                        next_action: next_action_retry_verify(&input.account_id),
+                        next_action: next_action_list_mailboxes(&input.account_id),
                         account_id: input.account_id,
                         mailbox: input.mailbox,
                         total: 0,
@@ -996,28 +894,318 @@ impl MailImapServer {
         }))
     }
 
-    async fn update_flags_impl(
+    async fn apply_to_messages_impl(
         &self,
-        input: UpdateMessageFlagsInput,
+        input: ApplyToMessagesInput,
     ) -> AppResult<serde_json::Value> {
         require_write_enabled(&self.config)?;
         validate_account_id(&input.account_id)?;
+        validate_chars(input.max_messages, 1, 1_000, "max_messages")?;
+        validate_message_action(&input.action, &input.account_id)?;
 
-        let add_flags = input.add_flags.unwrap_or_default();
-        let remove_flags = input.remove_flags.unwrap_or_default();
-        if add_flags.is_empty() && remove_flags.is_empty() {
-            return Err(AppError::InvalidInput(
-                "at least one of add_flags/remove_flags is required".to_owned(),
-            ));
+        let message_ids = self
+            .resolve_message_selection(&input.account_id, &input.selector, input.max_messages)
+            .await?;
+        let action_name = message_action_name(&input.action);
+
+        let mut results = Vec::with_capacity(message_ids.len());
+        let mut issues = Vec::new();
+
+        if input.dry_run {
+            for msg_id in message_ids {
+                results.push(build_planned_message_result(&msg_id, &input.action));
+            }
+
+            return Ok(serde_json::json!({
+                "status": "ok",
+                "issues": issues,
+                "account_id": input.account_id,
+                "action": action_name,
+                "dry_run": true,
+                "matched": results.len(),
+                "attempted": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "results": results,
+            }));
         }
-        validate_flags(&add_flags, "add_flags")?;
-        validate_flags(&remove_flags, "remove_flags")?;
 
-        let msg_id = parse_and_validate_message_id(&input.account_id, &input.message_id)?;
-        let encoded_message_id = msg_id.encode();
+        let matched = message_ids.len();
+        let mut succeeded = 0usize;
+        for msg_id in message_ids {
+            let result = self
+                .execute_message_action(&input.account_id, &input.action, &msg_id)
+                .await;
+            if result.status == "ok" {
+                succeeded += 1;
+            }
+            issues.extend(result.issues.iter().cloned());
+            results.push(result);
+        }
+        let failed = matched.saturating_sub(succeeded);
+        let status = status_from_issue_and_counts(&issues, succeeded > 0).to_owned();
+        log_runtime_issues(
+            "imap_apply_to_messages",
+            &status,
+            &input.account_id,
+            None,
+            &issues,
+        );
+
+        Ok(serde_json::json!({
+            "status": status,
+            "issues": issues,
+            "account_id": input.account_id,
+            "action": action_name,
+            "dry_run": false,
+            "matched": matched,
+            "attempted": matched,
+            "succeeded": succeeded,
+            "failed": failed,
+            "results": results,
+        }))
+    }
+
+    async fn manage_mailbox_impl(&self, input: ManageMailboxInput) -> AppResult<serde_json::Value> {
+        require_write_enabled(&self.config)?;
+        validate_account_id(&input.account_id)?;
+
+        let (action_name, mailbox, destination_mailbox) = match &input.action {
+            MailboxAction::Create { mailbox } => {
+                validate_mailbox(mailbox)?;
+                ("create", mailbox.clone(), None)
+            }
+            MailboxAction::Rename {
+                mailbox,
+                destination_mailbox,
+            } => {
+                validate_mailbox(mailbox)?;
+                validate_mailbox(destination_mailbox)?;
+                if normalize_mailbox_name(mailbox) == normalize_mailbox_name(destination_mailbox) {
+                    return Err(AppError::InvalidInput(
+                        "destination_mailbox must differ from mailbox".to_owned(),
+                    ));
+                }
+                ("rename", mailbox.clone(), Some(destination_mailbox.clone()))
+            }
+            MailboxAction::Delete { mailbox } => {
+                validate_mailbox(mailbox)?;
+                ("delete", mailbox.clone(), None)
+            }
+        };
 
         let account = self.config.get_account(&input.account_id)?;
         let mut issues = Vec::new();
+        let mut session = match imap::connect_authenticated(&self.config, account).await {
+            Ok(session) => session,
+            Err(error) => {
+                issues.push(ToolIssue::from_error("connect_authenticated", &error));
+                let result = MailboxManagementResult {
+                    status: "failed".to_owned(),
+                    issues: issues.clone(),
+                    account_id: input.account_id,
+                    action: action_name.to_owned(),
+                    mailbox,
+                    destination_mailbox,
+                };
+                return serde_json::to_value(result).map_err(serialization_error);
+            }
+        };
+
+        let operation = match &input.action {
+            MailboxAction::Create { mailbox } => {
+                imap::create_mailbox_path(&self.config, &mut session, mailbox).await
+            }
+            MailboxAction::Rename {
+                mailbox,
+                destination_mailbox,
+            } => {
+                match imap::create_parent_mailboxes(&self.config, &mut session, destination_mailbox)
+                    .await
+                {
+                    Ok(()) => {
+                        imap::rename_mailbox(
+                            &self.config,
+                            &mut session,
+                            mailbox,
+                            destination_mailbox,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            MailboxAction::Delete { mailbox } => {
+                imap::delete_mailbox(&self.config, &mut session, mailbox).await
+            }
+        };
+
+        if let Err(error) = operation {
+            let stage = match &input.action {
+                MailboxAction::Create { .. } => "create_mailbox",
+                MailboxAction::Rename { .. } => "rename_mailbox",
+                MailboxAction::Delete { .. } => "delete_mailbox",
+            };
+            issues.push(ToolIssue::from_error(stage, &error));
+        }
+
+        let status = status_from_issue_and_counts(&issues, issues.is_empty()).to_owned();
+        log_runtime_issues(
+            "imap_manage_mailbox",
+            &status,
+            &input.account_id,
+            Some(&mailbox),
+            &issues,
+        );
+
+        let result = MailboxManagementResult {
+            status,
+            issues,
+            account_id: input.account_id,
+            action: action_name.to_owned(),
+            mailbox,
+            destination_mailbox,
+        };
+        serde_json::to_value(result).map_err(serialization_error)
+    }
+
+    async fn resolve_message_selection(
+        &self,
+        account_id: &str,
+        selector: &crate::models::MessageSelectorInput,
+        max_messages: usize,
+    ) -> AppResult<Vec<MessageId>> {
+        match (&selector.message_ids, &selector.search) {
+            (Some(message_ids), None) => {
+                if message_ids.is_empty() {
+                    return Err(AppError::InvalidInput(
+                        "selector.message_ids must not be empty".to_owned(),
+                    ));
+                }
+                if message_ids.len() > max_messages {
+                    return Err(AppError::InvalidInput(format!(
+                        "selector matched {} messages; narrow selection to at most {}",
+                        message_ids.len(),
+                        max_messages
+                    )));
+                }
+                dedupe_and_parse_message_ids(account_id, message_ids)
+            }
+            (None, Some(search)) => {
+                self.resolve_search_selection(account_id, search, max_messages)
+                    .await
+            }
+            _ => Err(AppError::InvalidInput(
+                "selector must include exactly one of message_ids or search".to_owned(),
+            )),
+        }
+    }
+
+    async fn resolve_search_selection(
+        &self,
+        account_id: &str,
+        search: &SearchSelectorInput,
+        max_messages: usize,
+    ) -> AppResult<Vec<MessageId>> {
+        let search_input = search_selector_to_search_input(account_id, search);
+        validate_search_input(&search_input)?;
+
+        let account = self.config.get_account(account_id)?;
+        let mut session = imap::connect_authenticated(&self.config, account).await?;
+        let uidvalidity =
+            imap::select_mailbox_readonly(&self.config, &mut session, &search_input.mailbox)
+                .await?;
+
+        let snapshot = if let Some(cursor) = search_input.cursor.clone() {
+            resume_cursor_search(&self.cursors, &search_input, uidvalidity, cursor).await?
+        } else {
+            start_new_search(&self.config, &mut session, &search_input).await?
+        };
+
+        let selected = snapshot
+            .uids_desc
+            .into_iter()
+            .skip(snapshot.offset)
+            .collect::<Vec<_>>();
+        if selected.len() > max_messages {
+            return Err(AppError::InvalidInput(format!(
+                "selector matched {} messages; narrow selection to at most {}",
+                selected.len(),
+                max_messages
+            )));
+        }
+
+        Ok(selected
+            .into_iter()
+            .map(|uid| MessageId {
+                account_id: account_id.to_owned(),
+                mailbox: search_input.mailbox.clone(),
+                uidvalidity,
+                uid,
+            })
+            .collect())
+    }
+
+    async fn execute_message_action(
+        &self,
+        account_id: &str,
+        action: &MessageActionInput,
+        msg_id: &MessageId,
+    ) -> MessageMutationResult {
+        match action {
+            MessageActionInput::Move {
+                destination_mailbox,
+            } => {
+                self.execute_move_message(account_id, msg_id, destination_mailbox)
+                    .await
+            }
+            MessageActionInput::Copy {
+                destination_mailbox,
+                destination_account_id,
+            } => {
+                self.execute_copy_message(
+                    account_id,
+                    msg_id,
+                    destination_mailbox,
+                    destination_account_id.as_deref(),
+                )
+                .await
+            }
+            MessageActionInput::Delete => self.execute_delete_message(account_id, msg_id).await,
+            MessageActionInput::UpdateFlags {
+                add_flags,
+                remove_flags,
+            } => {
+                self.execute_update_flags(
+                    account_id,
+                    msg_id,
+                    add_flags.clone().unwrap_or_default(),
+                    remove_flags.clone().unwrap_or_default(),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn execute_update_flags(
+        &self,
+        account_id: &str,
+        msg_id: &MessageId,
+        add_flags: Vec<String>,
+        remove_flags: Vec<String>,
+    ) -> MessageMutationResult {
+        let encoded_message_id = msg_id.encode();
+        let mut issues = Vec::new();
+        let account = match self.config.get_account(account_id) {
+            Ok(account) => account,
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("account_lookup", &error)
+                        .with_message_id(&encoded_message_id),
+                );
+                return failed_message_result(msg_id, encoded_message_id, issues, None, None, None);
+            }
+        };
 
         let mut session = match imap::connect_authenticated(&self.config, account).await {
             Ok(session) => session,
@@ -1026,57 +1214,42 @@ impl MailImapServer {
                     ToolIssue::from_error("connect_authenticated", &error)
                         .with_message_id(&encoded_message_id),
                 );
-                log_runtime_issues(
-                    "imap_update_message_flags",
-                    "failed",
-                    &input.account_id,
-                    Some(&msg_id.mailbox),
-                    &issues,
-                );
-                return Ok(serde_json::json!({
-                    "status": "failed",
-                    "issues": issues,
-                    "account_id": input.account_id,
-                    "message_id": encoded_message_id,
-                    "flags": serde_json::Value::Null,
-                    "requested_add_flags": add_flags,
-                    "requested_remove_flags": remove_flags,
-                    "applied_add_flags": false,
-                    "applied_remove_flags": false,
-                }));
+                return failed_message_result(msg_id, encoded_message_id, issues, None, None, None);
             }
         };
-        ensure_uidvalidity_matches_readwrite(&self.config, &mut session, &msg_id).await?;
+        if let Err(error) =
+            ensure_uidvalidity_matches_readwrite(&self.config, &mut session, msg_id).await
+        {
+            issues.push(
+                ToolIssue::from_error("select_mailbox_readwrite", &error)
+                    .with_uid(msg_id.uid)
+                    .with_message_id(&encoded_message_id),
+            );
+            return failed_message_result(msg_id, encoded_message_id, issues, None, None, None);
+        }
 
-        let mut applied_add_flags = false;
         if !add_flags.is_empty() {
             let query = format!("+FLAGS.SILENT ({})", add_flags.join(" "));
             if let Err(error) =
-                imap::uid_store(&self.config, &mut session, msg_id.uid, query.as_str()).await
+                imap::uid_store(&self.config, &mut session, msg_id.uid, &query).await
             {
                 issues.push(
                     ToolIssue::from_error("uid_store_add_flags", &error)
                         .with_uid(msg_id.uid)
                         .with_message_id(&encoded_message_id),
                 );
-            } else {
-                applied_add_flags = true;
             }
         }
-
-        let mut applied_remove_flags = false;
         if !remove_flags.is_empty() {
             let query = format!("-FLAGS.SILENT ({})", remove_flags.join(" "));
             if let Err(error) =
-                imap::uid_store(&self.config, &mut session, msg_id.uid, query.as_str()).await
+                imap::uid_store(&self.config, &mut session, msg_id.uid, &query).await
             {
                 issues.push(
                     ToolIssue::from_error("uid_store_remove_flags", &error)
                         .with_uid(msg_id.uid)
                         .with_message_id(&encoded_message_id),
                 );
-            } else {
-                applied_remove_flags = true;
             }
         }
 
@@ -1092,349 +1265,310 @@ impl MailImapServer {
             }
         };
 
-        let status = status_from_issue_and_counts(&issues, flags.is_some());
-        log_runtime_issues(
-            "imap_update_message_flags",
-            status,
-            &input.account_id,
-            Some(&msg_id.mailbox),
-            &issues,
-        );
-        Ok(serde_json::json!({
-            "status": status,
-            "issues": issues,
-            "account_id": input.account_id,
-            "message_id": encoded_message_id,
-            "flags": flags,
-            "requested_add_flags": add_flags,
-            "requested_remove_flags": remove_flags,
-            "applied_add_flags": applied_add_flags,
-            "applied_remove_flags": applied_remove_flags,
-        }))
+        let has_flags = flags.is_some();
+        finalize_message_result(
+            msg_id,
+            encoded_message_id,
+            issues,
+            None,
+            None,
+            flags,
+            has_flags,
+        )
     }
 
-    async fn copy_message_impl(&self, input: CopyMessageInput) -> AppResult<serde_json::Value> {
-        require_write_enabled(&self.config)?;
-        validate_account_id(&input.account_id)?;
-        validate_mailbox(&input.destination_mailbox)?;
-        let destination_account_id = input
-            .destination_account_id
-            .clone()
-            .unwrap_or_else(|| input.account_id.clone());
-        validate_account_id(&destination_account_id)?;
-
-        let msg_id = parse_and_validate_message_id(&input.account_id, &input.message_id)?;
+    async fn execute_copy_message(
+        &self,
+        account_id: &str,
+        msg_id: &MessageId,
+        destination_mailbox: &str,
+        destination_account_id: Option<&str>,
+    ) -> MessageMutationResult {
         let encoded_message_id = msg_id.encode();
+        let destination_account_id = destination_account_id.unwrap_or(account_id).to_owned();
         let mut issues = Vec::new();
-        let mut steps_succeeded = 0usize;
-        let mut steps_attempted = 0usize;
 
-        if destination_account_id == input.account_id {
-            let account = self.config.get_account(&input.account_id)?;
-            steps_attempted += 1;
-            let mut session = match imap::connect_authenticated(&self.config, account).await {
-                Ok(session) => {
-                    steps_succeeded += 1;
-                    session
-                }
+        let source_account = match self.config.get_account(account_id) {
+            Ok(account) => account,
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("account_lookup_source", &error)
+                        .with_message_id(&encoded_message_id),
+                );
+                return failed_message_result(
+                    msg_id,
+                    encoded_message_id,
+                    issues,
+                    Some(destination_mailbox.to_owned()),
+                    Some(destination_account_id),
+                    None,
+                );
+            }
+        };
+
+        if destination_account_id == account_id {
+            let mut session = match imap::connect_authenticated(&self.config, source_account).await
+            {
+                Ok(session) => session,
                 Err(error) => {
                     issues.push(
                         ToolIssue::from_error("connect_authenticated_source", &error)
                             .with_message_id(&encoded_message_id),
                     );
-                    log_runtime_issues(
-                        "imap_copy_message",
-                        "failed",
-                        &input.account_id,
-                        Some(&msg_id.mailbox),
-                        &issues,
+                    return failed_message_result(
+                        msg_id,
+                        encoded_message_id,
+                        issues,
+                        Some(destination_mailbox.to_owned()),
+                        Some(destination_account_id),
+                        None,
                     );
-                    return Ok(serde_json::json!({
-                        "status": "failed",
-                        "issues": issues,
-                        "source_account_id": input.account_id,
-                        "destination_account_id": destination_account_id,
-                        "source_mailbox": msg_id.mailbox,
-                        "destination_mailbox": input.destination_mailbox,
-                        "message_id": encoded_message_id,
-                        "new_message_id": serde_json::Value::Null,
-                        "steps_attempted": steps_attempted,
-                        "steps_succeeded": steps_succeeded,
-                    }));
                 }
             };
-            ensure_uidvalidity_matches_readwrite(&self.config, &mut session, &msg_id).await?;
-            steps_attempted += 1;
-            if let Err(error) = imap::uid_copy(
-                &self.config,
-                &mut session,
-                msg_id.uid,
-                input.destination_mailbox.as_str(),
-            )
-            .await
+            if let Err(error) =
+                ensure_uidvalidity_matches_readwrite(&self.config, &mut session, msg_id).await
+            {
+                issues.push(
+                    ToolIssue::from_error("select_mailbox_readwrite", &error)
+                        .with_uid(msg_id.uid)
+                        .with_message_id(&encoded_message_id),
+                );
+                return failed_message_result(
+                    msg_id,
+                    encoded_message_id,
+                    issues,
+                    Some(destination_mailbox.to_owned()),
+                    Some(destination_account_id),
+                    None,
+                );
+            }
+            if let Err(error) =
+                imap::uid_copy(&self.config, &mut session, msg_id.uid, destination_mailbox).await
             {
                 issues.push(
                     ToolIssue::from_error("uid_copy", &error)
                         .with_uid(msg_id.uid)
                         .with_message_id(&encoded_message_id),
                 );
-            } else {
-                steps_succeeded += 1;
             }
-        } else {
-            let source = self.config.get_account(&input.account_id)?;
-            steps_attempted += 1;
-            let mut source_session = match imap::connect_authenticated(&self.config, source).await {
-                Ok(session) => {
-                    steps_succeeded += 1;
-                    session
-                }
+            return finalize_message_result(
+                msg_id,
+                encoded_message_id,
+                issues,
+                Some(destination_mailbox.to_owned()),
+                Some(destination_account_id),
+                None,
+                true,
+            );
+        }
+
+        let mut source_session =
+            match imap::connect_authenticated(&self.config, source_account).await {
+                Ok(session) => session,
                 Err(error) => {
                     issues.push(
                         ToolIssue::from_error("connect_authenticated_source", &error)
                             .with_message_id(&encoded_message_id),
                     );
-                    log_runtime_issues(
-                        "imap_copy_message",
-                        "failed",
-                        &input.account_id,
-                        Some(&msg_id.mailbox),
-                        &issues,
+                    return failed_message_result(
+                        msg_id,
+                        encoded_message_id,
+                        issues,
+                        Some(destination_mailbox.to_owned()),
+                        Some(destination_account_id),
+                        None,
                     );
-                    return Ok(serde_json::json!({
-                        "status": "failed",
-                        "issues": issues,
-                        "source_account_id": input.account_id,
-                        "destination_account_id": destination_account_id,
-                        "source_mailbox": msg_id.mailbox,
-                        "destination_mailbox": input.destination_mailbox,
-                        "message_id": encoded_message_id,
-                        "new_message_id": serde_json::Value::Null,
-                        "steps_attempted": steps_attempted,
-                        "steps_succeeded": steps_succeeded,
-                    }));
                 }
             };
-            ensure_uidvalidity_matches_readonly(&self.config, &mut source_session, &msg_id).await?;
-            steps_attempted += 1;
-            let raw = match imap::fetch_raw_message(&self.config, &mut source_session, msg_id.uid)
-                .await
-            {
-                Ok(raw) => {
-                    steps_succeeded += 1;
-                    raw
-                }
-                Err(error) => {
-                    issues.push(
-                        ToolIssue::from_error("fetch_raw_message_source", &error)
-                            .with_uid(msg_id.uid)
-                            .with_message_id(&encoded_message_id),
-                    );
-                    log_runtime_issues(
-                        "imap_copy_message",
-                        "failed",
-                        &input.account_id,
-                        Some(&msg_id.mailbox),
-                        &issues,
-                    );
-                    return Ok(serde_json::json!({
-                        "status": "failed",
-                        "issues": issues,
-                        "source_account_id": input.account_id,
-                        "destination_account_id": destination_account_id,
-                        "source_mailbox": msg_id.mailbox,
-                        "destination_mailbox": input.destination_mailbox,
-                        "message_id": encoded_message_id,
-                        "new_message_id": serde_json::Value::Null,
-                        "steps_attempted": steps_attempted,
-                        "steps_succeeded": steps_succeeded,
-                    }));
-                }
-            };
-
-            let destination = self.config.get_account(&destination_account_id)?;
-            steps_attempted += 1;
-            let mut destination_session =
-                match imap::connect_authenticated(&self.config, destination).await {
-                    Ok(session) => {
-                        steps_succeeded += 1;
-                        session
-                    }
-                    Err(error) => {
-                        issues.push(
-                            ToolIssue::from_error("connect_authenticated_destination", &error)
-                                .with_message_id(&encoded_message_id),
-                        );
-                        let status = status_from_issue_and_counts(&issues, steps_succeeded > 0);
-                        log_runtime_issues(
-                            "imap_copy_message",
-                            status,
-                            &input.account_id,
-                            Some(&msg_id.mailbox),
-                            &issues,
-                        );
-                        return Ok(serde_json::json!({
-                            "status": status,
-                            "issues": issues,
-                            "source_account_id": input.account_id,
-                            "destination_account_id": destination_account_id,
-                            "source_mailbox": msg_id.mailbox,
-                            "destination_mailbox": input.destination_mailbox,
-                            "message_id": encoded_message_id,
-                            "new_message_id": serde_json::Value::Null,
-                            "steps_attempted": steps_attempted,
-                            "steps_succeeded": steps_succeeded,
-                        }));
-                    }
-                };
-            steps_attempted += 1;
-            if let Err(error) = imap::append(
-                &self.config,
-                &mut destination_session,
-                input.destination_mailbox.as_str(),
-                raw.as_slice(),
-            )
-            .await
-            {
+        if let Err(error) =
+            ensure_uidvalidity_matches_readonly(&self.config, &mut source_session, msg_id).await
+        {
+            issues.push(
+                ToolIssue::from_error("select_mailbox_readonly", &error)
+                    .with_uid(msg_id.uid)
+                    .with_message_id(&encoded_message_id),
+            );
+            return failed_message_result(
+                msg_id,
+                encoded_message_id,
+                issues,
+                Some(destination_mailbox.to_owned()),
+                Some(destination_account_id),
+                None,
+            );
+        }
+        let raw = match imap::fetch_raw_message(&self.config, &mut source_session, msg_id.uid).await
+        {
+            Ok(raw) => raw,
+            Err(error) => {
                 issues.push(
-                    ToolIssue::from_error("append_destination", &error)
+                    ToolIssue::from_error("fetch_raw_message_source", &error)
+                        .with_uid(msg_id.uid)
                         .with_message_id(&encoded_message_id),
                 );
-            } else {
-                steps_succeeded += 1;
+                return failed_message_result(
+                    msg_id,
+                    encoded_message_id,
+                    issues,
+                    Some(destination_mailbox.to_owned()),
+                    Some(destination_account_id),
+                    None,
+                );
             }
+        };
+
+        let destination_account = match self.config.get_account(&destination_account_id) {
+            Ok(account) => account,
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("account_lookup_destination", &error)
+                        .with_message_id(&encoded_message_id),
+                );
+                return failed_message_result(
+                    msg_id,
+                    encoded_message_id,
+                    issues,
+                    Some(destination_mailbox.to_owned()),
+                    Some(destination_account_id),
+                    None,
+                );
+            }
+        };
+        let mut destination_session =
+            match imap::connect_authenticated(&self.config, destination_account).await {
+                Ok(session) => session,
+                Err(error) => {
+                    issues.push(
+                        ToolIssue::from_error("connect_authenticated_destination", &error)
+                            .with_message_id(&encoded_message_id),
+                    );
+                    return failed_message_result(
+                        msg_id,
+                        encoded_message_id,
+                        issues,
+                        Some(destination_mailbox.to_owned()),
+                        Some(destination_account_id),
+                        None,
+                    );
+                }
+            };
+        if let Err(error) = imap::append(
+            &self.config,
+            &mut destination_session,
+            destination_mailbox,
+            &raw,
+        )
+        .await
+        {
+            issues.push(
+                ToolIssue::from_error("append_destination", &error)
+                    .with_message_id(&encoded_message_id),
+            );
         }
-
-        let status = status_from_issue_and_counts(&issues, steps_succeeded > 0);
-        log_runtime_issues(
-            "imap_copy_message",
-            status,
-            &input.account_id,
-            Some(&msg_id.mailbox),
-            &issues,
-        );
-
-        Ok(serde_json::json!({
-            "status": status,
-            "issues": issues,
-            "source_account_id": input.account_id,
-            "destination_account_id": destination_account_id,
-            "source_mailbox": msg_id.mailbox,
-            "destination_mailbox": input.destination_mailbox,
-            "message_id": encoded_message_id,
-            "new_message_id": serde_json::Value::Null,
-            "steps_attempted": steps_attempted,
-            "steps_succeeded": steps_succeeded,
-        }))
+        finalize_message_result(
+            msg_id,
+            encoded_message_id,
+            issues,
+            Some(destination_mailbox.to_owned()),
+            Some(destination_account_id),
+            None,
+            true,
+        )
     }
 
-    async fn move_message_impl(&self, input: MoveMessageInput) -> AppResult<serde_json::Value> {
-        require_write_enabled(&self.config)?;
-        validate_account_id(&input.account_id)?;
-        validate_mailbox(&input.destination_mailbox)?;
-
-        let msg_id = parse_and_validate_message_id(&input.account_id, &input.message_id)?;
+    async fn execute_move_message(
+        &self,
+        account_id: &str,
+        msg_id: &MessageId,
+        destination_mailbox: &str,
+    ) -> MessageMutationResult {
         let encoded_message_id = msg_id.encode();
-
-        let account = self.config.get_account(&input.account_id)?;
         let mut issues = Vec::new();
-        let mut steps_attempted = 0usize;
-        let mut steps_succeeded = 0usize;
-
-        steps_attempted += 1;
-        let mut session = match imap::connect_authenticated(&self.config, account).await {
-            Ok(session) => {
-                steps_succeeded += 1;
-                session
+        let account = match self.config.get_account(account_id) {
+            Ok(account) => account,
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("account_lookup", &error)
+                        .with_message_id(&encoded_message_id),
+                );
+                return failed_message_result(
+                    msg_id,
+                    encoded_message_id,
+                    issues,
+                    Some(destination_mailbox.to_owned()),
+                    Some(account_id.to_owned()),
+                    None,
+                );
             }
+        };
+
+        let mut session = match imap::connect_authenticated(&self.config, account).await {
+            Ok(session) => session,
             Err(error) => {
                 issues.push(
                     ToolIssue::from_error("connect_authenticated", &error)
                         .with_message_id(&encoded_message_id),
                 );
-                log_runtime_issues(
-                    "imap_move_message",
-                    "failed",
-                    &input.account_id,
-                    Some(&msg_id.mailbox),
-                    &issues,
+                return failed_message_result(
+                    msg_id,
+                    encoded_message_id,
+                    issues,
+                    Some(destination_mailbox.to_owned()),
+                    Some(account_id.to_owned()),
+                    None,
                 );
-                return Ok(serde_json::json!({
-                    "status": "failed",
-                    "issues": issues,
-                    "account_id": input.account_id,
-                    "source_mailbox": msg_id.mailbox,
-                    "destination_mailbox": input.destination_mailbox,
-                    "message_id": encoded_message_id,
-                    "new_message_id": serde_json::Value::Null,
-                    "steps_attempted": steps_attempted,
-                    "steps_succeeded": steps_succeeded,
-                }));
             }
         };
-        ensure_uidvalidity_matches_readwrite(&self.config, &mut session, &msg_id).await?;
+        if let Err(error) =
+            ensure_uidvalidity_matches_readwrite(&self.config, &mut session, msg_id).await
+        {
+            issues.push(
+                ToolIssue::from_error("select_mailbox_readwrite", &error)
+                    .with_uid(msg_id.uid)
+                    .with_message_id(&encoded_message_id),
+            );
+            return failed_message_result(
+                msg_id,
+                encoded_message_id,
+                issues,
+                Some(destination_mailbox.to_owned()),
+                Some(account_id.to_owned()),
+                None,
+            );
+        }
 
-        steps_attempted += 1;
         let caps = match imap::capabilities(&self.config, &mut session).await {
-            Ok(caps) => {
-                steps_succeeded += 1;
-                caps
-            }
+            Ok(caps) => caps,
             Err(error) => {
                 issues.push(
                     ToolIssue::from_error("capabilities", &error)
                         .with_uid(msg_id.uid)
                         .with_message_id(&encoded_message_id),
                 );
-                let status = status_from_issue_and_counts(&issues, steps_succeeded > 0);
-                log_runtime_issues(
-                    "imap_move_message",
-                    status,
-                    &input.account_id,
-                    Some(&msg_id.mailbox),
-                    &issues,
+                return failed_message_result(
+                    msg_id,
+                    encoded_message_id,
+                    issues,
+                    Some(destination_mailbox.to_owned()),
+                    Some(account_id.to_owned()),
+                    None,
                 );
-                return Ok(serde_json::json!({
-                    "status": status,
-                    "issues": issues,
-                    "account_id": input.account_id,
-                    "source_mailbox": msg_id.mailbox,
-                    "destination_mailbox": input.destination_mailbox,
-                    "message_id": encoded_message_id,
-                    "new_message_id": serde_json::Value::Null,
-                    "steps_attempted": steps_attempted,
-                    "steps_succeeded": steps_succeeded,
-                }));
             }
         };
 
         if caps.has_str("MOVE") {
-            steps_attempted += 1;
-            if let Err(error) = imap::uid_move(
-                &self.config,
-                &mut session,
-                msg_id.uid,
-                input.destination_mailbox.as_str(),
-            )
-            .await
+            if let Err(error) =
+                imap::uid_move(&self.config, &mut session, msg_id.uid, destination_mailbox).await
             {
                 issues.push(
                     ToolIssue::from_error("uid_move", &error)
                         .with_uid(msg_id.uid)
                         .with_message_id(&encoded_message_id),
                 );
-            } else {
-                steps_succeeded += 1;
             }
         } else {
-            steps_attempted += 1;
-            let copied = if let Err(error) = imap::uid_copy(
-                &self.config,
-                &mut session,
-                msg_id.uid,
-                input.destination_mailbox.as_str(),
-            )
-            .await
+            let copied = if let Err(error) =
+                imap::uid_copy(&self.config, &mut session, msg_id.uid, destination_mailbox).await
             {
                 issues.push(
                     ToolIssue::from_error("uid_copy", &error)
@@ -1443,12 +1577,9 @@ impl MailImapServer {
                 );
                 false
             } else {
-                steps_succeeded += 1;
                 true
             };
-
             if copied {
-                steps_attempted += 1;
                 let deleted = if let Err(error) = imap::uid_store(
                     &self.config,
                     &mut session,
@@ -1464,98 +1595,92 @@ impl MailImapServer {
                     );
                     false
                 } else {
-                    steps_succeeded += 1;
                     true
                 };
-
-                if deleted {
-                    steps_attempted += 1;
-                    if let Err(error) =
+                if deleted
+                    && let Err(error) =
                         imap::uid_expunge(&self.config, &mut session, msg_id.uid).await
-                    {
-                        issues.push(
-                            ToolIssue::from_error("uid_expunge", &error)
-                                .with_uid(msg_id.uid)
-                                .with_message_id(&encoded_message_id),
-                        );
-                    } else {
-                        steps_succeeded += 1;
-                    }
+                {
+                    issues.push(
+                        ToolIssue::from_error("uid_expunge", &error)
+                            .with_uid(msg_id.uid)
+                            .with_message_id(&encoded_message_id),
+                    );
                 }
             }
         }
 
-        let status = status_from_issue_and_counts(&issues, steps_succeeded > 0);
-        log_runtime_issues(
-            "imap_move_message",
-            status,
-            &input.account_id,
-            Some(&msg_id.mailbox),
-            &issues,
-        );
-
-        Ok(serde_json::json!({
-            "status": status,
-            "issues": issues,
-            "account_id": input.account_id,
-            "source_mailbox": msg_id.mailbox,
-            "destination_mailbox": input.destination_mailbox,
-            "message_id": encoded_message_id,
-            "new_message_id": serde_json::Value::Null,
-            "steps_attempted": steps_attempted,
-            "steps_succeeded": steps_succeeded,
-        }))
+        finalize_message_result(
+            msg_id,
+            encoded_message_id,
+            issues,
+            Some(destination_mailbox.to_owned()),
+            Some(account_id.to_owned()),
+            None,
+            true,
+        )
     }
 
-    async fn delete_message_impl(&self, input: DeleteMessageInput) -> AppResult<serde_json::Value> {
-        require_write_enabled(&self.config)?;
-        validate_account_id(&input.account_id)?;
-        if !input.confirm {
-            return Err(AppError::InvalidInput(
-                "delete requires confirm=true".to_owned(),
-            ));
-        }
-
-        let msg_id = parse_and_validate_message_id(&input.account_id, &input.message_id)?;
+    async fn execute_delete_message(
+        &self,
+        account_id: &str,
+        msg_id: &MessageId,
+    ) -> MessageMutationResult {
         let encoded_message_id = msg_id.encode();
-
-        let account = self.config.get_account(&input.account_id)?;
         let mut issues = Vec::new();
-        let mut steps_attempted = 0usize;
-        let mut steps_succeeded = 0usize;
-
-        steps_attempted += 1;
-        let mut session = match imap::connect_authenticated(&self.config, account).await {
-            Ok(session) => {
-                steps_succeeded += 1;
-                session
+        let account = match self.config.get_account(account_id) {
+            Ok(account) => account,
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("account_lookup", &error)
+                        .with_message_id(&encoded_message_id),
+                );
+                return failed_message_result(
+                    msg_id,
+                    encoded_message_id,
+                    issues,
+                    None,
+                    Some(account_id.to_owned()),
+                    None,
+                );
             }
+        };
+
+        let mut session = match imap::connect_authenticated(&self.config, account).await {
+            Ok(session) => session,
             Err(error) => {
                 issues.push(
                     ToolIssue::from_error("connect_authenticated", &error)
                         .with_message_id(&encoded_message_id),
                 );
-                log_runtime_issues(
-                    "imap_delete_message",
-                    "failed",
-                    &input.account_id,
-                    Some(&msg_id.mailbox),
-                    &issues,
+                return failed_message_result(
+                    msg_id,
+                    encoded_message_id,
+                    issues,
+                    None,
+                    Some(account_id.to_owned()),
+                    None,
                 );
-                return Ok(serde_json::json!({
-                    "status": "failed",
-                    "issues": issues,
-                    "account_id": input.account_id,
-                    "mailbox": msg_id.mailbox,
-                    "message_id": encoded_message_id,
-                    "steps_attempted": steps_attempted,
-                    "steps_succeeded": steps_succeeded,
-                }));
             }
         };
-        ensure_uidvalidity_matches_readwrite(&self.config, &mut session, &msg_id).await?;
+        if let Err(error) =
+            ensure_uidvalidity_matches_readwrite(&self.config, &mut session, msg_id).await
+        {
+            issues.push(
+                ToolIssue::from_error("select_mailbox_readwrite", &error)
+                    .with_uid(msg_id.uid)
+                    .with_message_id(&encoded_message_id),
+            );
+            return failed_message_result(
+                msg_id,
+                encoded_message_id,
+                issues,
+                None,
+                Some(account_id.to_owned()),
+                None,
+            );
+        }
 
-        steps_attempted += 1;
         let flagged_deleted = if let Err(error) = imap::uid_store(
             &self.config,
             &mut session,
@@ -1571,41 +1696,27 @@ impl MailImapServer {
             );
             false
         } else {
-            steps_succeeded += 1;
             true
         };
-
-        if flagged_deleted {
-            steps_attempted += 1;
-            if let Err(error) = imap::uid_expunge(&self.config, &mut session, msg_id.uid).await {
-                issues.push(
-                    ToolIssue::from_error("uid_expunge", &error)
-                        .with_uid(msg_id.uid)
-                        .with_message_id(&encoded_message_id),
-                );
-            } else {
-                steps_succeeded += 1;
-            }
+        if flagged_deleted
+            && let Err(error) = imap::uid_expunge(&self.config, &mut session, msg_id.uid).await
+        {
+            issues.push(
+                ToolIssue::from_error("uid_expunge", &error)
+                    .with_uid(msg_id.uid)
+                    .with_message_id(&encoded_message_id),
+            );
         }
 
-        let status = status_from_issue_and_counts(&issues, steps_succeeded > 0);
-        log_runtime_issues(
-            "imap_delete_message",
-            status,
-            &input.account_id,
-            Some(&msg_id.mailbox),
-            &issues,
-        );
-
-        Ok(serde_json::json!({
-            "status": status,
-            "issues": issues,
-            "account_id": input.account_id,
-            "mailbox": msg_id.mailbox,
-            "message_id": encoded_message_id,
-            "steps_attempted": steps_attempted,
-            "steps_succeeded": steps_succeeded,
-        }))
+        finalize_message_result(
+            msg_id,
+            encoded_message_id,
+            issues,
+            None,
+            Some(account_id.to_owned()),
+            None,
+            true,
+        )
     }
 }
 
@@ -1686,13 +1797,11 @@ fn next_action(instruction: &str, tool: &str, arguments: serde_json::Value) -> N
     }
 }
 
-fn next_action_retry_verify(account_id: &str) -> NextAction {
+fn next_action_list_accounts() -> NextAction {
     next_action(
-        "Re-verify account connectivity before proceeding.",
-        "imap_verify_account",
-        serde_json::json!({
-            "account_id": account_id,
-        }),
+        "List configured accounts before retrying mailbox access.",
+        "imap_list_accounts",
+        serde_json::json!({}),
     )
 }
 
@@ -1750,7 +1859,7 @@ fn next_action_for_search_result(
     }
 
     if status == "failed" {
-        return next_action_retry_verify(account_id);
+        return next_action_list_mailboxes(account_id);
     }
 
     if let Some(first) = messages.first() {
@@ -2009,6 +2118,173 @@ struct SummaryBuildOptions<'a> {
     snippet_max_chars: usize,
 }
 
+fn serialization_error(error: serde_json::Error) -> AppError {
+    AppError::Internal(format!("serialization failure: {error}"))
+}
+
+fn message_action_name(action: &MessageActionInput) -> &'static str {
+    match action {
+        MessageActionInput::Move { .. } => "move",
+        MessageActionInput::Copy { .. } => "copy",
+        MessageActionInput::Delete => "delete",
+        MessageActionInput::UpdateFlags { .. } => "update_flags",
+    }
+}
+
+fn search_selector_to_search_input(
+    account_id: &str,
+    search: &SearchSelectorInput,
+) -> SearchMessagesInput {
+    SearchMessagesInput {
+        account_id: account_id.to_owned(),
+        mailbox: search.mailbox.clone(),
+        cursor: search.cursor.clone(),
+        query: search.query.clone(),
+        from: search.from.clone(),
+        to: search.to.clone(),
+        subject: search.subject.clone(),
+        unread_only: search.unread_only,
+        last_days: search.last_days,
+        start_date: search.start_date.clone(),
+        end_date: search.end_date.clone(),
+        limit: MAX_SEARCH_LIMIT,
+        include_snippet: false,
+        snippet_max_chars: None,
+    }
+}
+
+fn validate_message_action(action: &MessageActionInput, account_id: &str) -> AppResult<()> {
+    match action {
+        MessageActionInput::Move {
+            destination_mailbox,
+        } => validate_mailbox(destination_mailbox),
+        MessageActionInput::Copy {
+            destination_mailbox,
+            destination_account_id,
+        } => {
+            validate_mailbox(destination_mailbox)?;
+            if let Some(destination_account_id) = destination_account_id {
+                validate_account_id(destination_account_id)?;
+            } else {
+                validate_account_id(account_id)?;
+            }
+            Ok(())
+        }
+        MessageActionInput::Delete => Ok(()),
+        MessageActionInput::UpdateFlags {
+            add_flags,
+            remove_flags,
+        } => {
+            let add_flags = add_flags.clone().unwrap_or_default();
+            let remove_flags = remove_flags.clone().unwrap_or_default();
+            if add_flags.is_empty() && remove_flags.is_empty() {
+                return Err(AppError::InvalidInput(
+                    "update_flags requires at least one of add_flags/remove_flags".to_owned(),
+                ));
+            }
+            validate_flags(&add_flags, "add_flags")?;
+            validate_flags(&remove_flags, "remove_flags")
+        }
+    }
+}
+
+fn dedupe_and_parse_message_ids(
+    account_id: &str,
+    message_ids: &[String],
+) -> AppResult<Vec<MessageId>> {
+    let mut seen = HashSet::new();
+    let mut resolved = Vec::new();
+    for message_id in message_ids {
+        let parsed = parse_and_validate_message_id(account_id, message_id)?;
+        let encoded = parsed.encode();
+        if seen.insert(encoded) {
+            resolved.push(parsed);
+        }
+    }
+    Ok(resolved)
+}
+
+fn build_planned_message_result(
+    msg_id: &MessageId,
+    action: &MessageActionInput,
+) -> MessageMutationResult {
+    let (destination_mailbox, destination_account_id, flags) = match action {
+        MessageActionInput::Move {
+            destination_mailbox,
+        } => (
+            Some(destination_mailbox.clone()),
+            Some(msg_id.account_id.clone()),
+            None,
+        ),
+        MessageActionInput::Copy {
+            destination_mailbox,
+            destination_account_id,
+        } => (
+            Some(destination_mailbox.clone()),
+            Some(
+                destination_account_id
+                    .clone()
+                    .unwrap_or_else(|| msg_id.account_id.clone()),
+            ),
+            None,
+        ),
+        MessageActionInput::Delete => (None, Some(msg_id.account_id.clone()), None),
+        MessageActionInput::UpdateFlags { .. } => (None, Some(msg_id.account_id.clone()), None),
+    };
+    MessageMutationResult {
+        message_id: msg_id.encode(),
+        status: "planned".to_owned(),
+        issues: Vec::new(),
+        source_mailbox: msg_id.mailbox.clone(),
+        destination_mailbox,
+        destination_account_id,
+        flags,
+        new_message_id: None,
+    }
+}
+
+fn failed_message_result(
+    msg_id: &MessageId,
+    encoded_message_id: String,
+    issues: Vec<ToolIssue>,
+    destination_mailbox: Option<String>,
+    destination_account_id: Option<String>,
+    flags: Option<Vec<String>>,
+) -> MessageMutationResult {
+    MessageMutationResult {
+        message_id: encoded_message_id,
+        status: "failed".to_owned(),
+        issues,
+        source_mailbox: msg_id.mailbox.clone(),
+        destination_mailbox,
+        destination_account_id,
+        flags,
+        new_message_id: None,
+    }
+}
+
+fn finalize_message_result(
+    msg_id: &MessageId,
+    encoded_message_id: String,
+    issues: Vec<ToolIssue>,
+    destination_mailbox: Option<String>,
+    destination_account_id: Option<String>,
+    flags: Option<Vec<String>>,
+    success_on_no_issues: bool,
+) -> MessageMutationResult {
+    let status = status_from_issue_and_counts(&issues, success_on_no_issues || flags.is_some());
+    MessageMutationResult {
+        message_id: encoded_message_id,
+        status: status.to_owned(),
+        issues,
+        source_mailbox: msg_id.mailbox.clone(),
+        destination_mailbox,
+        destination_account_id,
+        flags,
+        new_message_id: None,
+    }
+}
+
 /// Validate account_id format
 fn validate_account_id(account_id: &str) -> AppResult<()> {
     if account_id.is_empty() || account_id.len() > 64 {
@@ -2265,10 +2541,11 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::{
-        encode_raw_source_base64, escape_imap_quoted, resume_cursor_search, validate_flag,
-        validate_mailbox, validate_search_input, validate_search_text,
+        dedupe_and_parse_message_ids, encode_raw_source_base64, escape_imap_quoted,
+        resume_cursor_search, validate_flag, validate_mailbox, validate_message_action,
+        validate_search_input, validate_search_text,
     };
-    use crate::models::SearchMessagesInput;
+    use crate::models::{MessageActionInput, SearchMessagesInput};
     use crate::pagination::{CursorEntry, CursorStore};
 
     /// Tests that control characters in search text are rejected.
@@ -2305,6 +2582,37 @@ mod tests {
     fn validate_flag_rejects_injection_like_value() {
         let err = validate_flag("\\Seen) UID FETCH 1:* (BODY[]").expect_err("must fail");
         assert!(err.to_string().contains("invalid flag"));
+    }
+
+    #[test]
+    fn validate_message_action_rejects_empty_flag_update() {
+        let err = validate_message_action(
+            &MessageActionInput::UpdateFlags {
+                add_flags: None,
+                remove_flags: None,
+            },
+            "default",
+        )
+        .expect_err("must reject empty flag update");
+        assert!(
+            err.to_string()
+                .contains("at least one of add_flags/remove_flags")
+        );
+    }
+
+    #[test]
+    fn dedupe_and_parse_message_ids_removes_duplicates() {
+        let message_ids = vec![
+            "imap:default:INBOX:42:7".to_owned(),
+            "imap:default:INBOX:42:7".to_owned(),
+            "imap:default:INBOX:42:8".to_owned(),
+        ];
+
+        let parsed = dedupe_and_parse_message_ids("default", &message_ids)
+            .expect("message ids should parse");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].uid, 7);
+        assert_eq!(parsed[1].uid, 8);
     }
 
     /// Tests that raw message sources are correctly base64 encoded.

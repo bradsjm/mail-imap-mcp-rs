@@ -173,8 +173,7 @@ pub struct MessageDetail {
 
 /// Input: account_id only
 ///
-/// Used by `imap_list_accounts`, `imap_verify_account`, and
-/// `imap_list_mailboxes`.
+/// Used by `imap_list_accounts` and `imap_list_mailboxes`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct AccountOnlyInput {
     /// Account identifier (defaults to `"default"`)
@@ -283,72 +282,142 @@ pub struct GetMessageRawInput {
     pub max_bytes: usize,
 }
 
-/// Input: update message flags
+/// Input: apply a bulk action to selected messages.
 ///
-/// Used by `imap_update_message_flags`. Requires at least one flag operation.
+/// Used by `imap_apply_to_messages`. Message selection may be explicit by
+/// `message_ids` or derived from mailbox search criteria.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct UpdateMessageFlagsInput {
+pub struct ApplyToMessagesInput {
     /// Account identifier (defaults to `"default"`)
     #[serde(default = "default_account_id")]
     #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
     pub account_id: String,
-    /// Stable message identifier
-    pub message_id: String,
-    /// Flags to add (e.g., `\Seen`, `\Flagged`, `Important`)
-    pub add_flags: Option<Vec<String>>,
-    /// Flags to remove
-    pub remove_flags: Option<Vec<String>>,
+    /// Message selector (either explicit ids or a mailbox search)
+    pub selector: MessageSelectorInput,
+    /// Action to apply to the selected messages
+    #[serde(flatten)]
+    pub action: MessageActionInput,
+    /// Maximum allowed matched messages
+    #[serde(default = "default_max_messages")]
+    #[schemars(range(min = 1, max = 1_000), transform = remove_format)]
+    pub max_messages: usize,
+    /// When true, validate and preview without mutating messages
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
-/// Input: copy message to mailbox
-///
-/// Used by `imap_copy_message`. Supports same-account or cross-account
-/// copies.
+/// Selects target messages by explicit ids or by mailbox search criteria.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct CopyMessageInput {
-    /// Account identifier (defaults to `"default"`)
-    #[serde(default = "default_account_id")]
-    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
-    pub account_id: String,
-    /// Stable message identifier
-    pub message_id: String,
-    /// Destination mailbox name
+pub struct MessageSelectorInput {
+    /// Stable message identifiers to target
+    #[schemars(length(min = 1, max = 1_000))]
+    pub message_ids: Option<Vec<String>>,
+    /// Mailbox search criteria
+    pub search: Option<SearchSelectorInput>,
+}
+
+/// Search criteria used by `imap_apply_to_messages`.
+///
+/// Mirrors `imap_search_messages` without pagination limit or snippet options.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SearchSelectorInput {
+    /// Mailbox to search (e.g., `INBOX`, `Sent`, `Archive`)
     #[schemars(length(min = 1, max = 256))]
-    pub destination_mailbox: String,
-    /// Destination account (if omitted, copies within same account)
-    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
-    pub destination_account_id: Option<String>,
-}
-
-/// Input: move message to mailbox
-///
-/// Used by `imap_move_message`. Only supports same-account moves.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct MoveMessageInput {
-    /// Account identifier (defaults to `"default"`)
-    #[serde(default = "default_account_id")]
-    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
-    pub account_id: String,
-    /// Stable message identifier
-    pub message_id: String,
-    /// Destination mailbox name
+    pub mailbox: String,
+    /// Pagination cursor from previous search result
+    pub cursor: Option<String>,
+    /// Full-text search query
     #[schemars(length(min = 1, max = 256))]
-    pub destination_mailbox: String,
+    pub query: Option<String>,
+    /// Filter by From header
+    #[schemars(length(min = 1, max = 256))]
+    pub from: Option<String>,
+    /// Filter by To header
+    #[schemars(length(min = 1, max = 256))]
+    pub to: Option<String>,
+    /// Filter by Subject header
+    #[schemars(length(min = 1, max = 256))]
+    pub subject: Option<String>,
+    /// Filter to unread messages only
+    pub unread_only: Option<bool>,
+    /// Filter to messages from last N days
+    #[schemars(range(min = 1, max = 365), transform = remove_format)]
+    pub last_days: Option<u16>,
+    /// Filter to messages on or after this date (YYYY-MM-DD)
+    #[schemars(pattern(r"^\d{4}-\d{2}-\d{2}$"))]
+    pub start_date: Option<String>,
+    /// Filter to messages before this date (YYYY-MM-DD)
+    #[schemars(pattern(r"^\d{4}-\d{2}-\d{2}$"))]
+    pub end_date: Option<String>,
 }
 
-/// Input: delete message
-///
-/// Used by `imap_delete_message`. Requires explicit `confirm=true`.
+/// Action union for `imap_apply_to_messages`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct DeleteMessageInput {
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum MessageActionInput {
+    /// Move messages within the same account
+    Move {
+        /// Destination mailbox
+        #[schemars(length(min = 1, max = 256))]
+        destination_mailbox: String,
+    },
+    /// Copy messages to another mailbox
+    Copy {
+        /// Destination mailbox
+        #[schemars(length(min = 1, max = 256))]
+        destination_mailbox: String,
+        /// Destination account (if omitted, copies within same account)
+        #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
+        destination_account_id: Option<String>,
+    },
+    /// Delete messages from their source mailbox
+    Delete,
+    /// Add and/or remove flags on messages
+    UpdateFlags {
+        /// Flags to add (e.g., `\Seen`, `\Flagged`, `Important`)
+        add_flags: Option<Vec<String>>,
+        /// Flags to remove
+        remove_flags: Option<Vec<String>>,
+    },
+}
+
+/// Input: create, rename, or delete a mailbox.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ManageMailboxInput {
     /// Account identifier (defaults to `"default"`)
     #[serde(default = "default_account_id")]
     #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
     pub account_id: String,
-    /// Stable message identifier
-    pub message_id: String,
-    /// Explicit confirmation required (must be `true`)
-    pub confirm: bool,
+    /// Mailbox management action
+    #[serde(flatten)]
+    pub action: MailboxAction,
+}
+
+/// Mailbox management action kind.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum MailboxAction {
+    /// Create a mailbox
+    Create {
+        /// Source or target mailbox name, depending on action
+        #[schemars(length(min = 1, max = 256))]
+        mailbox: String,
+    },
+    /// Rename or move a mailbox
+    Rename {
+        /// Existing mailbox name
+        #[schemars(length(min = 1, max = 256))]
+        mailbox: String,
+        /// Destination mailbox name
+        #[schemars(length(min = 1, max = 256))]
+        destination_mailbox: String,
+    },
+    /// Delete a mailbox
+    Delete {
+        /// Mailbox name
+        #[schemars(length(min = 1, max = 256))]
+        mailbox: String,
+    },
 }
 
 /// Default value for `account_id` field
@@ -385,14 +454,19 @@ fn default_raw_max_bytes() -> usize {
     200_000
 }
 
+/// Default value for maximum messages allowed in bulk selection.
+fn default_max_messages() -> usize {
+    100
+}
+
 #[cfg(test)]
 mod tests {
     use rmcp::handler::server::common::schema_for_type;
     use serde_json::{Map, Value};
 
     use super::{
-        AccountOnlyInput, CopyMessageInput, DeleteMessageInput, GetMessageInput,
-        GetMessageRawInput, MoveMessageInput, SearchMessagesInput, UpdateMessageFlagsInput,
+        AccountOnlyInput, ApplyToMessagesInput, GetMessageInput, GetMessageRawInput,
+        ManageMailboxInput, SearchMessagesInput,
     };
 
     #[test]
@@ -402,10 +476,8 @@ mod tests {
             schema_for_type::<SearchMessagesInput>(),
             schema_for_type::<GetMessageInput>(),
             schema_for_type::<GetMessageRawInput>(),
-            schema_for_type::<UpdateMessageFlagsInput>(),
-            schema_for_type::<CopyMessageInput>(),
-            schema_for_type::<MoveMessageInput>(),
-            schema_for_type::<DeleteMessageInput>(),
+            schema_for_type::<ApplyToMessagesInput>(),
+            schema_for_type::<ManageMailboxInput>(),
         ] {
             assert_no_nonstandard_integer_formats(&Value::Object((*schema).clone()));
         }
@@ -490,6 +562,19 @@ mod tests {
         assert_eq!(
             schema_numeric_property(raw_props, "max_bytes", "maximum"),
             Some(1_000_000)
+        );
+
+        let apply_schema = schema_for_type::<ApplyToMessagesInput>();
+        let apply_props = apply_schema["properties"]
+            .as_object()
+            .expect("apply_to_messages schema must expose properties");
+        assert_eq!(
+            schema_numeric_property(apply_props, "max_messages", "minimum"),
+            Some(1)
+        );
+        assert_eq!(
+            schema_numeric_property(apply_props, "max_messages", "maximum"),
+            Some(1_000)
         );
     }
 

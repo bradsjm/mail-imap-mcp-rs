@@ -11,7 +11,7 @@ A secure, efficient Model Context Protocol (MCP) server for IMAP email access ov
 - **Multi-account support**: Configure multiple IMAP accounts via environment variables
 - **PDF text extraction**: Optional text extraction from PDF attachments
 - **Rust-powered**: Fast, memory-safe async/await implementation with tokio
-- **Write operations**: Copy, move, flag, and delete tools require explicit enable
+- **Write operations**: Message mutations and mailbox management require explicit enable
 
 ## Installation
 
@@ -110,7 +110,7 @@ MAIL_IMAP_DEFAULT_SECURE=true
 
 ### Enabling Write Operations
 
-**By default, write operations (copy, move, delete, flag) are disabled**. Enable explicitly:
+**By default, write operations (message mutations and mailbox management) are disabled**. Enable explicitly:
 
 ```bash
 MAIL_IMAP_WRITE_ENABLED=true
@@ -165,7 +165,6 @@ All tools return a consistent envelope:
 | Tool | Purpose |
 |------|---------|
 | `imap_list_accounts` | List configured accounts without exposing credentials |
-| `imap_verify_account` | Test connectivity, authentication, and capabilities |
 | `imap_list_mailboxes` | List all visible mailboxes/folders |
 | `imap_search_messages` | Search with cursor-based pagination |
 | `imap_get_message` | Get parsed message details |
@@ -175,10 +174,8 @@ All tools return a consistent envelope:
 
 | Tool | Purpose |
 |------|---------|
-| `imap_update_message_flags` | Add/remove flags (`\Seen`, `\Flagged`, etc.) |
-| `imap_copy_message` | Copy to mailbox (same or different account) |
-| `imap_move_message` | Move to mailbox in same account |
-| `imap_delete_message` | Delete message (requires explicit confirmation) |
+| `imap_apply_to_messages` | Apply one action (`move`, `copy`, `delete`, `update_flags`) to selected messages |
+| `imap_manage_mailbox` | Create, rename, or delete a mailbox |
 
 Write operations require `MAIL_IMAP_WRITE_ENABLED=true`.
 
@@ -210,7 +207,7 @@ Error: authentication failed: [AUTHENTICATIONFAILED] Authentication failed.
 Error: invalid input: write tools are disabled; set MAIL_IMAP_WRITE_ENABLED=true
 ```
 
-Set `MAIL_IMAP_WRITE_ENABLED=true` to enable copy, move, flag, and delete operations.
+Set `MAIL_IMAP_WRITE_ENABLED=true` to enable message mutation and mailbox management operations.
 
 ### Cursor Invalid/Expired
 
@@ -245,7 +242,7 @@ Key security features:
 - **Password secrecy**: Passwords never logged or returned
 - **Bounded outputs**: Body text, HTML, attachments truncated to limits
 - **Write gating**: Destructive operations require explicit opt-in
-- **Delete confirmation**: Requires explicit `confirm: true`
+- **Dry-run support**: Bulk message mutations can validate selection without changing IMAP state
 - **HTML sanitization**: HTML sanitized using `ammonia`
 
 ## Documentation

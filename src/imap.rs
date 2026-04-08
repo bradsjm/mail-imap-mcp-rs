@@ -124,16 +124,6 @@ pub async fn connect_authenticated(
     Ok(session)
 }
 
-/// Send NOOP to test connection liveness
-///
-/// Typically used after connection to verify the server is responsive.
-pub async fn noop(server: &ServerConfig, session: &mut ImapSession) -> AppResult<()> {
-    timeout(socket_timeout(server), session.noop())
-        .await
-        .map_err(|_| AppError::Timeout("NOOP timed out".to_owned()))
-        .and_then(|r| r.map_err(|e| AppError::Internal(format!("NOOP failed: {e}"))))
-}
-
 /// Query server capabilities
 ///
 /// Returns the IMAP capabilities supported by the server. Used to detect
@@ -165,6 +155,113 @@ pub async fn list_all_mailboxes(
         .await
         .map_err(|_| AppError::Timeout("LIST stream timed out".to_owned()))
         .and_then(|r| r.map_err(|e| AppError::Internal(format!("LIST stream failed: {e}"))))
+}
+
+/// Create a mailbox if it does not already exist.
+pub async fn create_mailbox_if_missing(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    mailbox: &str,
+) -> AppResult<()> {
+    let encoded_mailbox = encode_mailbox_name_for_command(mailbox);
+    let result = timeout(socket_timeout(server), session.create(&encoded_mailbox))
+        .await
+        .map_err(|_| AppError::Timeout(format!("CREATE timed out for mailbox '{mailbox}'")))?;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let lowered = error.to_string().to_ascii_lowercase();
+            if lowered.contains("exists") || lowered.contains("already") {
+                Ok(())
+            } else {
+                Err(AppError::Internal(format!(
+                    "CREATE failed for mailbox '{mailbox}': {error}"
+                )))
+            }
+        }
+    }
+}
+
+/// Rename or move a mailbox.
+pub async fn rename_mailbox(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    from_mailbox: &str,
+    to_mailbox: &str,
+) -> AppResult<()> {
+    let from_encoded = encode_mailbox_name_for_command(from_mailbox);
+    let to_encoded = encode_mailbox_name_for_command(to_mailbox);
+    timeout(
+        socket_timeout(server),
+        session.rename(&from_encoded, &to_encoded),
+    )
+    .await
+    .map_err(|_| AppError::Timeout(format!("RENAME timed out for mailbox '{from_mailbox}'")))
+    .and_then(|r| {
+        r.map_err(|e| {
+            AppError::Internal(format!(
+                "RENAME failed for mailbox '{from_mailbox}' to '{to_mailbox}': {e}"
+            ))
+        })
+    })
+}
+
+/// Delete a mailbox.
+pub async fn delete_mailbox(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    mailbox: &str,
+) -> AppResult<()> {
+    let encoded_mailbox = encode_mailbox_name_for_command(mailbox);
+    timeout(socket_timeout(server), session.delete(&encoded_mailbox))
+        .await
+        .map_err(|_| AppError::Timeout(format!("DELETE timed out for mailbox '{mailbox}'")))
+        .and_then(|r| {
+            r.map_err(|e| AppError::Internal(format!("DELETE failed for mailbox '{mailbox}': {e}")))
+        })
+}
+
+/// Create missing parent mailboxes for a hierarchical mailbox path.
+pub async fn create_parent_mailboxes(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    mailbox: &str,
+) -> AppResult<()> {
+    for parent in mailbox_parent_paths(mailbox) {
+        create_mailbox_if_missing(server, session, &parent).await?;
+    }
+    Ok(())
+}
+
+/// Create a mailbox path, creating any missing parent mailboxes first.
+pub async fn create_mailbox_path(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    mailbox: &str,
+) -> AppResult<()> {
+    create_parent_mailboxes(server, session, mailbox).await?;
+    create_mailbox_if_missing(server, session, mailbox).await
+}
+
+fn mailbox_parent_paths(mailbox: &str) -> Vec<String> {
+    let delimiter = if mailbox.contains('/') {
+        Some('/')
+    } else if mailbox.contains('.') {
+        Some('.')
+    } else {
+        None
+    };
+
+    let Some(delimiter) = delimiter else {
+        return Vec::new();
+    };
+
+    let parts: Vec<&str> = mailbox.split(delimiter).collect();
+    let mut parents = Vec::new();
+    for idx in 1..parts.len() {
+        parents.push(parts[..idx].join(&delimiter.to_string()));
+    }
+    parents
 }
 
 /// Select mailbox in read-only mode
@@ -465,9 +562,9 @@ mod tests {
     use crate::mailbox_codec::encode_mailbox_name_for_command;
 
     use super::{
-        append, fetch_flags, fetch_raw_message, list_all_mailboxes, noop, select_mailbox_readonly,
-        select_mailbox_readwrite, socket_timeout, uid_copy, uid_expunge, uid_move, uid_search,
-        uid_store,
+        append, fetch_flags, fetch_raw_message, list_all_mailboxes, mailbox_parent_paths,
+        select_mailbox_readonly, select_mailbox_readwrite, socket_timeout, uid_copy, uid_expunge,
+        uid_move, uid_search, uid_store,
     };
     use crate::config::{AccountConfig, ServerConfig};
 
@@ -498,6 +595,22 @@ mod tests {
             user: std::env::var("GREENMAIL_USER").unwrap_or_else(|_| "test@localhost".to_owned()),
             pass: std::env::var("GREENMAIL_PASS").unwrap_or_else(|_| "test".to_owned()),
         }
+    }
+
+    #[test]
+    fn mailbox_parent_paths_builds_hierarchy_for_slash_paths() {
+        assert_eq!(
+            mailbox_parent_paths("Archive/Projects/2026"),
+            vec!["Archive".to_owned(), "Archive/Projects".to_owned()]
+        );
+    }
+
+    #[test]
+    fn mailbox_parent_paths_uses_dot_when_no_slash_exists() {
+        assert_eq!(
+            mailbox_parent_paths("Archive.Projects.2026"),
+            vec!["Archive".to_owned(), "Archive.Projects".to_owned()]
+        );
     }
 
     /// Constructs a ServerConfig for GreenMail integration tests.
@@ -720,10 +833,6 @@ mod tests {
         let mut session = connect_authenticated_greenmail(&config)
             .await
             .expect("imap login should work");
-
-        noop(&config, &mut session)
-            .await
-            .expect("NOOP should succeed");
 
         let mailboxes = list_all_mailboxes(&config, &mut session)
             .await

@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0]
+
+### Added
+
+- Added `imap_apply_to_messages` to apply `move`, `copy`, `delete`, or `update_flags` to explicit message ids or search-selected messages.
+- Added `imap_manage_mailbox` to create, rename, and delete mailboxes, including automatic parent mailbox creation for create and rename operations.
+
+### Changed
+
+- Reduced the MCP surface to 7 tools by consolidating single-message write operations into `imap_apply_to_messages` and replacing mailbox lifecycle gaps with `imap_manage_mailbox`.
+- Removed `imap_verify_account` from the public surface and dropped redundant `confirm` parameters from destructive operations.
+
 ## [0.2.2]
 
 ### Added

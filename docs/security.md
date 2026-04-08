@@ -60,22 +60,8 @@ MAIL_IMAP_WRITE_ENABLED=true
 ### Affected Tools
 
 When `MAIL_IMAP_WRITE_ENABLED=false`, these tools return errors:
-- `imap_update_message_flags` - Add/remove flags
-- `imap_copy_message` - Copy messages
-- `imap_move_message` - Move messages
-- `imap_delete_message` - Delete messages
-
-### Delete Confirmation
-
-`imap_delete_message` requires explicit confirmation regardless of write gating:
-
-```json
-{
-  "account_id": "default",
-  "message_id": "imap:default:INBOX:12345:42",
-  "confirm": true  // Required literal true
-}
-```
+- `imap_apply_to_messages` - Bulk message mutation
+- `imap_manage_mailbox` - Mailbox lifecycle operations
 
 ## Output Bounding
 
