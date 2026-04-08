@@ -24,8 +24,8 @@ use crate::message_id::MessageId;
 use crate::mime;
 use crate::models::{
     AccountInfo, AccountOnlyInput, ApplyToMessagesInput, GetMessageInput, GetMessageRawInput,
-    MailboxAction, MailboxInfo, ManageMailboxInput, MessageActionInput, MessageDetail,
-    MessageSummary, Meta, SearchMessagesInput, SearchSelectorInput, ToolEnvelope,
+    MailboxInfo, ManageMailboxInput, MessageDetail, MessageSummary, Meta, SearchMessagesInput,
+    SearchSelectorInput, ToolEnvelope,
 };
 use crate::pagination::{CursorEntry, CursorStore};
 
@@ -345,6 +345,36 @@ struct MailboxManagementResult {
     action: String,
     mailbox: String,
     destination_mailbox: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum MessageActionInput {
+    Move {
+        destination_mailbox: String,
+    },
+    Copy {
+        destination_mailbox: String,
+        destination_account_id: Option<String>,
+    },
+    Delete,
+    UpdateFlags {
+        add_flags: Option<Vec<String>>,
+        remove_flags: Option<Vec<String>>,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum MailboxAction {
+    Create {
+        mailbox: String,
+    },
+    Rename {
+        mailbox: String,
+        destination_mailbox: String,
+    },
+    Delete {
+        mailbox: String,
+    },
 }
 
 /// Tool implementation methods
@@ -897,19 +927,20 @@ impl MailImapServer {
         require_write_enabled(&self.config)?;
         validate_account_id(&input.account_id)?;
         validate_chars(input.max_messages, 1, 1_000, "max_messages")?;
-        validate_message_action(&input.action, &input.account_id)?;
+        let action = build_message_action(&input)?;
+        validate_message_action(&action, &input.account_id)?;
 
         let message_ids = self
             .resolve_message_selection(&input.account_id, &input.selector, input.max_messages)
             .await?;
-        let action_name = message_action_name(&input.action);
+        let action_name = message_action_name(&action);
 
         let mut results = Vec::with_capacity(message_ids.len());
         let mut issues = Vec::new();
 
         if input.dry_run {
             for msg_id in message_ids {
-                results.push(build_planned_message_result(&msg_id, &input.action));
+                results.push(build_planned_message_result(&msg_id, &action));
             }
 
             return Ok(serde_json::json!({
@@ -930,7 +961,7 @@ impl MailImapServer {
         let mut succeeded = 0usize;
         for msg_id in message_ids {
             let result = self
-                .execute_message_action(&input.account_id, &input.action, &msg_id)
+                .execute_message_action(&input.account_id, &action, &msg_id)
                 .await;
             if result.status == "ok" {
                 succeeded += 1;
@@ -965,8 +996,9 @@ impl MailImapServer {
     async fn manage_mailbox_impl(&self, input: ManageMailboxInput) -> AppResult<serde_json::Value> {
         require_write_enabled(&self.config)?;
         validate_account_id(&input.account_id)?;
+        let action = build_mailbox_action(&input)?;
 
-        let (action_name, mailbox, destination_mailbox) = match &input.action {
+        let (action_name, mailbox, destination_mailbox) = match &action {
             MailboxAction::Create { mailbox } => {
                 validate_mailbox(mailbox)?;
                 ("create", mailbox.clone(), None)
@@ -1008,7 +1040,7 @@ impl MailImapServer {
             }
         };
 
-        let operation = match &input.action {
+        let operation = match &action {
             MailboxAction::Create { mailbox } => {
                 imap::create_mailbox_path(&self.config, &mut session, mailbox).await
             }
@@ -1037,7 +1069,7 @@ impl MailImapServer {
         };
 
         if let Err(error) = operation {
-            let stage = match &input.action {
+            let stage = match &action {
                 MailboxAction::Create { .. } => "create_mailbox",
                 MailboxAction::Rename { .. } => "rename_mailbox",
                 MailboxAction::Delete { .. } => "delete_mailbox",
@@ -1071,24 +1103,22 @@ impl MailImapServer {
         selector: &crate::models::MessageSelectorInput,
         max_messages: usize,
     ) -> AppResult<Vec<MessageId>> {
-        match (&selector.message_ids, &selector.search) {
-            (Some(message_ids), None) => {
-                if message_ids.is_empty() {
-                    return Err(AppError::InvalidInput(
-                        "selector.message_ids must not be empty".to_owned(),
-                    ));
-                }
-                if message_ids.len() > max_messages {
+        let has_message_ids = !selector.message_ids.is_empty();
+        let has_search = !search_selector_is_empty(&selector.search);
+
+        match (has_message_ids, has_search) {
+            (true, false) => {
+                if selector.message_ids.len() > max_messages {
                     return Err(AppError::InvalidInput(format!(
                         "selector matched {} messages; narrow selection to at most {}",
-                        message_ids.len(),
+                        selector.message_ids.len(),
                         max_messages
                     )));
                 }
-                dedupe_and_parse_message_ids(account_id, message_ids)
+                dedupe_and_parse_message_ids(account_id, &selector.message_ids)
             }
-            (None, Some(search)) => {
-                self.resolve_search_selection(account_id, search, max_messages)
+            (false, true) => {
+                self.resolve_search_selection(account_id, &selector.search, max_messages)
                     .await
             }
             _ => Err(AppError::InvalidInput(
@@ -1103,7 +1133,7 @@ impl MailImapServer {
         search: &SearchSelectorInput,
         max_messages: usize,
     ) -> AppResult<Vec<MessageId>> {
-        let search_input = search_selector_to_search_input(account_id, search);
+        let search_input = search_selector_to_search_input(account_id, search)?;
         validate_search_input(&search_input)?;
 
         let account = self.config.get_account(account_id)?;
@@ -2127,13 +2157,143 @@ fn message_action_name(action: &MessageActionInput) -> &'static str {
     }
 }
 
+fn build_message_action(input: &ApplyToMessagesInput) -> AppResult<MessageActionInput> {
+    match input.action.as_str() {
+        "move" => {
+            let destination_mailbox = required_mailbox_field(
+                input.destination_mailbox.as_ref(),
+                "destination_mailbox",
+                "move",
+            )?;
+            reject_field_for_action(
+                input.destination_account_id.as_ref(),
+                "destination_account_id",
+                "move",
+            )?;
+            reject_field_for_action(input.add_flags.as_ref(), "add_flags", "move")?;
+            reject_field_for_action(input.remove_flags.as_ref(), "remove_flags", "move")?;
+            Ok(MessageActionInput::Move {
+                destination_mailbox,
+            })
+        }
+        "copy" => {
+            let destination_mailbox = required_mailbox_field(
+                input.destination_mailbox.as_ref(),
+                "destination_mailbox",
+                "copy",
+            )?;
+            reject_field_for_action(input.add_flags.as_ref(), "add_flags", "copy")?;
+            reject_field_for_action(input.remove_flags.as_ref(), "remove_flags", "copy")?;
+            Ok(MessageActionInput::Copy {
+                destination_mailbox,
+                destination_account_id: input.destination_account_id.clone(),
+            })
+        }
+        "delete" => {
+            reject_field_for_action(
+                input.destination_mailbox.as_ref(),
+                "destination_mailbox",
+                "delete",
+            )?;
+            reject_field_for_action(
+                input.destination_account_id.as_ref(),
+                "destination_account_id",
+                "delete",
+            )?;
+            reject_field_for_action(input.add_flags.as_ref(), "add_flags", "delete")?;
+            reject_field_for_action(input.remove_flags.as_ref(), "remove_flags", "delete")?;
+            Ok(MessageActionInput::Delete)
+        }
+        "update_flags" => {
+            reject_field_for_action(
+                input.destination_mailbox.as_ref(),
+                "destination_mailbox",
+                "update_flags",
+            )?;
+            reject_field_for_action(
+                input.destination_account_id.as_ref(),
+                "destination_account_id",
+                "update_flags",
+            )?;
+            Ok(MessageActionInput::UpdateFlags {
+                add_flags: input.add_flags.clone(),
+                remove_flags: input.remove_flags.clone(),
+            })
+        }
+        _ => Err(AppError::InvalidInput(format!(
+            "action must be one of move, copy, delete, update_flags; got '{}'",
+            input.action
+        ))),
+    }
+}
+
+fn build_mailbox_action(input: &ManageMailboxInput) -> AppResult<MailboxAction> {
+    match input.action.as_str() {
+        "create" => {
+            reject_field_for_action(
+                input.destination_mailbox.as_ref(),
+                "destination_mailbox",
+                "create",
+            )?;
+            Ok(MailboxAction::Create {
+                mailbox: input.mailbox.clone(),
+            })
+        }
+        "rename" => Ok(MailboxAction::Rename {
+            mailbox: input.mailbox.clone(),
+            destination_mailbox: required_mailbox_field(
+                input.destination_mailbox.as_ref(),
+                "destination_mailbox",
+                "rename",
+            )?,
+        }),
+        "delete" => {
+            reject_field_for_action(
+                input.destination_mailbox.as_ref(),
+                "destination_mailbox",
+                "delete",
+            )?;
+            Ok(MailboxAction::Delete {
+                mailbox: input.mailbox.clone(),
+            })
+        }
+        _ => Err(AppError::InvalidInput(format!(
+            "action must be one of create, rename, delete; got '{}'",
+            input.action
+        ))),
+    }
+}
+
+fn required_mailbox_field(value: Option<&String>, field: &str, action: &str) -> AppResult<String> {
+    match value {
+        Some(value) => Ok(value.clone()),
+        None => Err(AppError::InvalidInput(format!(
+            "{field} is required for action={action}"
+        ))),
+    }
+}
+
+fn reject_field_for_action<T>(value: Option<&T>, field: &str, action: &str) -> AppResult<()> {
+    if value.is_some() {
+        return Err(AppError::InvalidInput(format!(
+            "{field} is not allowed for action={action}"
+        )));
+    }
+    Ok(())
+}
+
 fn search_selector_to_search_input(
     account_id: &str,
     search: &SearchSelectorInput,
-) -> SearchMessagesInput {
-    SearchMessagesInput {
+) -> AppResult<SearchMessagesInput> {
+    let mailbox = search
+        .mailbox
+        .clone()
+        .ok_or_else(|| AppError::InvalidInput("selector.search.mailbox is required".to_owned()))?;
+
+    Ok(SearchMessagesInput {
         account_id: account_id.to_owned(),
-        mailbox: search.mailbox.clone(),
+        mailbox,
         cursor: search.cursor.clone(),
         query: search.query.clone(),
         from: search.from.clone(),
@@ -2146,7 +2306,20 @@ fn search_selector_to_search_input(
         limit: MAX_SEARCH_LIMIT,
         include_snippet: false,
         snippet_max_chars: None,
-    }
+    })
+}
+
+fn search_selector_is_empty(search: &SearchSelectorInput) -> bool {
+    search.mailbox.is_none()
+        && search.cursor.is_none()
+        && search.query.is_none()
+        && search.from.is_none()
+        && search.to.is_none()
+        && search.subject.is_none()
+        && search.unread_only.is_none()
+        && search.last_days.is_none()
+        && search.start_date.is_none()
+        && search.end_date.is_none()
 }
 
 fn validate_message_action(action: &MessageActionInput, account_id: &str) -> AppResult<()> {
@@ -2531,17 +2704,23 @@ fn encode_raw_source_base64(raw: &[u8]) -> String {
 #[cfg(test)]
 /// Tests for server-side validation and encoding helpers.
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Instant;
 
     use tokio::sync::Mutex;
 
     use super::{
+        MailImapServer, MessageActionInput, build_mailbox_action, build_message_action,
         dedupe_and_parse_message_ids, encode_raw_source_base64, escape_imap_quoted,
         resume_cursor_search, validate_flag, validate_mailbox, validate_message_action,
         validate_search_input, validate_search_text,
     };
-    use crate::models::{MessageActionInput, SearchMessagesInput};
+    use crate::config::ServerConfig;
+    use crate::models::{
+        ApplyToMessagesInput, ManageMailboxInput, MessageSelectorInput, SearchMessagesInput,
+        SearchSelectorInput, validate_client_safe_input_schema,
+    };
     use crate::pagination::{CursorEntry, CursorStore};
 
     /// Tests that control characters in search text are rejected.
@@ -2616,6 +2795,82 @@ mod tests {
     fn encodes_raw_source_as_base64() {
         let raw = [0_u8, 159, 255];
         assert_eq!(encode_raw_source_base64(&raw), "AJ//");
+    }
+
+    #[test]
+    fn build_message_action_rejects_copy_only_account_for_move() {
+        let input = ApplyToMessagesInput {
+            account_id: "default".to_owned(),
+            selector: MessageSelectorInput {
+                message_ids: vec!["imap:default:INBOX:42:7".to_owned()],
+                search: SearchSelectorInput::default(),
+            },
+            action: "move".to_owned(),
+            destination_mailbox: Some("Archive".to_owned()),
+            destination_account_id: Some("other".to_owned()),
+            add_flags: None,
+            remove_flags: None,
+            max_messages: 1,
+            dry_run: false,
+        };
+
+        let err =
+            build_message_action(&input).expect_err("move must reject destination_account_id");
+        assert!(
+            err.to_string()
+                .contains("destination_account_id is not allowed for action=move")
+        );
+    }
+
+    #[test]
+    fn build_message_action_requires_destination_for_copy() {
+        let input = ApplyToMessagesInput {
+            account_id: "default".to_owned(),
+            selector: MessageSelectorInput {
+                message_ids: vec!["imap:default:INBOX:42:7".to_owned()],
+                search: SearchSelectorInput::default(),
+            },
+            action: "copy".to_owned(),
+            destination_mailbox: None,
+            destination_account_id: None,
+            add_flags: None,
+            remove_flags: None,
+            max_messages: 1,
+            dry_run: false,
+        };
+
+        let err = build_message_action(&input).expect_err("copy must require destination_mailbox");
+        assert!(
+            err.to_string()
+                .contains("destination_mailbox is required for action=copy")
+        );
+    }
+
+    #[test]
+    fn build_mailbox_action_rejects_destination_for_delete() {
+        let input = ManageMailboxInput {
+            account_id: "default".to_owned(),
+            action: "delete".to_owned(),
+            mailbox: "Archive".to_owned(),
+            destination_mailbox: Some("Archive/Elsewhere".to_owned()),
+        };
+
+        let err = build_mailbox_action(&input).expect_err("delete must reject destination_mailbox");
+        assert!(
+            err.to_string()
+                .contains("destination_mailbox is not allowed for action=delete")
+        );
+    }
+
+    #[test]
+    fn all_published_tool_input_schemas_are_client_safe() {
+        let server = MailImapServer::new(schema_test_server_config());
+        for tool in server.tool_router.list_all() {
+            let schema = serde_json::Value::Object(tool.input_schema.as_ref().clone());
+            validate_client_safe_input_schema(&schema).unwrap_or_else(|error| {
+                panic!("tool {} published unsafe schema: {error}", tool.name)
+            });
+        }
     }
 
     #[test]
@@ -2773,5 +3028,18 @@ mod tests {
             .expect("decoded cursor should resume from legacy encoded request");
         assert!(snapshot.include_snippet);
         assert_eq!(snapshot.snippet_max_chars, 120);
+    }
+
+    fn schema_test_server_config() -> ServerConfig {
+        ServerConfig {
+            accounts: BTreeMap::new(),
+            trusted_ca_certs: Vec::new(),
+            write_enabled: false,
+            connect_timeout_ms: 30_000,
+            greeting_timeout_ms: 15_000,
+            socket_timeout_ms: 300_000,
+            cursor_ttl_seconds: 600,
+            cursor_max_entries: 512,
+        }
     }
 }

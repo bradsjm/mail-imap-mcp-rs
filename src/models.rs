@@ -295,8 +295,18 @@ pub struct ApplyToMessagesInput {
     /// Message selector (either explicit ids or a mailbox search)
     pub selector: MessageSelectorInput,
     /// Action to apply to the selected messages
-    #[serde(flatten)]
-    pub action: MessageActionInput,
+    #[schemars(schema_with = "message_action_schema")]
+    pub action: String,
+    /// Destination mailbox for `move` and `copy`
+    #[schemars(length(min = 1, max = 256))]
+    pub destination_mailbox: Option<String>,
+    /// Destination account for `copy` (defaults to source account)
+    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
+    pub destination_account_id: Option<String>,
+    /// Flags to add for `update_flags`
+    pub add_flags: Option<Vec<String>>,
+    /// Flags to remove for `update_flags`
+    pub remove_flags: Option<Vec<String>>,
     /// Maximum allowed matched messages
     #[serde(default = "default_max_messages")]
     #[schemars(range(min = 1, max = 1_000), transform = remove_format)]
@@ -310,20 +320,22 @@ pub struct ApplyToMessagesInput {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct MessageSelectorInput {
     /// Stable message identifiers to target
-    #[schemars(length(min = 1, max = 1_000))]
-    pub message_ids: Option<Vec<String>>,
+    #[serde(default)]
+    #[schemars(length(max = 1_000))]
+    pub message_ids: Vec<String>,
     /// Mailbox search criteria
-    pub search: Option<SearchSelectorInput>,
+    #[serde(default)]
+    pub search: SearchSelectorInput,
 }
 
 /// Search criteria used by `imap_apply_to_messages`.
 ///
 /// Mirrors `imap_search_messages` without pagination limit or snippet options.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct SearchSelectorInput {
     /// Mailbox to search (e.g., `INBOX`, `Sent`, `Archive`)
     #[schemars(length(min = 1, max = 256))]
-    pub mailbox: String,
+    pub mailbox: Option<String>,
     /// Pagination cursor from previous search result
     pub cursor: Option<String>,
     /// Full-text search query
@@ -351,36 +363,6 @@ pub struct SearchSelectorInput {
     pub end_date: Option<String>,
 }
 
-/// Action union for `imap_apply_to_messages`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum MessageActionInput {
-    /// Move messages within the same account
-    Move {
-        /// Destination mailbox
-        #[schemars(length(min = 1, max = 256))]
-        destination_mailbox: String,
-    },
-    /// Copy messages to another mailbox
-    Copy {
-        /// Destination mailbox
-        #[schemars(length(min = 1, max = 256))]
-        destination_mailbox: String,
-        /// Destination account (if omitted, copies within same account)
-        #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
-        destination_account_id: Option<String>,
-    },
-    /// Delete messages from their source mailbox
-    Delete,
-    /// Add and/or remove flags on messages
-    UpdateFlags {
-        /// Flags to add (e.g., `\Seen`, `\Flagged`, `Important`)
-        add_flags: Option<Vec<String>>,
-        /// Flags to remove
-        remove_flags: Option<Vec<String>>,
-    },
-}
-
 /// Input: create, rename, or delete a mailbox.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ManageMailboxInput {
@@ -389,35 +371,14 @@ pub struct ManageMailboxInput {
     #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
     pub account_id: String,
     /// Mailbox management action
-    #[serde(flatten)]
-    pub action: MailboxAction,
-}
-
-/// Mailbox management action kind.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum MailboxAction {
-    /// Create a mailbox
-    Create {
-        /// Source or target mailbox name, depending on action
-        #[schemars(length(min = 1, max = 256))]
-        mailbox: String,
-    },
-    /// Rename or move a mailbox
-    Rename {
-        /// Existing mailbox name
-        #[schemars(length(min = 1, max = 256))]
-        mailbox: String,
-        /// Destination mailbox name
-        #[schemars(length(min = 1, max = 256))]
-        destination_mailbox: String,
-    },
-    /// Delete a mailbox
-    Delete {
-        /// Mailbox name
-        #[schemars(length(min = 1, max = 256))]
-        mailbox: String,
-    },
+    #[schemars(schema_with = "mailbox_action_schema")]
+    pub action: String,
+    /// Source or target mailbox name, depending on action
+    #[schemars(length(min = 1, max = 256))]
+    pub mailbox: String,
+    /// Destination mailbox name for `rename`
+    #[schemars(length(min = 1, max = 256))]
+    pub destination_mailbox: Option<String>,
 }
 
 /// Default value for `account_id` field
@@ -459,6 +420,91 @@ fn default_max_messages() -> usize {
     100
 }
 
+fn message_action_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "enum": ["move", "copy", "delete", "update_flags"]
+    })
+}
+
+fn mailbox_action_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "enum": ["create", "rename", "delete"]
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn validate_client_safe_input_schema(schema: &serde_json::Value) -> Result<(), String> {
+    let type_is_object = schema
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|ty| ty == "object");
+    if !type_is_object {
+        return Err("root schema must have type=object".to_owned());
+    }
+    if !schema
+        .get("properties")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        return Err("root schema must expose explicit properties".to_owned());
+    }
+    validate_client_safe_schema_node(schema, "$")
+}
+
+#[cfg(test)]
+fn validate_client_safe_schema_node(value: &serde_json::Value, path: &str) -> Result<(), String> {
+    match value {
+        serde_json::Value::Object(object) => {
+            for keyword in [
+                "oneOf",
+                "anyOf",
+                "allOf",
+                "not",
+                "if",
+                "then",
+                "else",
+                "dependentSchemas",
+                "dependentRequired",
+                "patternProperties",
+                "unevaluatedProperties",
+                "propertyNames",
+            ] {
+                if object.contains_key(keyword) {
+                    return Err(format!(
+                        "client-unsafe schema keyword '{keyword}' found at {path}"
+                    ));
+                }
+            }
+
+            if let Some(additional_properties) = object.get("additionalProperties") {
+                match additional_properties {
+                    serde_json::Value::Bool(false) => {}
+                    _ => {
+                        return Err(format!(
+                            "client-unsafe additionalProperties found at {path}"
+                        ));
+                    }
+                }
+            }
+
+            for (key, nested) in object {
+                let nested_path = format!("{path}.{key}");
+                validate_client_safe_schema_node(nested, &nested_path)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(values) => {
+            for (index, nested) in values.iter().enumerate() {
+                let nested_path = format!("{path}[{index}]");
+                validate_client_safe_schema_node(nested, &nested_path)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rmcp::handler::server::common::schema_for_type;
@@ -466,7 +512,7 @@ mod tests {
 
     use super::{
         AccountOnlyInput, ApplyToMessagesInput, GetMessageInput, GetMessageRawInput,
-        ManageMailboxInput, SearchMessagesInput,
+        ManageMailboxInput, SearchMessagesInput, validate_client_safe_input_schema,
     };
 
     #[test]
@@ -576,6 +622,17 @@ mod tests {
             schema_numeric_property(apply_props, "max_messages", "maximum"),
             Some(1_000)
         );
+    }
+
+    #[test]
+    fn formerly_broken_write_tool_model_schemas_are_client_safe() {
+        for schema in [
+            schema_for_type::<ApplyToMessagesInput>(),
+            schema_for_type::<ManageMailboxInput>(),
+        ] {
+            validate_client_safe_input_schema(&Value::Object((*schema).clone()))
+                .expect("write tool input schema must be client-safe");
+        }
     }
 
     fn assert_no_nonstandard_integer_formats(value: &Value) {

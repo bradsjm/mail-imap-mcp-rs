@@ -11,6 +11,7 @@ It is the source of truth for tool names, input/output shapes, validation bounds
 - Destructive/write operations: disabled by default and explicitly gated.
 - Output style: concise summaries with bounded structured data.
 - Compatibility: no backward compatibility requirement with earlier implementations.
+- MCP input schemas must remain client-safe: plain object properties only, with conditional rules enforced at runtime rather than schema unions.
 
 ## Shared Input Types
 
@@ -148,6 +149,8 @@ Output `data`:
 - `failed` (integer)
 - `messages`: array (max 50) of:
   - `message_id`
+  - `message_uri`
+  - `message_raw_uri`
   - `mailbox`
   - `uidvalidity`
   - `uid`
@@ -179,6 +182,8 @@ Output `data`:
 - `account_id`
 - `message`:
   - `message_id`
+  - `message_uri`
+  - `message_raw_uri`
   - `mailbox`
   - `uidvalidity`
   - `uid`
@@ -217,6 +222,8 @@ Output `data`:
 - `issues`: array of diagnostic issues
 - `account_id`
 - `message_id`
+- `message_uri`
+- `message_raw_uri`
 - `size_bytes`
 - `raw_source_base64` (byte-faithful RFC822 source, base64 encoded)
 - `raw_source_encoding` (`"base64"` on success)
@@ -247,6 +254,11 @@ Input:
   - `copy` with `destination_mailbox`, `destination_account_id?`
   - `delete`
   - `update_flags` with `add_flags?`, `remove_flags?`
+- action-specific top-level fields:
+  - `destination_mailbox?`
+  - `destination_account_id?`
+  - `add_flags?`
+  - `remove_flags?`
 - `max_messages` (optional, default `100`, range `1..1000`)
 - `dry_run` (optional, default `false`)
 
@@ -285,10 +297,9 @@ Write gate: requires `MAIL_IMAP_WRITE_ENABLED=true`.
 
 Input:
 - `account_id` (optional)
-- `action` (required), one of:
-  - `create` with `mailbox`
-  - `rename` with `mailbox`, `destination_mailbox`
-  - `delete` with `mailbox`
+- `action` (required): `create|rename|delete`
+- `mailbox` (required)
+- `destination_mailbox?` (required for `rename`, rejected for `create` and `delete`)
 
 Behavior:
 - `create` auto-creates missing parent mailboxes before the target mailbox
