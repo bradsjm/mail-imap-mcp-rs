@@ -632,22 +632,24 @@ mod tests {
 
     fn schema_variant_for<'a>(properties: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
         let schema = properties.get(key)?;
-        if schema
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|ty| ty != "null")
-        {
+        if schema.get("type").is_some_and(is_non_null_type) {
             return Some(schema);
         }
         schema
             .get("anyOf")
             .and_then(Value::as_array)?
             .iter()
-            .find(|variant| {
-                variant
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|ty| ty != "null")
-            })
+            .find(|variant| variant.get("type").is_some_and(is_non_null_type))
+    }
+
+    fn is_non_null_type(value: &Value) -> bool {
+        match value {
+            Value::String(ty) => ty != "null",
+            Value::Array(types) => types
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|ty| ty != "null"),
+            _ => false,
+        }
     }
 }

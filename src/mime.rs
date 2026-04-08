@@ -116,7 +116,9 @@ fn select_body_text(body_text: Option<String>, body_html: Option<&str>) -> Optio
 
 /// Convert sanitized HTML to plain text without artificial wrapping.
 fn html_to_text(html: &str) -> Option<String> {
-    let text = html2text::from_read(html.as_bytes(), usize::MAX).ok()?;
+    let text = html2text::config::plain_no_decorate()
+        .string_from_read(html.as_bytes(), usize::MAX)
+        .ok()?;
     let trimmed = text.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
