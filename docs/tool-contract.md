@@ -5,7 +5,7 @@ It is the source of truth for tool names, input/output shapes, validation bounds
 
 ## Design Decisions
 
-- Transport: stdio only.
+- Transport: stdio by default, with optional streamable HTTP transport at `/mcp`.
 - Auth/config: environment variables only.
 - Message locator: stable `message_id` format `imap:{account_id}:{mailbox}:{uidvalidity}:{uid}`.
 - Destructive/write operations: disabled by default and explicitly gated.
@@ -364,4 +364,4 @@ Server-wide:
 
 ## Implementation Notes for Next Artifact
 
-Next artifact will generate Rust types and schema definitions from this contract, then register all tools in an `rmcp` stdio server skeleton with unified error handling.
+Next artifact will generate Rust types and schema definitions from this contract, then register all tools in an `rmcp` server skeleton with unified error handling across stdio and optional streamable HTTP transport.

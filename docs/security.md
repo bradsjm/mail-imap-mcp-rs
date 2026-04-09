@@ -2,6 +2,23 @@
 
 This document outlines security features and considerations for the `mail-imap-mcp-rs` MCP server.
 
+## Transport Exposure
+
+The server defaults to MCP over stdio. Optional streamable HTTP transport is available only when started with `--transport http`.
+
+### HTTP Defaults
+
+- HTTP binds to `127.0.0.1:8000` if you do not specify `--http-bind-address` or `--http-port`
+- MCP is served at `/mcp`
+- This localhost default reduces accidental network exposure during local development
+
+### HTTP Exposure Warning
+
+- The HTTP transport is plain HTTP unless you place it behind external TLS termination
+- The server does not add built-in HTTP authentication
+- Do not leave this server publicly reachable unless exposure is intentional and protected by a trusted boundary such as a reverse proxy, firewall, or private network
+- Binding to `0.0.0.0` or `::` increases exposure and should be treated as an intentional network-serving decision
+
 ## TLS Enforcement
 
 All IMAP connections require TLS encryption by default. Insecure connections are rejected.
@@ -182,10 +199,11 @@ All tool responses include metadata for auditing:
 ### For Operators
 
 1. **Principle of least privilege**: Run the server with minimal required permissions
-2. **Network isolation**: Deploy in isolated network segments where possible
+2. **Network isolation**: Deploy in isolated network segments where possible, especially for HTTP mode
 3. **Regular updates**: Keep dependencies and the server updated
 4. **Audit logs**: Monitor server logs for unusual patterns or errors
 5. **Rate limiting**: Consider implementing additional rate limiting at the infrastructure layer
+6. **TLS termination**: If you must expose HTTP mode beyond localhost, terminate TLS and enforce access controls before traffic reaches the server
 
 ### For Development
 

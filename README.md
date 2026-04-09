@@ -1,6 +1,6 @@
 # mail-imap-mcp-rs
 
-A secure, efficient Model Context Protocol (MCP) server for IMAP email access over stdio. Provides read/write operations on IMAP mailboxes with structured output, cursor-based pagination, and security-first design.
+A secure, efficient Model Context Protocol (MCP) server for IMAP email access over stdio by default, with optional streamable HTTP transport. Provides read/write operations on IMAP mailboxes with structured output, cursor-based pagination, and security-first design.
 
 ## Features
 
@@ -23,6 +23,12 @@ Easiest method - no global install required.
 
 ```bash
 npx @bradsjm/mail-imap-mcp-rs@latest
+```
+
+Optional HTTP transport example:
+
+```bash
+npx @bradsjm/mail-imap-mcp-rs@latest --transport http
 ```
 
 Supported npm/native targets:
@@ -61,6 +67,12 @@ docker pull ghcr.io/bradsjm/mail-imap-mcp-rs:latest
 docker run --rm -i --env-file .env ghcr.io/bradsjm/mail-imap-mcp-rs:latest
 ```
 
+Optional HTTP transport example:
+
+```bash
+docker run --rm -p 127.0.0.1:8000:8000 --env-file .env ghcr.io/bradsjm/mail-imap-mcp-rs:latest --transport http
+```
+
 Build locally:
 
 ```bash
@@ -77,6 +89,29 @@ cargo install --path .
 ```
 
 Binary available at `$HOME/.cargo/mail-imap-mcp-rs`.
+
+## Transport Modes
+
+The server defaults to `stdio`, which is the right mode for most MCP desktop integrations.
+
+Use streamable HTTP only when you explicitly need it:
+
+```bash
+mail-imap-mcp-rs --transport http
+```
+
+Optional bind controls:
+
+```bash
+mail-imap-mcp-rs --transport http --http-bind-address 127.0.0.1 --http-port 8000
+```
+
+HTTP mode serves MCP at `http://127.0.0.1:8000/mcp` by default.
+
+Security note:
+- The HTTP transport defaults to localhost only.
+- The server does not add built-in HTTP authentication or TLS termination.
+- Do not leave this server publicly reachable unless exposure is intentional and protected by a trusted boundary such as a reverse proxy, firewall, or private network.
 
 ## Quick Start
 
@@ -242,6 +277,7 @@ For comprehensive security documentation, see [Security Considerations](docs/sec
 
 Key security features:
 - **TLS enforcement**: Insecure connections rejected
+- **Local HTTP default**: Optional HTTP transport binds to localhost unless you override it
 - **Password secrecy**: Passwords never logged or returned
 - **Bounded outputs**: Body text, HTML, attachments truncated to limits
 - **Write gating**: Destructive operations require explicit opt-in
