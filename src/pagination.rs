@@ -9,6 +9,28 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
+#[derive(Debug)]
+enum CursorClock {
+    System,
+    #[cfg(test)]
+    Manual {
+        base: Instant,
+        offset_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    },
+}
+
+impl CursorClock {
+    fn now(&self) -> Instant {
+        match self {
+            Self::System => Instant::now(),
+            #[cfg(test)]
+            Self::Manual { base, offset_ms } => {
+                *base + Duration::from_millis(offset_ms.load(std::sync::atomic::Ordering::Relaxed))
+            }
+        }
+    }
+}
+
 /// Single cursor entry
 ///
 /// Captures the full state of a search result page, allowing
@@ -43,6 +65,8 @@ pub struct CursorStore {
     max_entries: usize,
     /// Active cursors keyed by UUID
     entries: HashMap<String, CursorEntry>,
+    /// Time source for expiry calculations
+    clock: CursorClock,
 }
 
 impl CursorStore {
@@ -57,7 +81,28 @@ impl CursorStore {
             ttl: Duration::from_secs(ttl_seconds),
             max_entries,
             entries: HashMap::new(),
+            clock: CursorClock::System,
         }
+    }
+
+    #[cfg(test)]
+    fn new_with_manual_clock(
+        ttl_seconds: u64,
+        max_entries: usize,
+    ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        let offset_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        (
+            Self {
+                ttl: Duration::from_secs(ttl_seconds),
+                max_entries,
+                entries: HashMap::new(),
+                clock: CursorClock::Manual {
+                    base: Instant::now(),
+                    offset_ms: offset_ms.clone(),
+                },
+            },
+            offset_ms,
+        )
     }
 
     /// Create and store a new cursor
@@ -66,7 +111,7 @@ impl CursorStore {
     /// and evicts old entries if necessary. Returns the cursor ID.
     pub fn create(&mut self, mut entry: CursorEntry) -> String {
         self.cleanup();
-        entry.expires_at = Instant::now() + self.ttl;
+        entry.expires_at = self.clock.now() + self.ttl;
         let id = Uuid::new_v4().to_string();
         self.entries.insert(id.clone(), entry);
         self.evict_if_needed();
@@ -82,7 +127,7 @@ impl CursorStore {
     pub fn get(&mut self, cursor: &str) -> Option<CursorEntry> {
         self.cleanup();
         let entry = self.entries.get_mut(cursor)?;
-        entry.expires_at = Instant::now() + self.ttl;
+        entry.expires_at = self.clock.now() + self.ttl;
         Some(entry.clone())
     }
 
@@ -93,7 +138,7 @@ impl CursorStore {
     pub fn update_offset(&mut self, cursor: &str, offset: usize) {
         if let Some(entry) = self.entries.get_mut(cursor) {
             entry.offset = offset;
-            entry.expires_at = Instant::now() + self.ttl;
+            entry.expires_at = self.clock.now() + self.ttl;
         }
     }
 
@@ -109,7 +154,7 @@ impl CursorStore {
     /// Called internally before get/create/update operations to
     /// ensure stale cursors don't accumulate.
     fn cleanup(&mut self) {
-        let now = Instant::now();
+        let now = self.clock.now();
         self.entries.retain(|_, entry| entry.expires_at > now);
     }
 
@@ -138,8 +183,9 @@ impl CursorStore {
 
 #[cfg(test)]
 mod tests {
-    use std::thread;
-    use std::time::{Duration, Instant};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
 
     use super::{CursorEntry, CursorStore};
 
@@ -161,7 +207,7 @@ mod tests {
     /// Tests that a cursor can be created and then retrieved from the store.
     #[test]
     fn create_and_get_cursor() {
-        let mut store = CursorStore::new(60, 10);
+        let (mut store, _) = CursorStore::new_with_manual_clock(60, 10);
         let id = store.create(cursor_entry(Instant::now()));
         let loaded = store.get(&id).expect("cursor must be present");
         assert_eq!(loaded.mailbox, "INBOX");
@@ -173,7 +219,7 @@ mod tests {
     /// Verifies that the offset is updated and that deletion removes the cursor.
     #[test]
     fn update_offset_and_delete_cursor() {
-        let mut store = CursorStore::new(60, 10);
+        let (mut store, _) = CursorStore::new_with_manual_clock(60, 10);
         let id = store.create(cursor_entry(Instant::now()));
         store.update_offset(&id, 3);
         let loaded = store.get(&id).expect("cursor must exist after update");
@@ -186,31 +232,33 @@ mod tests {
     /// Tests that cursors expire after their TTL has elapsed.
     #[test]
     fn expires_old_entries() {
-        let mut store = CursorStore::new(1, 10);
+        let (mut store, offset_ms) = CursorStore::new_with_manual_clock(1, 10);
         let id = store.create(cursor_entry(Instant::now()));
-        thread::sleep(Duration::from_millis(1100));
+        advance_ms(&offset_ms, 1_100);
         assert!(store.get(&id).is_none());
     }
 
     /// Tests that accessing a cursor refreshes its TTL, preventing expiration.
     #[test]
     fn get_refreshes_cursor_ttl() {
-        let mut store = CursorStore::new(1, 10);
+        let (mut store, offset_ms) = CursorStore::new_with_manual_clock(1, 10);
         let id = store.create(cursor_entry(Instant::now()));
 
-        thread::sleep(Duration::from_millis(700));
+        advance_ms(&offset_ms, 700);
         assert!(store.get(&id).is_some());
 
-        thread::sleep(Duration::from_millis(700));
+        advance_ms(&offset_ms, 700);
         assert!(store.get(&id).is_some());
     }
 
     /// Tests that the store evicts the oldest cursors when exceeding max_entries.
     #[test]
     fn evicts_to_max_entries() {
-        let mut store = CursorStore::new(60, 2);
+        let (mut store, offset_ms) = CursorStore::new_with_manual_clock(60, 2);
         let id1 = store.create(cursor_entry(Instant::now()));
+        advance_ms(&offset_ms, 1);
         let id2 = store.create(cursor_entry(Instant::now()));
+        advance_ms(&offset_ms, 1);
         let id3 = store.create(cursor_entry(Instant::now()));
 
         let remaining = [id1, id2, id3]
@@ -218,5 +266,9 @@ mod tests {
             .filter(|id| store.get(id).is_some())
             .count();
         assert_eq!(remaining, 2);
+    }
+
+    fn advance_ms(offset_ms: &Arc<AtomicU64>, amount: u64) {
+        offset_ms.fetch_add(amount, Ordering::Relaxed);
     }
 }

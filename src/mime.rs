@@ -11,6 +11,9 @@ use mailparse::{DispositionType, MailHeader, ParsedMail};
 use crate::errors::{AppError, AppResult};
 use crate::models::AttachmentInfo;
 
+/// Maximum attachments collected during MIME parsing.
+pub const MAX_ATTACHMENTS: usize = 50;
+
 /// Parsed message representation
 ///
 /// Contains extracted headers, body content, and attachment metadata.
@@ -35,6 +38,20 @@ pub struct ParsedMessage {
     pub body_html_sanitized: Option<String>,
     /// Attachment metadata
     pub attachments: Vec<AttachmentInfo>,
+    /// Whether attachment collection exceeded `MAX_ATTACHMENTS`
+    pub attachments_truncated: bool,
+}
+
+struct WalkConfig {
+    extract_attachment_text: bool,
+    attachment_text_max_chars: usize,
+}
+
+struct WalkState {
+    body_text: Option<String>,
+    body_html: Option<String>,
+    attachments: Vec<AttachmentInfo>,
+    attachments_truncated: bool,
 }
 
 /// Parse RFC822 message into structured representation
@@ -64,24 +81,23 @@ pub fn parse_message(
         .map_err(|e| AppError::Internal(format!("failed to parse RFC822 message: {e}")))?;
 
     let headers = parse_all_headers(raw)?;
-    let mut body_text = None;
-    let mut body_html = None;
-    let mut attachments = Vec::new();
-
-    walk_parts(
-        &parsed,
-        "1".to_owned(),
-        &mut body_text,
-        &mut body_html,
-        &mut attachments,
+    let mut state = WalkState {
+        body_text: None,
+        body_html: None,
+        attachments: Vec::new(),
+        attachments_truncated: false,
+    };
+    let config = WalkConfig {
         extract_attachment_text,
         attachment_text_max_chars,
-    )?;
+    };
 
-    let text = select_body_text(body_text, body_html.as_deref())
+    walk_parts(&parsed, "1".to_owned(), &mut state, &config)?;
+
+    let text = select_body_text(state.body_text, state.body_html.as_deref())
         .map(|t| truncate_chars(t, body_max_chars));
     let html = if include_html {
-        body_html.map(|h| truncate_chars(h, body_max_chars))
+        state.body_html.map(|h| truncate_chars(h, body_max_chars))
     } else {
         None
     };
@@ -96,7 +112,8 @@ pub fn parse_message(
         headers_all: headers,
         body_text: text,
         body_html_sanitized: html,
-        attachments,
+        attachments: state.attachments,
+        attachments_truncated: state.attachments_truncated,
     })
 }
 
@@ -135,11 +152,8 @@ fn has_meaningful_content(body: &str) -> bool {
 fn walk_parts(
     part: &ParsedMail<'_>,
     part_id: String,
-    body_text: &mut Option<String>,
-    body_html: &mut Option<String>,
-    attachments: &mut Vec<AttachmentInfo>,
-    extract_attachment_text: bool,
-    attachment_text_max_chars: usize,
+    state: &mut WalkState,
+    config: &WalkConfig,
 ) -> AppResult<()> {
     if part.subparts.is_empty() {
         let ctype = part.ctype.mimetype.to_ascii_lowercase();
@@ -149,34 +163,38 @@ fn walk_parts(
 
         if !is_attachment {
             if ctype == "text/plain"
-                && body_text.is_none()
+                && state.body_text.is_none()
                 && let Ok(text) = part.get_body()
             {
-                *body_text = Some(text);
+                state.body_text = Some(text);
             }
 
             if ctype == "text/html"
-                && body_html.is_none()
+                && state.body_html.is_none()
                 && let Ok(html) = part.get_body()
             {
-                *body_html = Some(ammonia::clean(&html));
+                state.body_html = Some(ammonia::clean(&html));
             }
         }
 
         if is_attachment {
+            if state.attachments.len() >= MAX_ATTACHMENTS {
+                state.attachments_truncated = true;
+                return Ok(());
+            }
             let raw_body = part
                 .get_body_raw()
                 .map_err(|e| AppError::Internal(format!("failed decoding attachment body: {e}")))?;
             let mut extracted_text = None;
-            if extract_attachment_text
+            if config.extract_attachment_text
                 && ctype == "application/pdf"
                 && raw_body.len() <= 5_000_000
                 && let Ok(text) = pdf_extract::extract_text_from_mem(&raw_body)
             {
-                extracted_text = Some(truncate_chars(text, attachment_text_max_chars));
+                extracted_text = Some(truncate_chars(text, config.attachment_text_max_chars));
             }
 
-            attachments.push(AttachmentInfo {
+            state.attachments.push(AttachmentInfo {
                 filename,
                 content_type: ctype,
                 size_bytes: raw_body.len(),
@@ -190,15 +208,7 @@ fn walk_parts(
 
     for (idx, sub) in part.subparts.iter().enumerate() {
         let next_id = format!("{part_id}.{}", idx + 1);
-        walk_parts(
-            sub,
-            next_id,
-            body_text,
-            body_html,
-            attachments,
-            extract_attachment_text,
-            attachment_text_max_chars,
-        )?;
+        walk_parts(sub, next_id, state, config)?;
     }
     Ok(())
 }
@@ -282,7 +292,7 @@ pub fn truncate_chars(input: String, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{curated_headers, parse_message, truncate_chars};
+    use super::{MAX_ATTACHMENTS, curated_headers, parse_message, truncate_chars};
 
     /// Tests that Unicode strings are truncated by character, not byte.
     #[test]
@@ -324,6 +334,7 @@ mod tests {
         assert_eq!(parsed.to.as_deref(), Some("user@example.com"));
         assert_eq!(parsed.body_text.as_deref(), Some("Hello there"));
         assert!(parsed.attachments.is_empty());
+        assert!(!parsed.attachments_truncated);
     }
 
     #[test]
@@ -422,5 +433,35 @@ mod tests {
 
         assert_eq!(parsed.body_text.as_deref(), Some("Hello from HTML"));
         assert_eq!(parsed.body_html_sanitized, None);
+    }
+
+    #[test]
+    fn truncates_attachment_collection_at_limit() {
+        let mut raw = concat!(
+            "From: sender@example.com\r\n",
+            "To: user@example.com\r\n",
+            "Subject: Many Attachments\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=\"mix\"\r\n",
+            "\r\n",
+            "--mix\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "hello\r\n",
+        )
+        .to_owned();
+
+        for idx in 0..55 {
+            raw.push_str(&format!(
+                "--mix\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"f{idx}.bin\"\r\n\r\npayload-{idx}\r\n"
+            ));
+        }
+        raw.push_str("--mix--\r\n");
+
+        let parsed =
+            parse_message(raw.as_bytes(), 2000, false, false, 10000).expect("parse should succeed");
+        assert_eq!(parsed.body_text.as_deref(), Some("hello"));
+        assert_eq!(parsed.attachments.len(), MAX_ATTACHMENTS);
+        assert!(parsed.attachments_truncated);
     }
 }

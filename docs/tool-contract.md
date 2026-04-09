@@ -205,6 +205,7 @@ PDF extraction rules:
 - only `application/pdf`
 - max attachment size for extraction: 5 MB
 - extraction failures do not fail the whole tool call
+- messages with more than 50 attachments return the first 50 plus a truncation issue
 
 ### 5) `imap_get_message_raw`
 
@@ -354,6 +355,7 @@ Server-wide:
 - `MAIL_IMAP_CONNECT_TIMEOUT_MS` (default `30000`)
 - `MAIL_IMAP_GREETING_TIMEOUT_MS` (default `15000`)
 - `MAIL_IMAP_SOCKET_TIMEOUT_MS` (default `300000`)
+- `MAIL_IMAP_OPERATION_MAX_ENTRIES` (default `256`; completed write operations retained in memory)
 
 ## Implementation Notes for Next Artifact
 

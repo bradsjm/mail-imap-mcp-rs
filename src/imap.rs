@@ -228,7 +228,7 @@ pub async fn create_parent_mailboxes(
     session: &mut ImapSession,
     mailbox: &str,
 ) -> AppResult<()> {
-    for parent in mailbox_parent_paths(mailbox) {
+    for parent in mailbox_parent_paths(server, session, mailbox).await? {
         create_mailbox_if_missing(server, session, &parent).await?;
     }
     Ok(())
@@ -244,18 +244,44 @@ pub async fn create_mailbox_path(
     create_mailbox_if_missing(server, session, mailbox).await
 }
 
-fn mailbox_parent_paths(mailbox: &str) -> Vec<String> {
-    let delimiter = if mailbox.contains('/') {
-        Some('/')
-    } else if mailbox.contains('.') {
-        Some('.')
-    } else {
-        None
+async fn mailbox_parent_paths(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    mailbox: &str,
+) -> AppResult<Vec<String>> {
+    let Some(delimiter) = hierarchy_delimiter(server, session).await? else {
+        return Ok(Vec::new());
     };
+    Ok(build_mailbox_parent_paths(delimiter, mailbox))
+}
 
-    let Some(delimiter) = delimiter else {
+/// Discover the server's mailbox hierarchy delimiter, if any.
+pub async fn hierarchy_delimiter(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+) -> AppResult<Option<char>> {
+    let stream = timeout(socket_timeout(server), session.list(None, Some("")))
+        .await
+        .map_err(|_| AppError::Timeout("LIST delimiter probe timed out".to_owned()))
+        .and_then(|r| {
+            r.map_err(|e| AppError::Internal(format!("LIST delimiter probe failed: {e}")))
+        })?;
+    let names = timeout(socket_timeout(server), stream.try_collect::<Vec<_>>())
+        .await
+        .map_err(|_| AppError::Timeout("LIST delimiter probe stream timed out".to_owned()))
+        .and_then(|r| {
+            r.map_err(|e| AppError::Internal(format!("LIST delimiter probe stream failed: {e}")))
+        })?;
+
+    Ok(names
+        .into_iter()
+        .find_map(|name| name.delimiter().and_then(|value| value.chars().next())))
+}
+
+fn build_mailbox_parent_paths(delimiter: char, mailbox: &str) -> Vec<String> {
+    if !mailbox.contains(delimiter) {
         return Vec::new();
-    };
+    }
 
     let parts: Vec<&str> = mailbox.split(delimiter).collect();
     let mut parents = Vec::new();
@@ -630,7 +656,7 @@ mod tests {
     use crate::mailbox_codec::encode_mailbox_name_for_command;
 
     use super::{
-        append, fetch_flags, fetch_raw_message, list_all_mailboxes, mailbox_parent_paths,
+        append, build_mailbox_parent_paths, fetch_flags, fetch_raw_message, list_all_mailboxes,
         select_mailbox_readonly, select_mailbox_readwrite, socket_timeout, uid_copy, uid_expunge,
         uid_move, uid_search, uid_store,
     };
@@ -668,7 +694,7 @@ mod tests {
     #[test]
     fn mailbox_parent_paths_builds_hierarchy_for_slash_paths() {
         assert_eq!(
-            mailbox_parent_paths("Archive/Projects/2026"),
+            build_mailbox_parent_paths('/', "Archive/Projects/2026"),
             vec!["Archive".to_owned(), "Archive/Projects".to_owned()]
         );
     }
@@ -676,7 +702,7 @@ mod tests {
     #[test]
     fn mailbox_parent_paths_uses_dot_when_no_slash_exists() {
         assert_eq!(
-            mailbox_parent_paths("Archive.Projects.2026"),
+            build_mailbox_parent_paths('.', "Archive.Projects.2026"),
             vec!["Archive".to_owned(), "Archive.Projects".to_owned()]
         );
     }
@@ -704,6 +730,7 @@ mod tests {
             socket_timeout_ms: 15_000,
             cursor_ttl_seconds: 600,
             cursor_max_entries: 128,
+            operation_max_entries: 256,
         }
     }
 

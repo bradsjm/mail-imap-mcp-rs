@@ -245,7 +245,6 @@ Key security features:
 - **Password secrecy**: Passwords never logged or returned
 - **Bounded outputs**: Body text, HTML, attachments truncated to limits
 - **Write gating**: Destructive operations require explicit opt-in
-- **Dry-run support**: Bulk message mutations can validate selection without changing IMAP state
 - **HTML sanitization**: HTML sanitized using `ammonia`
 
 ## Documentation

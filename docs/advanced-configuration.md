@@ -30,6 +30,22 @@ MAIL_IMAP_CURSOR_MAX_ENTRIES=512
 - Lower limit: Less memory usage, cursors may expire sooner
 - Higher limit: Supports more concurrent searches, higher memory usage
 
+## Write Operation Retention
+
+### Completed Operation Storage Limit
+
+Maximum number of completed write operations retained in memory for `imap_get_operation`.
+
+```bash
+# Default: 256 entries
+MAIL_IMAP_OPERATION_MAX_ENTRIES=256
+```
+
+Behavior:
+- Pending and running operations are never evicted by this limit.
+- When the limit is exceeded, the oldest completed operations are evicted first.
+- After eviction, polling or canceling that operation returns `not_found`.
+
 ## Timeout Configuration
 
 All timeouts are in milliseconds. Adjust based on network conditions and server performance.
@@ -185,6 +201,7 @@ MAIL_IMAP_<ACCOUNT>_SECURE=true
    - `MAIL_IMAP_SOCKET_TIMEOUT_MS=300000`
    - `MAIL_IMAP_CURSOR_TTL_SECONDS=600`
    - `MAIL_IMAP_CURSOR_MAX_ENTRIES=512`
+   - `MAIL_IMAP_OPERATION_MAX_ENTRIES=256`
 
 ## Trouleshooting Configuration Issues
 
