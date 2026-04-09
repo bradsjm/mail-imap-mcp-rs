@@ -16,10 +16,11 @@ use crate::models::{
 use crate::pagination::{CursorEntry, CursorStore};
 
 use super::types::{
-    SearchResultData, SummaryBuildResult, ToolIssue, build_message_raw_uri, build_message_uri,
-    is_hard_precondition_error, log_runtime_issues, next_action_for_search_result,
-    next_action_list_accounts, next_action_list_mailboxes, next_action_search_mailbox,
-    preferred_mailbox_name, status_from_counts, status_from_issue_and_counts,
+    GetMessageData, GetMessageRawData, ListMailboxesData, SearchResultData, SummaryBuildResult,
+    ToolIssue, build_message_raw_uri, build_message_uri, is_hard_precondition_error,
+    log_runtime_issues, next_action_for_search_result, next_action_list_accounts,
+    next_action_list_mailboxes, next_action_search_mailbox, preferred_mailbox_name,
+    status_from_counts, status_from_issue_and_counts,
 };
 use super::validation::{
     build_search_query, header_value, parse_and_validate_message_id, validate_account_id,
@@ -45,7 +46,7 @@ impl MailImapServer {
     pub(super) async fn list_mailboxes_impl(
         &self,
         input: AccountOnlyInput,
-    ) -> AppResult<serde_json::Value> {
+    ) -> AppResult<ListMailboxesData> {
         validate_account_id(&input.account_id)?;
         let account = self.config.get_account(&input.account_id)?;
         let mut issues = Vec::new();
@@ -61,13 +62,13 @@ impl MailImapServer {
                     None,
                     &issues,
                 );
-                return Ok(serde_json::json!({
-                    "status": "failed",
-                    "issues": issues,
-                    "next_action": next_action_list_accounts(),
-                    "account_id": account.account_id,
-                    "mailboxes": []
-                }));
+                return Ok(ListMailboxesData {
+                    status: "failed".to_owned(),
+                    issues,
+                    next_action: next_action_list_accounts(),
+                    account_id: account.account_id.clone(),
+                    mailboxes: Vec::new(),
+                });
             }
         };
 
@@ -100,13 +101,13 @@ impl MailImapServer {
             .map(|mailbox| next_action_search_mailbox(&input.account_id, &mailbox))
             .unwrap_or_else(next_action_list_accounts);
 
-        Ok(serde_json::json!({
-            "status": status,
-            "issues": issues,
-            "next_action": next_action,
-            "account_id": account.account_id,
-            "mailboxes": mailboxes,
-        }))
+        Ok(ListMailboxesData {
+            status: status.to_owned(),
+            issues,
+            next_action,
+            account_id: account.account_id.clone(),
+            mailboxes,
+        })
     }
 
     pub(super) async fn search_messages_impl(
@@ -311,7 +312,7 @@ impl MailImapServer {
     pub(super) async fn get_message_impl(
         &self,
         input: GetMessageInput,
-    ) -> AppResult<serde_json::Value> {
+    ) -> AppResult<GetMessageData> {
         validate_chars(input.body_max_chars, 100, 20_000, "body_max_chars")?;
         let attachment_text_max_chars = input.attachment_text_max_chars.unwrap_or(10_000);
         if input.attachment_text_max_chars.is_some()
@@ -347,12 +348,12 @@ impl MailImapServer {
                     Some(&message_id.mailbox),
                     &issues,
                 );
-                return Ok(serde_json::json!({
-                    "status": "failed",
-                    "issues": issues,
-                    "account_id": message_id.account_id,
-                    "message": serde_json::Value::Null,
-                }));
+                return Ok(GetMessageData {
+                    status: "failed".to_owned(),
+                    issues,
+                    account_id: message_id.account_id.clone(),
+                    message: None,
+                });
             }
         };
         ensure_uidvalidity_matches_readonly(&self.config, &mut session, &message_id).await?;
@@ -372,12 +373,12 @@ impl MailImapServer {
                     Some(&message_id.mailbox),
                     &issues,
                 );
-                return Ok(serde_json::json!({
-                    "status": "failed",
-                    "issues": issues,
-                    "account_id": message_id.account_id,
-                    "message": serde_json::Value::Null,
-                }));
+                return Ok(GetMessageData {
+                    status: "failed".to_owned(),
+                    issues,
+                    account_id: message_id.account_id.clone(),
+                    message: None,
+                });
             }
         };
 
@@ -402,12 +403,12 @@ impl MailImapServer {
                     Some(&message_id.mailbox),
                     &issues,
                 );
-                return Ok(serde_json::json!({
-                    "status": "failed",
-                    "issues": issues,
-                    "account_id": message_id.account_id,
-                    "message": serde_json::Value::Null,
-                }));
+                return Ok(GetMessageData {
+                    status: "failed".to_owned(),
+                    issues,
+                    account_id: message_id.account_id.clone(),
+                    message: None,
+                });
             }
         };
 
@@ -485,18 +486,18 @@ impl MailImapServer {
             &issues,
         );
 
-        Ok(serde_json::json!({
-            "status": status,
-            "issues": issues,
-            "account_id": message_id.account_id,
-            "message": detail,
-        }))
+        Ok(GetMessageData {
+            status: status.to_owned(),
+            issues,
+            account_id: message_id.account_id.clone(),
+            message: Some(detail),
+        })
     }
 
     pub(super) async fn get_message_raw_impl(
         &self,
         input: GetMessageRawInput,
-    ) -> AppResult<serde_json::Value> {
+    ) -> AppResult<GetMessageRawData> {
         validate_chars(input.max_bytes, 1_024, 1_000_000, "max_bytes")?;
 
         let message_id = parse_and_validate_message_id(&input.message_id)?;
@@ -518,58 +519,76 @@ impl MailImapServer {
                     Some(&message_id.mailbox),
                     &issues,
                 );
-                return Ok(serde_json::json!({
-                    "status": "failed",
-                    "issues": issues,
-                    "account_id": message_id.account_id,
-                    "message_id": encoded_message_id,
-                    "message_uri": build_message_uri(&message_id.account_id, &message_id.mailbox, message_id.uidvalidity, message_id.uid),
-                    "message_raw_uri": build_message_raw_uri(&message_id.account_id, &message_id.mailbox, message_id.uidvalidity, message_id.uid),
-                    "size_bytes": 0,
-                    "raw_source_base64": serde_json::Value::Null,
-                    "raw_source_encoding": serde_json::Value::Null,
-                }));
+                return Ok(GetMessageRawData {
+                    status: "failed".to_owned(),
+                    issues,
+                    account_id: message_id.account_id.clone(),
+                    message_id: encoded_message_id.clone(),
+                    message_uri: build_message_uri(
+                        &message_id.account_id,
+                        &message_id.mailbox,
+                        message_id.uidvalidity,
+                        message_id.uid,
+                    ),
+                    message_raw_uri: build_message_raw_uri(
+                        &message_id.account_id,
+                        &message_id.mailbox,
+                        message_id.uidvalidity,
+                        message_id.uid,
+                    ),
+                    total_size_bytes: 0,
+                    returned_bytes: 0,
+                    offset_bytes: input.offset_bytes,
+                    truncated: false,
+                    raw_source_base64: None,
+                    raw_source_encoding: None,
+                });
             }
         };
         ensure_uidvalidity_matches_readonly(&self.config, &mut session, &message_id).await?;
 
-        let total_size_bytes = match imap::fetch_message_size(
-            &self.config,
-            &mut session,
-            message_id.uid,
-        )
-        .await
-        {
-            Ok(size) => size,
-            Err(error) => {
-                issues.push(
-                    ToolIssue::from_error("fetch_message_size", &error)
-                        .with_uid(message_id.uid)
-                        .with_message_id(&encoded_message_id),
-                );
-                log_runtime_issues(
-                    "imap_get_message_raw",
-                    "failed",
-                    &message_id.account_id,
-                    Some(&message_id.mailbox),
-                    &issues,
-                );
-                return Ok(serde_json::json!({
-                    "status": "failed",
-                    "issues": issues,
-                    "account_id": message_id.account_id,
-                    "message_id": encoded_message_id,
-                    "message_uri": build_message_uri(&message_id.account_id, &message_id.mailbox, message_id.uidvalidity, message_id.uid),
-                    "message_raw_uri": build_message_raw_uri(&message_id.account_id, &message_id.mailbox, message_id.uidvalidity, message_id.uid),
-                    "total_size_bytes": 0,
-                    "returned_bytes": 0,
-                    "offset_bytes": input.offset_bytes,
-                    "truncated": false,
-                    "raw_source_base64": serde_json::Value::Null,
-                    "raw_source_encoding": serde_json::Value::Null,
-                }));
-            }
-        };
+        let total_size_bytes =
+            match imap::fetch_message_size(&self.config, &mut session, message_id.uid).await {
+                Ok(size) => size,
+                Err(error) => {
+                    issues.push(
+                        ToolIssue::from_error("fetch_message_size", &error)
+                            .with_uid(message_id.uid)
+                            .with_message_id(&encoded_message_id),
+                    );
+                    log_runtime_issues(
+                        "imap_get_message_raw",
+                        "failed",
+                        &message_id.account_id,
+                        Some(&message_id.mailbox),
+                        &issues,
+                    );
+                    return Ok(GetMessageRawData {
+                        status: "failed".to_owned(),
+                        issues,
+                        account_id: message_id.account_id.clone(),
+                        message_id: encoded_message_id.clone(),
+                        message_uri: build_message_uri(
+                            &message_id.account_id,
+                            &message_id.mailbox,
+                            message_id.uidvalidity,
+                            message_id.uid,
+                        ),
+                        message_raw_uri: build_message_raw_uri(
+                            &message_id.account_id,
+                            &message_id.mailbox,
+                            message_id.uidvalidity,
+                            message_id.uid,
+                        ),
+                        total_size_bytes: 0,
+                        returned_bytes: 0,
+                        offset_bytes: input.offset_bytes,
+                        truncated: false,
+                        raw_source_base64: None,
+                        raw_source_encoding: None,
+                    });
+                }
+            };
         if input.offset_bytes > total_size_bytes {
             return Err(AppError::InvalidInput(
                 "offset_bytes must not exceed total message size".to_owned(),
@@ -599,20 +618,30 @@ impl MailImapServer {
                     Some(&message_id.mailbox),
                     &issues,
                 );
-                return Ok(serde_json::json!({
-                    "status": "failed",
-                    "issues": issues,
-                    "account_id": message_id.account_id,
-                    "message_id": encoded_message_id,
-                    "message_uri": build_message_uri(&message_id.account_id, &message_id.mailbox, message_id.uidvalidity, message_id.uid),
-                    "message_raw_uri": build_message_raw_uri(&message_id.account_id, &message_id.mailbox, message_id.uidvalidity, message_id.uid),
-                    "total_size_bytes": total_size_bytes,
-                    "returned_bytes": 0,
-                    "offset_bytes": input.offset_bytes,
-                    "truncated": false,
-                    "raw_source_base64": serde_json::Value::Null,
-                    "raw_source_encoding": serde_json::Value::Null,
-                }));
+                return Ok(GetMessageRawData {
+                    status: "failed".to_owned(),
+                    issues,
+                    account_id: message_id.account_id.clone(),
+                    message_id: encoded_message_id.clone(),
+                    message_uri: build_message_uri(
+                        &message_id.account_id,
+                        &message_id.mailbox,
+                        message_id.uidvalidity,
+                        message_id.uid,
+                    ),
+                    message_raw_uri: build_message_raw_uri(
+                        &message_id.account_id,
+                        &message_id.mailbox,
+                        message_id.uidvalidity,
+                        message_id.uid,
+                    ),
+                    total_size_bytes,
+                    returned_bytes: 0,
+                    offset_bytes: input.offset_bytes,
+                    truncated: false,
+                    raw_source_base64: None,
+                    raw_source_encoding: None,
+                });
             }
         };
         let truncated = input.offset_bytes.saturating_add(raw.len()) < total_size_bytes;
@@ -625,20 +654,30 @@ impl MailImapServer {
             &issues,
         );
 
-        Ok(serde_json::json!({
-            "status": "ok",
-            "issues": issues,
-            "account_id": message_id.account_id,
-            "message_id": encoded_message_id,
-            "message_uri": build_message_uri(&message_id.account_id, &message_id.mailbox, message_id.uidvalidity, message_id.uid),
-            "message_raw_uri": build_message_raw_uri(&message_id.account_id, &message_id.mailbox, message_id.uidvalidity, message_id.uid),
-            "total_size_bytes": total_size_bytes,
-            "returned_bytes": raw.len(),
-            "offset_bytes": input.offset_bytes,
-            "truncated": truncated,
-            "raw_source_base64": base64::engine::general_purpose::STANDARD.encode(raw),
-            "raw_source_encoding": "base64",
-        }))
+        Ok(GetMessageRawData {
+            status: "ok".to_owned(),
+            issues,
+            account_id: message_id.account_id.clone(),
+            message_id: encoded_message_id,
+            message_uri: build_message_uri(
+                &message_id.account_id,
+                &message_id.mailbox,
+                message_id.uidvalidity,
+                message_id.uid,
+            ),
+            message_raw_uri: build_message_raw_uri(
+                &message_id.account_id,
+                &message_id.mailbox,
+                message_id.uidvalidity,
+                message_id.uid,
+            ),
+            total_size_bytes,
+            returned_bytes: raw.len(),
+            offset_bytes: input.offset_bytes,
+            truncated,
+            raw_source_base64: Some(base64::engine::general_purpose::STANDARD.encode(raw)),
+            raw_source_encoding: Some("base64".to_owned()),
+        })
     }
 }
 

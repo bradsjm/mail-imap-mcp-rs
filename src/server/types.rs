@@ -4,13 +4,29 @@ use std::time::Instant;
 use chrono::Utc;
 use rmcp::Json;
 use rmcp::model::ErrorData;
+use schemars::JsonSchema;
 use tracing::{error, warn};
 
 use crate::errors::{AppError, AppResult};
 use crate::message_id::MessageId;
-use crate::models::{MailboxInfo, MessageSummary, Meta, ToolEnvelope};
+use crate::models::{AccountInfo, MailboxInfo, MessageDetail, MessageSummary, Meta, ToolEnvelope};
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub(super) struct ListAccountsData {
+    pub(super) accounts: Vec<AccountInfo>,
+    pub(super) next_action: NextAction,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub(super) struct ListMailboxesData {
+    pub(super) status: String,
+    pub(super) issues: Vec<ToolIssue>,
+    pub(super) next_action: NextAction,
+    pub(super) account_id: String,
+    pub(super) mailboxes: Vec<MailboxInfo>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 pub(super) struct SearchResultData {
     pub(super) status: String,
     pub(super) issues: Vec<ToolIssue>,
@@ -26,14 +42,38 @@ pub(super) struct SearchResultData {
     pub(super) has_more: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub(super) struct GetMessageData {
+    pub(super) status: String,
+    pub(super) issues: Vec<ToolIssue>,
+    pub(super) account_id: String,
+    pub(super) message: Option<MessageDetail>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub(super) struct GetMessageRawData {
+    pub(super) status: String,
+    pub(super) issues: Vec<ToolIssue>,
+    pub(super) account_id: String,
+    pub(super) message_id: String,
+    pub(super) message_uri: String,
+    pub(super) message_raw_uri: String,
+    pub(super) total_size_bytes: usize,
+    pub(super) returned_bytes: usize,
+    pub(super) offset_bytes: usize,
+    pub(super) truncated: bool,
+    pub(super) raw_source_base64: Option<String>,
+    pub(super) raw_source_encoding: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 pub(super) struct NextAction {
     pub(super) instruction: String,
     pub(super) tool: String,
     pub(super) arguments: serde_json::Value,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
 pub(super) struct ToolIssue {
     pub(super) code: String,
     pub(super) stage: String,
@@ -82,7 +122,7 @@ pub(super) struct SummaryBuildResult {
     pub(super) failed: usize,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 pub(super) struct MessageMutationResult {
     pub(super) message_id: String,
     pub(super) status: String,
@@ -93,7 +133,21 @@ pub(super) struct MessageMutationResult {
     pub(super) new_message_id: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub(super) struct BulkMessageOperationData {
+    pub(super) status: String,
+    pub(super) issues: Vec<ToolIssue>,
+    pub(super) account_id: String,
+    pub(super) action: Option<String>,
+    pub(super) operation: Option<String>,
+    pub(super) matched: usize,
+    pub(super) attempted: usize,
+    pub(super) succeeded: usize,
+    pub(super) failed: usize,
+    pub(super) results: Vec<MessageMutationResult>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 pub(super) struct MailboxManagementResult {
     pub(super) status: String,
     pub(super) issues: Vec<ToolIssue>,
@@ -101,6 +155,37 @@ pub(super) struct MailboxManagementResult {
     pub(super) action: String,
     pub(super) mailbox: String,
     pub(super) destination_mailbox: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub(super) struct OperationMetadata {
+    pub(super) operation_id: String,
+    pub(super) kind: String,
+    pub(super) state: String,
+    pub(super) done: bool,
+    pub(super) cancel_supported: bool,
+    pub(super) created_at: String,
+    pub(super) started_at: Option<String>,
+    pub(super) finished_at: Option<String>,
+    pub(super) progress: OperationProgress,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub(super) enum OperationResultData {
+    BulkMessage(BulkMessageOperationData),
+    MailboxManagement(MailboxManagementResult),
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub(super) struct OperationStatusData {
+    pub(super) status: String,
+    pub(super) issues: Vec<ToolIssue>,
+    pub(super) operation: OperationMetadata,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) result: Option<OperationResultData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) next_action: Option<NextAction>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,7 +273,7 @@ impl OperationState {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 pub(super) struct OperationProgress {
     pub(super) total_units: usize,
     pub(super) completed_units: usize,
@@ -223,7 +308,7 @@ pub(super) struct StoredOperation {
     pub(super) worker_started: bool,
     pub(super) progress: OperationProgress,
     pub(super) issues: Vec<ToolIssue>,
-    pub(super) result: Option<serde_json::Value>,
+    pub(super) result: Option<OperationResultData>,
     pub(super) spec: StoredOperationSpec,
 }
 
@@ -500,13 +585,7 @@ where
     }
 }
 
-pub(super) fn serialization_error(error: serde_json::Error) -> AppError {
-    AppError::Internal(format!("serialization failure: {error}"))
-}
-
-pub(super) fn operation_summary(noun: &str, data: &serde_json::Value) -> String {
-    let status = data["status"].as_str().unwrap_or("running");
-    let kind = data["operation"]["kind"].as_str().unwrap_or(noun);
+pub(super) fn operation_summary(status: &str, kind: &str) -> String {
     let label = kind.strip_prefix("imap_").unwrap_or(kind);
     match status {
         "accepted" => format!("{label} accepted"),

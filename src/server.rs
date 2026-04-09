@@ -22,7 +22,10 @@ use crate::models::{
 };
 use crate::pagination::CursorStore;
 
-use self::types::{StoredOperation, finalize_tool, operation_summary};
+use self::types::{
+    GetMessageData, GetMessageRawData, ListAccountsData, ListMailboxesData, OperationStatusData,
+    SearchResultData, StoredOperation, finalize_tool, operation_summary,
+};
 
 /// Maximum messages per search result page.
 const MAX_SEARCH_LIMIT: usize = 50;
@@ -63,7 +66,7 @@ impl MailImapServer {
     )]
     async fn list_accounts(
         &self,
-    ) -> Result<Json<crate::models::ToolEnvelope<serde_json::Value>>, ErrorData> {
+    ) -> Result<Json<crate::models::ToolEnvelope<ListAccountsData>>, ErrorData> {
         let started = Instant::now();
         let accounts = self
             .config
@@ -80,10 +83,10 @@ impl MailImapServer {
             .first()
             .map(|account| account.account_id.clone())
             .unwrap_or_else(|| "default".to_owned());
-        let data = serde_json::json!({
-            "accounts": accounts,
-            "next_action": types::next_action_list_mailboxes(&next_account_id),
-        });
+        let data = ListAccountsData {
+            accounts,
+            next_action: types::next_action_list_mailboxes(&next_account_id),
+        };
         finalize_tool(
             started,
             "imap_list_accounts",
@@ -104,20 +107,14 @@ impl MailImapServer {
     async fn list_mailboxes(
         &self,
         Parameters(input): Parameters<AccountOnlyInput>,
-    ) -> Result<Json<crate::models::ToolEnvelope<serde_json::Value>>, ErrorData> {
+    ) -> Result<Json<crate::models::ToolEnvelope<ListMailboxesData>>, ErrorData> {
         let started = Instant::now();
         finalize_tool(
             started,
             "imap_list_mailboxes",
-            self.list_mailboxes_impl(input).await.map(|data| {
-                (
-                    format!(
-                        "{} mailbox(es)",
-                        data["mailboxes"].as_array().map_or(0, Vec::len)
-                    ),
-                    data,
-                )
-            }),
+            self.list_mailboxes_impl(input)
+                .await
+                .map(|data| (format!("{} mailbox(es)", data.mailboxes.len()), data)),
         )
     }
 
@@ -128,15 +125,12 @@ impl MailImapServer {
     async fn search_messages(
         &self,
         Parameters(input): Parameters<SearchMessagesInput>,
-    ) -> Result<Json<crate::models::ToolEnvelope<serde_json::Value>>, ErrorData> {
+    ) -> Result<Json<crate::models::ToolEnvelope<SearchResultData>>, ErrorData> {
         let started = Instant::now();
-        let result = self.search_messages_impl(input).await.and_then(|data| {
-            let summary = format!("{} message(s) returned", data.messages.len());
-            let serialized = serde_json::to_value(data).map_err(|error| {
-                crate::errors::AppError::Internal(format!("serialization failure: {error}"))
-            })?;
-            Ok((summary, serialized))
-        });
+        let result = self
+            .search_messages_impl(input)
+            .await
+            .map(|data| (format!("{} message(s) returned", data.messages.len()), data));
         finalize_tool(started, "imap_search_messages", result)
     }
 
@@ -144,7 +138,7 @@ impl MailImapServer {
     async fn get_message(
         &self,
         Parameters(input): Parameters<GetMessageInput>,
-    ) -> Result<Json<crate::models::ToolEnvelope<serde_json::Value>>, ErrorData> {
+    ) -> Result<Json<crate::models::ToolEnvelope<GetMessageData>>, ErrorData> {
         let started = Instant::now();
         finalize_tool(
             started,
@@ -162,7 +156,7 @@ impl MailImapServer {
     async fn get_message_raw(
         &self,
         Parameters(input): Parameters<GetMessageRawInput>,
-    ) -> Result<Json<crate::models::ToolEnvelope<serde_json::Value>>, ErrorData> {
+    ) -> Result<Json<crate::models::ToolEnvelope<GetMessageRawData>>, ErrorData> {
         let started = Instant::now();
         finalize_tool(
             started,
@@ -180,14 +174,14 @@ impl MailImapServer {
     async fn apply_to_messages(
         &self,
         Parameters(input): Parameters<ApplyToMessagesInput>,
-    ) -> Result<Json<crate::models::ToolEnvelope<serde_json::Value>>, ErrorData> {
+    ) -> Result<Json<crate::models::ToolEnvelope<OperationStatusData>>, ErrorData> {
         let started = Instant::now();
         finalize_tool(
             started,
             "imap_apply_to_messages",
             self.apply_to_messages_impl(input)
                 .await
-                .map(|data| (operation_summary("apply_to_messages", &data), data)),
+                .map(|data| (operation_summary(&data.status, &data.operation.kind), data)),
         )
     }
 
@@ -198,14 +192,14 @@ impl MailImapServer {
     async fn update_message_flags(
         &self,
         Parameters(input): Parameters<UpdateMessageFlagsInput>,
-    ) -> Result<Json<crate::models::ToolEnvelope<serde_json::Value>>, ErrorData> {
+    ) -> Result<Json<crate::models::ToolEnvelope<OperationStatusData>>, ErrorData> {
         let started = Instant::now();
         finalize_tool(
             started,
             "imap_update_message_flags",
             self.update_message_flags_impl(input)
                 .await
-                .map(|data| (operation_summary("update_message_flags", &data), data)),
+                .map(|data| (operation_summary(&data.status, &data.operation.kind), data)),
         )
     }
 
@@ -216,14 +210,14 @@ impl MailImapServer {
     async fn manage_mailbox(
         &self,
         Parameters(input): Parameters<ManageMailboxInput>,
-    ) -> Result<Json<crate::models::ToolEnvelope<serde_json::Value>>, ErrorData> {
+    ) -> Result<Json<crate::models::ToolEnvelope<OperationStatusData>>, ErrorData> {
         let started = Instant::now();
         finalize_tool(
             started,
             "imap_manage_mailbox",
             self.manage_mailbox_impl(input)
                 .await
-                .map(|data| (operation_summary("manage_mailbox", &data), data)),
+                .map(|data| (operation_summary(&data.status, &data.operation.kind), data)),
         )
     }
 
@@ -234,14 +228,14 @@ impl MailImapServer {
     async fn get_operation(
         &self,
         Parameters(input): Parameters<OperationIdInput>,
-    ) -> Result<Json<crate::models::ToolEnvelope<serde_json::Value>>, ErrorData> {
+    ) -> Result<Json<crate::models::ToolEnvelope<OperationStatusData>>, ErrorData> {
         let started = Instant::now();
         finalize_tool(
             started,
             "imap_get_operation",
             self.get_operation_impl(input)
                 .await
-                .map(|data| (operation_summary("operation", &data), data)),
+                .map(|data| (operation_summary(&data.status, &data.operation.kind), data)),
         )
     }
 
@@ -252,14 +246,14 @@ impl MailImapServer {
     async fn cancel_operation(
         &self,
         Parameters(input): Parameters<OperationIdInput>,
-    ) -> Result<Json<crate::models::ToolEnvelope<serde_json::Value>>, ErrorData> {
+    ) -> Result<Json<crate::models::ToolEnvelope<OperationStatusData>>, ErrorData> {
         let started = Instant::now();
         finalize_tool(
             started,
             "imap_cancel_operation",
             self.cancel_operation_impl(input)
                 .await
-                .map(|data| (operation_summary("operation", &data), data)),
+                .map(|data| (operation_summary(&data.status, &data.operation.kind), data)),
         )
     }
 }
@@ -277,9 +271,15 @@ impl ServerHandler for MailImapServer {
 mod tests {
     use std::collections::BTreeMap;
 
+    use rmcp::handler::server::tool::schema_for_output;
+
     use super::*;
-    use crate::models::{OperationIdInput, validate_client_safe_input_schema};
-    use crate::server::types::{ManageMailboxOperation, OperationState, StoredOperationSpec};
+    use crate::models::{OperationIdInput, ToolEnvelope, validate_client_safe_input_schema};
+    use crate::server::types::{
+        GetMessageData, GetMessageRawData, ListAccountsData, ListMailboxesData,
+        ManageMailboxOperation, OperationState, OperationStatusData, SearchResultData,
+        StoredOperationSpec,
+    };
 
     #[test]
     fn all_published_tool_input_schemas_are_client_safe() {
@@ -289,6 +289,82 @@ mod tests {
             validate_client_safe_input_schema(&schema).unwrap_or_else(|error| {
                 panic!("tool {} published unsafe schema: {error}", tool.name)
             });
+        }
+    }
+
+    #[test]
+    fn all_tools_publish_output_schemas() {
+        let server = MailImapServer::new(schema_test_server_config());
+        for tool in server.tool_router.list_all() {
+            assert!(
+                tool.output_schema.is_some(),
+                "tool {} missing output_schema",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn tool_output_schemas_match_concrete_envelope_types() {
+        let server = MailImapServer::new(schema_test_server_config());
+        let expected = [
+            (
+                "imap_list_accounts",
+                schema_for_output::<ToolEnvelope<ListAccountsData>>().expect("valid schema"),
+            ),
+            (
+                "imap_list_mailboxes",
+                schema_for_output::<ToolEnvelope<ListMailboxesData>>().expect("valid schema"),
+            ),
+            (
+                "imap_search_messages",
+                schema_for_output::<ToolEnvelope<SearchResultData>>().expect("valid schema"),
+            ),
+            (
+                "imap_get_message",
+                schema_for_output::<ToolEnvelope<GetMessageData>>().expect("valid schema"),
+            ),
+            (
+                "imap_get_message_raw",
+                schema_for_output::<ToolEnvelope<GetMessageRawData>>().expect("valid schema"),
+            ),
+            (
+                "imap_apply_to_messages",
+                schema_for_output::<ToolEnvelope<OperationStatusData>>().expect("valid schema"),
+            ),
+            (
+                "imap_update_message_flags",
+                schema_for_output::<ToolEnvelope<OperationStatusData>>().expect("valid schema"),
+            ),
+            (
+                "imap_manage_mailbox",
+                schema_for_output::<ToolEnvelope<OperationStatusData>>().expect("valid schema"),
+            ),
+            (
+                "imap_get_operation",
+                schema_for_output::<ToolEnvelope<OperationStatusData>>().expect("valid schema"),
+            ),
+            (
+                "imap_cancel_operation",
+                schema_for_output::<ToolEnvelope<OperationStatusData>>().expect("valid schema"),
+            ),
+        ];
+
+        for (name, schema) in expected {
+            let tool = server
+                .tool_router
+                .list_all()
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            assert_eq!(
+                tool.output_schema
+                    .as_ref()
+                    .expect("output schema missing")
+                    .as_ref(),
+                schema.as_ref(),
+                "tool {name} output schema differs from concrete envelope type"
+            );
         }
     }
 
@@ -333,9 +409,16 @@ mod tests {
             .operation_response(&operation_id)
             .await
             .expect("operation response should be available");
-        assert_eq!(response["status"], "running");
-        assert_eq!(response["operation"]["done"], false);
-        assert_eq!(response["next_action"]["tool"], "imap_get_operation");
+        assert_eq!(response.status, "running");
+        assert!(!response.operation.done);
+        assert_eq!(
+            response
+                .next_action
+                .as_ref()
+                .expect("next action should be present")
+                .tool,
+            "imap_get_operation"
+        );
     }
 
     #[tokio::test]
@@ -358,8 +441,8 @@ mod tests {
             })
             .await
             .expect("cancel operation should succeed");
-        assert_eq!(response["operation"]["state"], "cancel_requested");
-        assert_eq!(response["status"], "running");
+        assert_eq!(response.operation.state, "cancel_requested");
+        assert_eq!(response.status, "running");
     }
 
     #[tokio::test]
@@ -391,16 +474,16 @@ mod tests {
             })
             .await
             .expect("operation response should be available");
-        assert_eq!(initial["operation"]["done"], false);
+        assert!(!initial.operation.done);
 
         for _ in 0..20 {
             let response = server
                 .operation_response(&operation_id)
                 .await
                 .expect("operation response should be available");
-            if response["operation"]["done"] == serde_json::Value::Bool(true) {
-                assert_eq!(response["status"], "canceled");
-                assert!(response.get("next_action").is_none());
+            if response.operation.done {
+                assert_eq!(response.status, "canceled");
+                assert!(response.next_action.is_none());
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

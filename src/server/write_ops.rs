@@ -14,13 +14,14 @@ use crate::models::{
 };
 
 use super::types::{
-    ApplyMessagesOperation, FlagUpdateRequest, MailboxAction, MailboxManagementResult,
-    MessageActionInput, MessageMutationGroup, MessageMutationResult, OperationProgress,
-    OperationState, OperationStep, OperationStepOutcome, StoredOperation, StoredOperationSpec,
-    ToolIssue, UpdateFlagsOperation, canceled_tool_issue, destination_mailbox_for_action,
-    flag_operation_name, mailbox_action_display, mailbox_action_stage, message_action_name,
-    next_action_get_operation, next_operation_step, now_utc_string, operation_kind_label,
-    operation_total_units, serialization_error, status_from_issue_and_counts,
+    ApplyMessagesOperation, BulkMessageOperationData, FlagUpdateRequest, MailboxAction,
+    MailboxManagementResult, MessageActionInput, MessageMutationGroup, MessageMutationResult,
+    OperationMetadata, OperationProgress, OperationResultData, OperationState, OperationStatusData,
+    OperationStep, OperationStepOutcome, StoredOperation, StoredOperationSpec, ToolIssue,
+    UpdateFlagsOperation, canceled_tool_issue, destination_mailbox_for_action, flag_operation_name,
+    mailbox_action_display, mailbox_action_stage, message_action_name, next_action_get_operation,
+    next_operation_step, now_utc_string, operation_kind_label, operation_total_units,
+    status_from_issue_and_counts,
 };
 use super::validation::{
     build_flag_update_request, build_mailbox_action, build_message_action, parse_bulk_message_ids,
@@ -43,7 +44,7 @@ impl MailImapServer {
     pub(super) async fn apply_to_messages_impl(
         &self,
         input: ApplyToMessagesInput,
-    ) -> AppResult<serde_json::Value> {
+    ) -> AppResult<OperationStatusData> {
         require_write_enabled(&self.config)?;
         let action = build_message_action(&input)?;
         validate_message_action(&action)?;
@@ -57,7 +58,7 @@ impl MailImapServer {
     pub(super) async fn update_message_flags_impl(
         &self,
         input: UpdateMessageFlagsInput,
-    ) -> AppResult<serde_json::Value> {
+    ) -> AppResult<OperationStatusData> {
         require_write_enabled(&self.config)?;
         let request = build_flag_update_request(&input)?;
         validate_flag_update_request(&request)?;
@@ -71,7 +72,7 @@ impl MailImapServer {
     pub(super) async fn manage_mailbox_impl(
         &self,
         input: ManageMailboxInput,
-    ) -> AppResult<serde_json::Value> {
+    ) -> AppResult<OperationStatusData> {
         require_write_enabled(&self.config)?;
         validate_account_id(&input.account_id)?;
         let action = build_mailbox_action(&input)?;
@@ -84,7 +85,7 @@ impl MailImapServer {
     pub(super) async fn get_operation_impl(
         &self,
         input: OperationIdInput,
-    ) -> AppResult<serde_json::Value> {
+    ) -> AppResult<OperationStatusData> {
         validate_operation_id(&input.operation_id)?;
         self.ensure_operation_worker_running(&input.operation_id)
             .await?;
@@ -94,7 +95,7 @@ impl MailImapServer {
     pub(super) async fn cancel_operation_impl(
         &self,
         input: OperationIdInput,
-    ) -> AppResult<serde_json::Value> {
+    ) -> AppResult<OperationStatusData> {
         validate_operation_id(&input.operation_id)?;
         {
             let mut operations = self.operations.lock().await;
@@ -208,7 +209,7 @@ impl MailImapServer {
     async fn start_write_operation(
         &self,
         spec: StoredOperationSpec,
-    ) -> AppResult<serde_json::Value> {
+    ) -> AppResult<OperationStatusData> {
         let operation_id = self.create_operation(spec).await;
         let deadline = Instant::now() + Duration::from_millis(WRITE_INLINE_BUDGET_MS);
         self.run_operation_until(&operation_id, Some(deadline))
@@ -499,17 +500,16 @@ impl MailImapServer {
                     spec.result = Some(result);
                     spec.completed = true;
                 }
-                serde_json::to_value(spec.result.clone().ok_or_else(|| {
+                OperationResultData::MailboxManagement(spec.result.clone().ok_or_else(|| {
                     AppError::Internal("missing mailbox operation result".to_owned())
                 })?)
-                .map_err(serialization_error)?
             }
         };
 
         operation.state = if was_cancel_requested {
             OperationState::Canceled
         } else {
-            match result["status"].as_str().unwrap_or("failed") {
+            match operation_result_status(&result) {
                 "ok" => OperationState::Ok,
                 "partial" => OperationState::Partial,
                 "failed" => OperationState::Failed,
@@ -521,9 +521,7 @@ impl MailImapServer {
         operation.progress.remaining_units = 0;
         operation.finished_at = Some(now_utc_string());
         operation.worker_started = false;
-        if let Ok(issues) = serde_json::from_value::<Vec<ToolIssue>>(result["issues"].clone()) {
-            operation.issues = issues;
-        }
+        operation.issues = operation_result_issues(&result).to_vec();
         operation.result = Some(result);
         evict_completed_operations(&mut operations, self.config.operation_max_entries);
         Ok(())
@@ -532,7 +530,7 @@ impl MailImapServer {
     pub(super) async fn operation_response(
         &self,
         operation_id: &str,
-    ) -> AppResult<serde_json::Value> {
+    ) -> AppResult<OperationStatusData> {
         let operation = {
             let operations = self.operations.lock().await;
             operations.get(operation_id).cloned().ok_or_else(|| {
@@ -540,27 +538,24 @@ impl MailImapServer {
             })?
         };
 
-        let mut response = serde_json::json!({
-            "status": operation.state.status_label(),
-            "issues": operation.issues,
-            "operation": {
-                "operation_id": operation.operation_id,
-                "kind": operation.kind,
-                "state": operation.state.state_label(),
-                "done": operation.state.is_terminal(),
-                "cancel_supported": operation.cancel_supported,
-                "created_at": operation.created_at,
-                "started_at": operation.started_at,
-                "finished_at": operation.finished_at,
-                "progress": operation.progress,
+        Ok(OperationStatusData {
+            status: operation.state.status_label().to_owned(),
+            issues: operation.issues,
+            operation: OperationMetadata {
+                operation_id: operation.operation_id,
+                kind: operation.kind,
+                state: operation.state.state_label().to_owned(),
+                done: operation.state.is_terminal(),
+                cancel_supported: operation.cancel_supported,
+                created_at: operation.created_at,
+                started_at: operation.started_at,
+                finished_at: operation.finished_at,
+                progress: operation.progress,
             },
-            "result": operation.result.unwrap_or(serde_json::Value::Null),
-        });
-        if !operation.state.is_terminal() {
-            response["next_action"] = serde_json::to_value(next_action_get_operation(operation_id))
-                .map_err(serialization_error)?;
-        }
-        Ok(response)
+            result: operation.result,
+            next_action: (!operation.state.is_terminal())
+                .then(|| next_action_get_operation(operation_id)),
+        })
     }
 
     async fn account_write_lock(&self, account_id: &str) -> Arc<Mutex<()>> {
@@ -654,10 +649,9 @@ impl MailImapServer {
                     });
                     spec.completed = true;
                 }
-                serde_json::to_value(spec.result.clone().ok_or_else(|| {
+                OperationResultData::MailboxManagement(spec.result.clone().ok_or_else(|| {
                     AppError::Internal("missing mailbox operation result".to_owned())
                 })?)
-                .map_err(serialization_error)?
             }
         };
 
@@ -673,11 +667,12 @@ impl MailImapServer {
         operation.progress.remaining_units = 0;
         operation.finished_at = Some(now_utc_string());
         operation.worker_started = false;
-        if let Ok(issues) = serde_json::from_value::<Vec<ToolIssue>>(result["issues"].clone()) {
-            operation.issues = issues;
+        let issues = operation_result_issues(&result);
+        operation.issues = if issues.is_empty() {
+            vec![failure_issue]
         } else {
-            operation.issues = vec![failure_issue];
-        }
+            issues.to_vec()
+        };
         operation.result = Some(result);
         evict_completed_operations(&mut operations, self.config.operation_max_entries);
         Ok(())
@@ -1276,7 +1271,7 @@ fn build_bulk_message_response(
     action: Option<&str>,
     operation: Option<&str>,
     results: Vec<MessageMutationResult>,
-) -> AppResult<serde_json::Value> {
+) -> AppResult<OperationResultData> {
     let matched = results.len();
     let mut issues = Vec::new();
     let mut succeeded = 0usize;
@@ -1288,23 +1283,32 @@ fn build_bulk_message_response(
     }
     let failed = matched.saturating_sub(succeeded);
     let status = status_from_issue_and_counts(&issues, succeeded > 0).to_owned();
-    let mut response = serde_json::json!({
-        "status": status,
-        "issues": issues,
-        "account_id": account_id,
-        "matched": matched,
-        "attempted": matched,
-        "succeeded": succeeded,
-        "failed": failed,
-        "results": results,
-    });
-    if let Some(action) = action {
-        response["action"] = serde_json::Value::String(action.to_owned());
+    Ok(OperationResultData::BulkMessage(BulkMessageOperationData {
+        status,
+        issues,
+        account_id,
+        action: action.map(ToOwned::to_owned),
+        operation: operation.map(ToOwned::to_owned),
+        matched,
+        attempted: matched,
+        succeeded,
+        failed,
+        results,
+    }))
+}
+
+fn operation_result_status(result: &OperationResultData) -> &str {
+    match result {
+        OperationResultData::BulkMessage(result) => result.status.as_str(),
+        OperationResultData::MailboxManagement(result) => result.status.as_str(),
     }
-    if let Some(operation) = operation {
-        response["operation"] = serde_json::Value::String(operation.to_owned());
+}
+
+fn operation_result_issues(result: &OperationResultData) -> &[ToolIssue] {
+    match result {
+        OperationResultData::BulkMessage(result) => &result.issues,
+        OperationResultData::MailboxManagement(result) => &result.issues,
     }
-    Ok(response)
 }
 
 fn append_canceled_message_results(
@@ -1460,7 +1464,8 @@ mod tests {
     use crate::config::ServerConfig;
     use crate::errors::AppError;
     use crate::server::types::{
-        MailboxAction, ManageMailboxOperation, OperationState, StoredOperation, StoredOperationSpec,
+        MailboxAction, MailboxManagementResult, ManageMailboxOperation, OperationResultData,
+        OperationState, StoredOperation, StoredOperationSpec,
     };
 
     fn completed_operation(operation_id: &str, finished_at: &str) -> StoredOperation {
@@ -1475,7 +1480,16 @@ mod tests {
             worker_started: false,
             progress: crate::server::types::OperationProgress::new(1, "ok"),
             issues: Vec::new(),
-            result: Some(serde_json::json!({ "status": "ok", "issues": [] })),
+            result: Some(OperationResultData::MailboxManagement(
+                MailboxManagementResult {
+                    status: "ok".to_owned(),
+                    issues: Vec::new(),
+                    account_id: "default".to_owned(),
+                    action: "create".to_owned(),
+                    mailbox: "Archive".to_owned(),
+                    destination_mailbox: None,
+                },
+            )),
             spec: StoredOperationSpec::ManageMailbox(ManageMailboxOperation {
                 account_id: "default".to_owned(),
                 action: MailboxAction::Create {
