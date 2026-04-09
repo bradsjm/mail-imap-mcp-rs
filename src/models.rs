@@ -131,6 +131,24 @@ pub struct AttachmentInfo {
     pub extracted_text: Option<String>,
 }
 
+/// Requested body content mode for `imap_get_message`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BodyMode {
+    Text,
+    Html,
+    Both,
+}
+
+/// Requested attachment handling mode for `imap_get_message`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentMode {
+    None,
+    Metadata,
+    ExtractText,
+}
+
 /// Full message detail
 ///
 /// Rich representation returned by `imap_get_message`. Includes all headers,
@@ -241,19 +259,19 @@ pub struct GetMessageInput {
     #[serde(default = "default_body_max_chars")]
     #[schemars(range(min = 100, max = 20_000), transform = remove_format)]
     pub body_max_chars: usize,
+    /// Requested body content mode
+    #[serde(default = "default_body_mode")]
+    pub body_mode: BodyMode,
     /// Include headers in response
     #[serde(default = "default_true")]
     pub include_headers: bool,
     /// Include all headers (if `true`, overrides curated header list)
     #[serde(default)]
     pub include_all_headers: bool,
-    /// Include sanitized HTML body
-    #[serde(default)]
-    pub include_html: bool,
-    /// Extract text from PDF attachments
-    #[serde(default)]
-    pub extract_attachment_text: bool,
-    /// Maximum attachment text length (100..50000, requires `extract_attachment_text=true`)
+    /// Requested attachment handling mode
+    #[serde(default = "default_attachment_mode")]
+    pub attachment_mode: AttachmentMode,
+    /// Maximum attachment text length (100..50000, requires `attachment_mode=extract_text`)
     #[schemars(range(min = 100, max = 50_000), transform = remove_format)]
     pub attachment_text_max_chars: Option<usize>,
 }
@@ -269,6 +287,10 @@ pub struct GetMessageRawInput {
     #[serde(default = "default_raw_max_bytes")]
     #[schemars(range(min = 1_024, max = 1_000_000), transform = remove_format)]
     pub max_bytes: usize,
+    /// Starting offset in the raw RFC822 source
+    #[serde(default)]
+    #[schemars(transform = remove_format)]
+    pub offset_bytes: usize,
 }
 
 /// Input: apply a bulk action to explicit messages.
@@ -352,6 +374,14 @@ fn default_limit() -> usize {
 /// 2,000 characters is typically sufficient to understand message content.
 fn default_body_max_chars() -> usize {
     2_000
+}
+
+fn default_body_mode() -> BodyMode {
+    BodyMode::Text
+}
+
+fn default_attachment_mode() -> AttachmentMode {
+    AttachmentMode::Metadata
 }
 
 /// Default value for `max_bytes` in get_message_raw
@@ -544,6 +574,8 @@ mod tests {
             schema_numeric_property(message_props, "attachment_text_max_chars", "maximum"),
             Some(50_000)
         );
+        assert!(message_props.contains_key("body_mode"));
+        assert!(message_props.contains_key("attachment_mode"));
 
         let raw_schema = schema_for_type::<GetMessageRawInput>();
         let raw_props = raw_schema["properties"]
@@ -556,6 +588,12 @@ mod tests {
         assert_eq!(
             schema_numeric_property(raw_props, "max_bytes", "maximum"),
             Some(1_000_000)
+        );
+        assert_eq!(
+            schema_variant_for(raw_props, "offset_bytes")
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str),
+            Some("integer")
         );
 
         let apply_schema = schema_for_type::<ApplyToMessagesInput>();

@@ -5,6 +5,7 @@
 //! across large result sets.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
@@ -44,7 +45,7 @@ pub struct CursorEntry {
     /// Mailbox UIDVALIDITY at time of search
     pub uidvalidity: u32,
     /// All matching UIDs in descending order (newest first)
-    pub uids_desc: Vec<u32>,
+    pub uids_desc: Arc<[u32]>,
     /// Current offset into `uids_desc` (next page starts here)
     pub offset: usize,
     /// Snippet character limit from original search. `None` means snippets are disabled.
@@ -197,7 +198,7 @@ mod tests {
             account_id: "default".to_owned(),
             mailbox: "INBOX".to_owned(),
             uidvalidity: 1,
-            uids_desc: vec![5, 4, 3, 2, 1],
+            uids_desc: vec![5, 4, 3, 2, 1].into(),
             offset: 0,
             snippet_max_chars: None,
             expires_at,

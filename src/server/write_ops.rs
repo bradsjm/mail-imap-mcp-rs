@@ -29,6 +29,16 @@ use super::validation::{
 };
 use super::{MailImapServer, WRITE_INLINE_BUDGET_MS};
 
+#[derive(Default)]
+struct OperationExecutionContext {
+    account_id: Option<String>,
+    session: Option<imap::ImapSession>,
+    selected_mailbox: Option<String>,
+    selected_readonly: Option<bool>,
+    selected_uidvalidity: Option<u32>,
+    supports_move: Option<bool>,
+}
+
 impl MailImapServer {
     pub(super) async fn apply_to_messages_impl(
         &self,
@@ -108,10 +118,6 @@ impl MailImapServer {
         message_ids: Vec<MessageId>,
     ) -> AppResult<StoredOperationSpec> {
         let groups = group_message_ids(&message_ids);
-        if let Some(destination_mailbox) = destination_mailbox_for_action(&action) {
-            self.ensure_mailbox_exists(account_id, destination_mailbox)
-                .await?;
-        }
         for group in &groups {
             if let MessageActionInput::Move {
                 destination_mailbox,
@@ -123,11 +129,14 @@ impl MailImapServer {
                     "destination_mailbox must differ from source mailbox for move".to_owned(),
                 ));
             }
-            self.connect_group_session(account_id, group, false)
-                .await
-                .map(|_| ())
-                .map_err(|(_, error)| error)?;
         }
+        let account = self.config.get_account(account_id)?;
+        let mut session = imap::connect_authenticated(&self.config, account).await?;
+        if let Some(destination_mailbox) = destination_mailbox_for_action(&action) {
+            imap::select_mailbox_readonly(&self.config, &mut session, destination_mailbox).await?;
+        }
+        self.validate_group_uidvalidities(&mut session, &groups, false)
+            .await?;
         Ok(StoredOperationSpec::ApplyMessages(ApplyMessagesOperation {
             account_id: account_id.to_owned(),
             action,
@@ -145,12 +154,10 @@ impl MailImapServer {
         message_ids: Vec<MessageId>,
     ) -> AppResult<StoredOperationSpec> {
         let groups = group_message_ids(&message_ids);
-        for group in &groups {
-            self.connect_group_session(account_id, group, false)
-                .await
-                .map(|_| ())
-                .map_err(|(_, error)| error)?;
-        }
+        let account = self.config.get_account(account_id)?;
+        let mut session = imap::connect_authenticated(&self.config, account).await?;
+        self.validate_group_uidvalidities(&mut session, &groups, false)
+            .await?;
         Ok(StoredOperationSpec::UpdateFlags(UpdateFlagsOperation {
             account_id: account_id.to_owned(),
             request,
@@ -271,6 +278,7 @@ impl MailImapServer {
         operation_id: &str,
         deadline: Option<Instant>,
     ) -> AppResult<()> {
+        let mut execution_ctx = OperationExecutionContext::default();
         loop {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Ok(());
@@ -304,7 +312,7 @@ impl MailImapServer {
                 self.finalize_operation(operation_id).await?;
                 return Ok(());
             }
-            let outcome = self.execute_operation_step(&step).await;
+            let outcome = self.execute_operation_step(&mut execution_ctx, &step).await;
             self.apply_operation_step_outcome(operation_id, outcome)
                 .await?;
         }
@@ -318,7 +326,11 @@ impl MailImapServer {
         Ok(operation.state == OperationState::CancelRequested)
     }
 
-    async fn execute_operation_step(&self, step: &OperationStep) -> OperationStepOutcome {
+    async fn execute_operation_step(
+        &self,
+        execution_ctx: &mut OperationExecutionContext,
+        step: &OperationStep,
+    ) -> OperationStepOutcome {
         match step {
             OperationStep::ApplyMessagesGroup {
                 account_id,
@@ -329,17 +341,28 @@ impl MailImapServer {
                     MessageActionInput::Move {
                         destination_mailbox,
                     } => {
-                        self.execute_move_group(account_id, group, destination_mailbox)
-                            .await
+                        self.execute_move_group(
+                            execution_ctx,
+                            account_id,
+                            group,
+                            destination_mailbox,
+                        )
+                        .await
                     }
                     MessageActionInput::Copy {
                         destination_mailbox,
                     } => {
-                        self.execute_copy_group(account_id, group, destination_mailbox)
-                            .await
+                        self.execute_copy_group(
+                            execution_ctx,
+                            account_id,
+                            group,
+                            destination_mailbox,
+                        )
+                        .await
                     }
                     MessageActionInput::Delete => {
-                        self.execute_delete_group(account_id, group).await
+                        self.execute_delete_group(execution_ctx, account_id, group)
+                            .await
                     }
                 };
                 OperationStepOutcome::MessageResults(results)
@@ -349,12 +372,13 @@ impl MailImapServer {
                 request,
                 group,
             } => OperationStepOutcome::MessageResults(
-                self.execute_flag_update_group(account_id, group, request)
+                self.execute_flag_update_group(execution_ctx, account_id, group, request)
                     .await,
             ),
             OperationStep::ManageMailbox { account_id, action } => {
                 OperationStepOutcome::MailboxResult(
-                    self.execute_manage_mailbox_action(account_id, action).await,
+                    self.execute_manage_mailbox_action(execution_ctx, account_id, action)
+                        .await,
                 )
             }
         }
@@ -539,14 +563,6 @@ impl MailImapServer {
         Ok(response)
     }
 
-    async fn ensure_mailbox_exists(&self, account_id: &str, mailbox: &str) -> AppResult<()> {
-        let account = self.config.get_account(account_id)?;
-        let mut session = imap::connect_authenticated(&self.config, account).await?;
-        imap::select_mailbox_readonly(&self.config, &mut session, mailbox)
-            .await
-            .map(|_| ())
-    }
-
     async fn account_write_lock(&self, account_id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.account_write_locks.lock().await;
         locks
@@ -669,68 +685,64 @@ impl MailImapServer {
 
     async fn execute_manage_mailbox_action(
         &self,
+        execution_ctx: &mut OperationExecutionContext,
         account_id: &str,
         action: &MailboxAction,
     ) -> MailboxManagementResult {
         let (action_name, mailbox, destination_mailbox) = mailbox_action_display(action);
-        let account = match self.config.get_account(account_id) {
-            Ok(account) => account,
-            Err(error) => {
-                return MailboxManagementResult {
-                    status: "failed".to_owned(),
-                    issues: vec![ToolIssue::from_error("account_lookup", &error)],
-                    account_id: account_id.to_owned(),
-                    action: action_name.to_owned(),
-                    mailbox,
-                    destination_mailbox,
-                };
-            }
-        };
-
-        let mut session = match imap::connect_authenticated(&self.config, account).await {
-            Ok(session) => session,
-            Err(error) => {
-                return MailboxManagementResult {
-                    status: "failed".to_owned(),
-                    issues: vec![ToolIssue::from_error("connect_authenticated", &error)],
-                    account_id: account_id.to_owned(),
-                    action: action_name.to_owned(),
-                    mailbox,
-                    destination_mailbox,
-                };
-            }
+        if let Err(error) = self
+            .ensure_execution_session(execution_ctx, account_id)
+            .await
+        {
+            return MailboxManagementResult {
+                status: "failed".to_owned(),
+                issues: vec![ToolIssue::from_error("connect_authenticated", &error)],
+                account_id: account_id.to_owned(),
+                action: action_name.to_owned(),
+                mailbox,
+                destination_mailbox,
+            };
+        }
+        let Some(session) = execution_ctx.session.as_mut() else {
+            return MailboxManagementResult {
+                status: "failed".to_owned(),
+                issues: vec![ToolIssue::from_error(
+                    "connect_authenticated",
+                    &AppError::Internal("execution session unavailable".to_owned()),
+                )],
+                account_id: account_id.to_owned(),
+                action: action_name.to_owned(),
+                mailbox,
+                destination_mailbox,
+            };
         };
 
         let mut issues = Vec::new();
         let operation = match action {
             MailboxAction::Create { mailbox } => {
-                imap::create_mailbox_path(&self.config, &mut session, mailbox).await
+                imap::create_mailbox_path(&self.config, session, mailbox).await
             }
             MailboxAction::Rename {
                 mailbox,
                 destination_mailbox,
-            } => {
-                match imap::create_parent_mailboxes(&self.config, &mut session, destination_mailbox)
-                    .await
-                {
-                    Ok(()) => {
-                        imap::rename_mailbox(
-                            &self.config,
-                            &mut session,
-                            mailbox,
-                            destination_mailbox,
-                        )
-                        .await
-                    }
-                    Err(error) => Err(error),
+            } => match imap::create_parent_mailboxes(&self.config, session, destination_mailbox)
+                .await
+            {
+                Ok(()) => {
+                    imap::rename_mailbox(&self.config, session, mailbox, destination_mailbox).await
                 }
-            }
+                Err(error) => Err(error),
+            },
             MailboxAction::Delete { mailbox } => {
-                imap::delete_mailbox(&self.config, &mut session, mailbox).await
+                imap::delete_mailbox(&self.config, session, mailbox).await
             }
         };
         if let Err(error) = operation {
             issues.push(ToolIssue::from_error(mailbox_action_stage(action), &error));
+        } else {
+            execution_ctx.selected_mailbox = None;
+            execution_ctx.selected_readonly = None;
+            execution_ctx.selected_uidvalidity = None;
         }
 
         let status = status_from_issue_and_counts(&issues, issues.is_empty()).to_owned();
@@ -746,24 +758,36 @@ impl MailImapServer {
 
     async fn execute_copy_group(
         &self,
+        execution_ctx: &mut OperationExecutionContext,
         account_id: &str,
         group: &MessageMutationGroup,
         destination_mailbox: &str,
     ) -> Vec<MessageMutationResult> {
         let uid_set = build_uid_set(&group.entries);
-        let mut session = match self.connect_group_session(account_id, group, false).await {
-            Ok(session) => session,
-            Err((stage, error)) => {
-                return failed_group_results(group, stage, &error, Some(destination_mailbox), None);
-            }
+        if let Err(error) = self
+            .ensure_selected_group(execution_ctx, account_id, group, false)
+            .await
+        {
+            return failed_group_results(
+                group,
+                "select_mailbox_readwrite",
+                &error,
+                Some(destination_mailbox),
+                None,
+            );
+        }
+        let Some(session) = execution_ctx.session.as_mut() else {
+            return failed_group_results(
+                group,
+                "connect_authenticated",
+                &AppError::Internal("execution session unavailable".to_owned()),
+                Some(destination_mailbox),
+                None,
+            );
         };
-        let result = imap::uid_copy_sequence(
-            &self.config,
-            &mut session,
-            uid_set.as_str(),
-            destination_mailbox,
-        )
-        .await;
+        let result =
+            imap::uid_copy_sequence(&self.config, session, uid_set.as_str(), destination_mailbox)
+                .await;
         let issues = result
             .err()
             .map(|error| group_issues(group, "uid_copy", &error))
@@ -773,20 +797,26 @@ impl MailImapServer {
 
     async fn execute_move_group(
         &self,
+        execution_ctx: &mut OperationExecutionContext,
         account_id: &str,
         group: &MessageMutationGroup,
         destination_mailbox: &str,
     ) -> Vec<MessageMutationResult> {
         let uid_set = build_uid_set(&group.entries);
-        let mut session = match self.connect_group_session(account_id, group, false).await {
-            Ok(session) => session,
-            Err((stage, error)) => {
-                return failed_group_results(group, stage, &error, Some(destination_mailbox), None);
-            }
-        };
-
-        let caps = match imap::capabilities(&self.config, &mut session).await {
-            Ok(caps) => caps,
+        if let Err(error) = self
+            .ensure_selected_group(execution_ctx, account_id, group, false)
+            .await
+        {
+            return failed_group_results(
+                group,
+                "select_mailbox_readwrite",
+                &error,
+                Some(destination_mailbox),
+                None,
+            );
+        }
+        let supports_move = match self.supports_move(execution_ctx, account_id).await {
+            Ok(supports_move) => supports_move,
             Err(error) => {
                 return failed_group_results(
                     group,
@@ -797,11 +827,20 @@ impl MailImapServer {
                 );
             }
         };
+        let Some(session) = execution_ctx.session.as_mut() else {
+            return failed_group_results(
+                group,
+                "connect_authenticated",
+                &AppError::Internal("execution session unavailable".to_owned()),
+                Some(destination_mailbox),
+                None,
+            );
+        };
 
-        if caps.has_str("MOVE") {
+        if supports_move {
             let issues = imap::uid_move_sequence(
                 &self.config,
-                &mut session,
+                session,
                 uid_set.as_str(),
                 destination_mailbox,
             )
@@ -812,13 +851,9 @@ impl MailImapServer {
             return finalize_group_results(group, issues, Some(destination_mailbox), None, true);
         }
 
-        if let Err(error) = imap::uid_copy_sequence(
-            &self.config,
-            &mut session,
-            uid_set.as_str(),
-            destination_mailbox,
-        )
-        .await
+        if let Err(error) =
+            imap::uid_copy_sequence(&self.config, session, uid_set.as_str(), destination_mailbox)
+                .await
         {
             return finalize_group_results(
                 group,
@@ -831,7 +866,7 @@ impl MailImapServer {
 
         if let Err(error) = imap::uid_store_sequence(
             &self.config,
-            &mut session,
+            session,
             uid_set.as_str(),
             "+FLAGS.SILENT (\\Deleted)",
         )
@@ -846,7 +881,7 @@ impl MailImapServer {
             );
         }
 
-        let issues = imap::uid_expunge_sequence(&self.config, &mut session, uid_set.as_str())
+        let issues = imap::uid_expunge_sequence(&self.config, session, uid_set.as_str())
             .await
             .err()
             .map(|error| group_issues(group, "uid_expunge", &error))
@@ -856,18 +891,30 @@ impl MailImapServer {
 
     async fn execute_delete_group(
         &self,
+        execution_ctx: &mut OperationExecutionContext,
         account_id: &str,
         group: &MessageMutationGroup,
     ) -> Vec<MessageMutationResult> {
         let uid_set = build_uid_set(&group.entries);
-        let mut session = match self.connect_group_session(account_id, group, false).await {
-            Ok(session) => session,
-            Err((stage, error)) => return failed_group_results(group, stage, &error, None, None),
+        if let Err(error) = self
+            .ensure_selected_group(execution_ctx, account_id, group, false)
+            .await
+        {
+            return failed_group_results(group, "select_mailbox_readwrite", &error, None, None);
+        }
+        let Some(session) = execution_ctx.session.as_mut() else {
+            return failed_group_results(
+                group,
+                "connect_authenticated",
+                &AppError::Internal("execution session unavailable".to_owned()),
+                None,
+                None,
+            );
         };
 
         if let Err(error) = imap::uid_store_sequence(
             &self.config,
-            &mut session,
+            session,
             uid_set.as_str(),
             "+FLAGS.SILENT (\\Deleted)",
         )
@@ -882,7 +929,7 @@ impl MailImapServer {
             );
         }
 
-        let issues = imap::uid_expunge_sequence(&self.config, &mut session, uid_set.as_str())
+        let issues = imap::uid_expunge_sequence(&self.config, session, uid_set.as_str())
             .await
             .err()
             .map(|error| group_issues(group, "uid_expunge", &error))
@@ -892,14 +939,26 @@ impl MailImapServer {
 
     async fn execute_flag_update_group(
         &self,
+        execution_ctx: &mut OperationExecutionContext,
         account_id: &str,
         group: &MessageMutationGroup,
         request: &FlagUpdateRequest,
     ) -> Vec<MessageMutationResult> {
         let uid_set = build_uid_set(&group.entries);
-        let mut session = match self.connect_group_session(account_id, group, false).await {
-            Ok(session) => session,
-            Err((stage, error)) => return failed_group_results(group, stage, &error, None, None),
+        if let Err(error) = self
+            .ensure_selected_group(execution_ctx, account_id, group, false)
+            .await
+        {
+            return failed_group_results(group, "select_mailbox_readwrite", &error, None, None);
+        }
+        let Some(session) = execution_ctx.session.as_mut() else {
+            return failed_group_results(
+                group,
+                "connect_authenticated",
+                &AppError::Internal("execution session unavailable".to_owned()),
+                None,
+                None,
+            );
         };
 
         let query = match request.operation {
@@ -915,7 +974,7 @@ impl MailImapServer {
         };
 
         if let Err(error) =
-            imap::uid_store_sequence(&self.config, &mut session, uid_set.as_str(), &query).await
+            imap::uid_store_sequence(&self.config, session, uid_set.as_str(), &query).await
         {
             return finalize_group_results(
                 group,
@@ -926,19 +985,14 @@ impl MailImapServer {
             );
         }
 
-        let fetched_flags = match imap::fetch_flags_by_uid_set(
-            &self.config,
-            &mut session,
-            uid_set.as_str(),
-        )
-        .await
-        {
-            Ok(flags) => Some(flags),
-            Err(error) => {
-                let issues = group_issues(group, "fetch_flags", &error);
-                return finalize_group_results(group, issues, None, None, false);
-            }
-        };
+        let fetched_flags =
+            match imap::fetch_flags_by_uid_set(&self.config, session, uid_set.as_str()).await {
+                Ok(flags) => Some(flags),
+                Err(error) => {
+                    let issues = group_issues(group, "fetch_flags", &error);
+                    return finalize_group_results(group, issues, None, None, false);
+                }
+            };
 
         let mut results = Vec::with_capacity(group.entries.len());
         for message_id in &group.entries {
@@ -970,40 +1024,126 @@ impl MailImapServer {
         results
     }
 
-    async fn connect_group_session(
+    async fn validate_group_uidvalidities(
         &self,
+        session: &mut imap::ImapSession,
+        groups: &[MessageMutationGroup],
+        readonly: bool,
+    ) -> AppResult<()> {
+        let mut selected_mailbox: Option<String> = None;
+        let mut selected_uidvalidity: Option<u32> = None;
+        for group in groups {
+            let current_uidvalidity = if selected_mailbox.as_deref() == Some(group.mailbox.as_str())
+            {
+                cached_uidvalidity(&selected_uidvalidity)?
+            } else if readonly {
+                let uidvalidity =
+                    imap::select_mailbox_readonly(&self.config, session, &group.mailbox).await?;
+                selected_mailbox = Some(group.mailbox.clone());
+                selected_uidvalidity = Some(uidvalidity);
+                uidvalidity
+            } else {
+                let uidvalidity =
+                    imap::select_mailbox_readwrite(&self.config, session, &group.mailbox).await?;
+                selected_mailbox = Some(group.mailbox.clone());
+                selected_uidvalidity = Some(uidvalidity);
+                uidvalidity
+            };
+            if current_uidvalidity != group.uidvalidity {
+                return Err(AppError::Conflict(
+                    "message uidvalidity no longer matches mailbox".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_execution_session(
+        &self,
+        execution_ctx: &mut OperationExecutionContext,
+        account_id: &str,
+    ) -> AppResult<()> {
+        if execution_ctx.account_id.as_deref() == Some(account_id)
+            && execution_ctx.session.is_some()
+        {
+            return Ok(());
+        }
+
+        let account = self.config.get_account(account_id)?;
+        let session = imap::connect_authenticated(&self.config, account).await?;
+        execution_ctx.account_id = Some(account_id.to_owned());
+        execution_ctx.session = Some(session);
+        execution_ctx.selected_mailbox = None;
+        execution_ctx.selected_readonly = None;
+        execution_ctx.selected_uidvalidity = None;
+        execution_ctx.supports_move = None;
+        Ok(())
+    }
+
+    async fn ensure_selected_group(
+        &self,
+        execution_ctx: &mut OperationExecutionContext,
         account_id: &str,
         group: &MessageMutationGroup,
         readonly: bool,
-    ) -> Result<imap::ImapSession, (&'static str, AppError)> {
-        let account = self
-            .config
-            .get_account(account_id)
-            .map_err(|error| ("account_lookup", error))?;
-        let mut session = imap::connect_authenticated(&self.config, account)
-            .await
-            .map_err(|error| ("connect_authenticated", error))?;
+    ) -> AppResult<()> {
+        self.ensure_execution_session(execution_ctx, account_id)
+            .await?;
+        if execution_ctx.selected_mailbox.as_deref() == Some(group.mailbox.as_str())
+            && execution_ctx.selected_readonly == Some(readonly)
+            && execution_ctx.selected_uidvalidity == Some(group.uidvalidity)
+        {
+            return Ok(());
+        }
+
+        let session = execution_ctx
+            .session
+            .as_mut()
+            .ok_or_else(|| AppError::Internal("execution session unavailable".to_owned()))?;
         let current_uidvalidity = if readonly {
-            imap::select_mailbox_readonly(&self.config, &mut session, &group.mailbox)
-                .await
-                .map_err(|error| ("select_mailbox_readonly", error))?
+            imap::select_mailbox_readonly(&self.config, session, &group.mailbox).await?
         } else {
-            imap::select_mailbox_readwrite(&self.config, &mut session, &group.mailbox)
-                .await
-                .map_err(|error| ("select_mailbox_readwrite", error))?
+            imap::select_mailbox_readwrite(&self.config, session, &group.mailbox).await?
         };
         if current_uidvalidity != group.uidvalidity {
-            return Err((
-                if readonly {
-                    "select_mailbox_readonly"
-                } else {
-                    "select_mailbox_readwrite"
-                },
-                AppError::Conflict("message uidvalidity no longer matches mailbox".to_owned()),
+            return Err(AppError::Conflict(
+                "message uidvalidity no longer matches mailbox".to_owned(),
             ));
         }
-        Ok(session)
+        execution_ctx.selected_mailbox = Some(group.mailbox.clone());
+        execution_ctx.selected_readonly = Some(readonly);
+        execution_ctx.selected_uidvalidity = Some(current_uidvalidity);
+        Ok(())
     }
+
+    async fn supports_move(
+        &self,
+        execution_ctx: &mut OperationExecutionContext,
+        account_id: &str,
+    ) -> AppResult<bool> {
+        self.ensure_execution_session(execution_ctx, account_id)
+            .await?;
+        if let Some(supports_move) = execution_ctx.supports_move {
+            return Ok(supports_move);
+        }
+        let session = execution_ctx
+            .session
+            .as_mut()
+            .ok_or_else(|| AppError::Internal("execution session unavailable".to_owned()))?;
+        let supports_move = imap::capabilities(&self.config, session)
+            .await?
+            .has_str("MOVE");
+        execution_ctx.supports_move = Some(supports_move);
+        Ok(supports_move)
+    }
+}
+
+fn cached_uidvalidity(selected_uidvalidity: &Option<u32>) -> AppResult<u32> {
+    selected_uidvalidity.ok_or_else(|| {
+        AppError::Internal(
+            "selected mailbox uidvalidity cache missing during validation".to_owned(),
+        )
+    })
 }
 
 fn evict_completed_operations(
@@ -1316,8 +1456,9 @@ fn order_group_results(
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::evict_completed_operations;
+    use super::{cached_uidvalidity, evict_completed_operations};
     use crate::config::ServerConfig;
+    use crate::errors::AppError;
     use crate::server::types::{
         MailboxAction, ManageMailboxOperation, OperationState, StoredOperation, StoredOperationSpec,
     };
@@ -1383,5 +1524,11 @@ mod tests {
             operation_max_entries: 256,
         };
         assert_eq!(config.operation_max_entries, 256);
+    }
+
+    #[test]
+    fn cached_uidvalidity_requires_server_selected_value() {
+        let error = cached_uidvalidity(&None).expect_err("missing cached uidvalidity must fail");
+        assert!(matches!(error, AppError::Internal(_)));
     }
 }

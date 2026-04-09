@@ -22,6 +22,12 @@ use crate::config::{AccountConfig, ServerConfig};
 use crate::errors::{AppError, AppResult};
 use crate::mailbox_codec::encode_mailbox_name_for_command;
 
+#[derive(Debug, Clone)]
+pub struct HeaderAndFlags {
+    pub header_bytes: Vec<u8>,
+    pub flags: Vec<String>,
+}
+
 /// Type alias for authenticated IMAP session over TLS
 ///
 /// Wraps the TLS stream type to simplify signatures throughout the codebase.
@@ -395,6 +401,7 @@ pub async fn fetch_raw_message(
 ///
 /// Returns standard headers (Date, From, To, CC, Subject) and message flags.
 /// Uses `BODY.PEEK` to avoid marking the message as read.
+#[allow(dead_code)]
 pub async fn fetch_headers_and_flags(
     server: &ServerConfig,
     session: &mut ImapSession,
@@ -413,6 +420,46 @@ pub async fn fetch_headers_and_flags(
         .ok_or_else(|| AppError::Internal("message headers not available".to_owned()))?
         .to_vec();
     Ok((header_bytes, flags_to_strings(&fetch)))
+}
+
+/// Fetch curated headers and flags for a UID set in one round trip.
+pub async fn fetch_headers_and_flags_by_uid_set(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid_set: &str,
+) -> AppResult<HashMap<u32, HeaderAndFlags>> {
+    let stream = timeout(
+        socket_timeout(server),
+        session.uid_fetch(
+            uid_set,
+            "(UID FLAGS BODY.PEEK[HEADER.FIELDS (DATE FROM TO CC SUBJECT)])",
+        ),
+    )
+    .await
+    .map_err(|_| AppError::Timeout("UID FETCH timed out".to_owned()))
+    .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid fetch failed: {e}"))))?;
+    let fetches: Vec<Fetch> = timeout(socket_timeout(server), stream.try_collect())
+        .await
+        .map_err(|_| AppError::Timeout("UID FETCH stream timed out".to_owned()))
+        .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid fetch stream failed: {e}"))))?;
+
+    let mut by_uid = HashMap::new();
+    for fetch in fetches {
+        let Some(uid) = fetch.uid else {
+            continue;
+        };
+        let Some(header_bytes) = fetch.header().or_else(|| fetch.body()).map(|v| v.to_vec()) else {
+            continue;
+        };
+        by_uid.insert(
+            uid,
+            HeaderAndFlags {
+                header_bytes,
+                flags: flags_to_strings(&fetch),
+            },
+        );
+    }
+    Ok(by_uid)
 }
 
 /// Fetch message flags only
@@ -489,6 +536,35 @@ pub async fn uid_search(
     let mut uids: Vec<u32> = set.into_iter().collect();
     uids.sort_unstable_by(|a, b| b.cmp(a));
     Ok(uids)
+}
+
+/// Fetch the total RFC822 size for a message UID.
+pub async fn fetch_message_size(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid: u32,
+) -> AppResult<usize> {
+    let fetch = fetch_one(server, session, uid, "(UID RFC822.SIZE)").await?;
+    let size = fetch
+        .size
+        .ok_or_else(|| AppError::Internal("message size not available".to_owned()))?;
+    Ok(size as usize)
+}
+
+/// Fetch a bounded raw RFC822 range without setting `\\Seen`.
+pub async fn fetch_raw_message_range(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid: u32,
+    offset: usize,
+    max_bytes: usize,
+) -> AppResult<Vec<u8>> {
+    let query = format!("BODY.PEEK[]<{offset}.{max_bytes}>");
+    let fetch = fetch_one(server, session, uid, &query).await?;
+    let body = fetch
+        .body()
+        .ok_or_else(|| AppError::Internal("message has no raw message body".to_owned()))?;
+    Ok(body.to_vec())
 }
 
 /// Store flags on a message

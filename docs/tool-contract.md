@@ -168,11 +168,11 @@ Purpose: return parsed message details with optional bounded enrichments.
 Input:
 - `message_id` (required)
 - `body_max_chars?` (100..20000, default 2000)
+- `body_mode?` (`text|html|both`, default `text`)
 - `include_headers?` (boolean, default true)
 - `include_all_headers?` (boolean, default false)
-- `include_html?` (boolean, default false; returned HTML is sanitized)
-- `extract_attachment_text?` (boolean, default false)
-- `attachment_text_max_chars?` (100..50000, default 10000; only valid when extraction is enabled)
+- `attachment_mode?` (`none|metadata|extract_text`, default `metadata`)
+- `attachment_text_max_chars?` (100..50000, default 10000; only valid when `attachment_mode=extract_text`)
 
 Output `data`:
 - `status`: `ok|partial|failed`
@@ -192,28 +192,30 @@ Output `data`:
   - `subject?`
   - `flags?`
   - `headers?` (curated by default; full when requested)
-  - `body_text?` (bounded; prefers `text/plain`, otherwise derived from sanitized HTML when no meaningful plain-text body exists)
-  - `body_html?` (sanitized and bounded)
+  - `body_text?` (bounded; returned for `body_mode=text|both`; prefers `text/plain`, otherwise derived from sanitized HTML when no meaningful plain-text body exists)
+  - `body_html?` (sanitized and bounded; returned for `body_mode=html|both`)
   - `attachments?`: array (max 50) of:
     - `filename?`
     - `content_type`
     - `size_bytes`
     - `part_id`
-    - `extracted_text?` (bounded)
+    - `extracted_text?` (bounded; only when `attachment_mode=extract_text`)
 
 PDF extraction rules:
 - only `application/pdf`
 - max attachment size for extraction: 5 MB
 - extraction failures do not fail the whole tool call
+- `attachment_mode=metadata` reports attachment metadata without attempting extraction
 - messages with more than 50 attachments return the first 50 plus a truncation issue
 
 ### 5) `imap_get_message_raw`
 
-Purpose: return bounded RFC822 source for diagnostics.
+Purpose: return a bounded RFC822 byte range for diagnostics.
 
 Input:
 - `message_id` (required)
 - `max_bytes?` (1024..1000000, default 200000)
+- `offset_bytes?` (integer, default 0)
 
 Output `data`:
 - `status`: `ok|partial|failed`
@@ -222,7 +224,10 @@ Output `data`:
 - `message_id`
 - `message_uri`
 - `message_raw_uri`
-- `size_bytes`
+- `total_size_bytes`
+- `returned_bytes`
+- `offset_bytes`
+- `truncated`
 - `raw_source_base64` (byte-faithful RFC822 source, base64 encoded)
 - `raw_source_encoding` (`"base64"` on success)
 

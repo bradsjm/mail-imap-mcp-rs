@@ -87,7 +87,7 @@ All potentially large outputs are bounded to prevent resource exhaustion.
 
 ```json
 {
-  "extract_attachment_text": true,
+  "attachment_mode": "extract_text",
   "attachment_text_max_chars": 10000  // Range: 100..50000, default: 10000
 }
 ```
@@ -96,6 +96,7 @@ All potentially large outputs are bounded to prevent resource exhaustion.
 
 ```json
 {
+  "offset_bytes": 0,
   "max_bytes": 200000  // Range: 1024..1000000, default: 200000
 }
 ```

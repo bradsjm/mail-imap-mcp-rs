@@ -28,7 +28,7 @@ use super::validation::{
 use super::{MAX_CURSOR_UIDS_STORED, MAX_SEARCH_LIMIT, MailImapServer};
 
 struct SearchSnapshot {
-    uids_desc: Vec<u32>,
+    uids_desc: Arc<[u32]>,
     offset: usize,
     snippet_max_chars: Option<usize>,
     cursor_id_from_request: Option<String>,
@@ -314,9 +314,11 @@ impl MailImapServer {
     ) -> AppResult<serde_json::Value> {
         validate_chars(input.body_max_chars, 100, 20_000, "body_max_chars")?;
         let attachment_text_max_chars = input.attachment_text_max_chars.unwrap_or(10_000);
-        if input.attachment_text_max_chars.is_some() && !input.extract_attachment_text {
+        if input.attachment_text_max_chars.is_some()
+            && input.attachment_mode != crate::models::AttachmentMode::ExtractText
+        {
             return Err(AppError::InvalidInput(
-                "attachment_text_max_chars requires extract_attachment_text=true".to_owned(),
+                "attachment_text_max_chars requires attachment_mode=extract_text".to_owned(),
             ));
         }
         validate_chars(
@@ -382,8 +384,8 @@ impl MailImapServer {
         let parsed = match mime::parse_message(
             &raw,
             input.body_max_chars,
-            input.include_html,
-            input.extract_attachment_text,
+            input.body_mode,
+            input.attachment_mode,
             attachment_text_max_chars,
         ) {
             Ok(parsed) => parsed,
@@ -531,11 +533,17 @@ impl MailImapServer {
         };
         ensure_uidvalidity_matches_readonly(&self.config, &mut session, &message_id).await?;
 
-        let raw = match imap::fetch_raw_message(&self.config, &mut session, message_id.uid).await {
-            Ok(raw) => raw,
+        let total_size_bytes = match imap::fetch_message_size(
+            &self.config,
+            &mut session,
+            message_id.uid,
+        )
+        .await
+        {
+            Ok(size) => size,
             Err(error) => {
                 issues.push(
-                    ToolIssue::from_error("fetch_raw_message", &error)
+                    ToolIssue::from_error("fetch_message_size", &error)
                         .with_uid(message_id.uid)
                         .with_message_id(&encoded_message_id),
                 );
@@ -553,17 +561,61 @@ impl MailImapServer {
                     "message_id": encoded_message_id,
                     "message_uri": build_message_uri(&message_id.account_id, &message_id.mailbox, message_id.uidvalidity, message_id.uid),
                     "message_raw_uri": build_message_raw_uri(&message_id.account_id, &message_id.mailbox, message_id.uidvalidity, message_id.uid),
-                    "size_bytes": 0,
+                    "total_size_bytes": 0,
+                    "returned_bytes": 0,
+                    "offset_bytes": input.offset_bytes,
+                    "truncated": false,
                     "raw_source_base64": serde_json::Value::Null,
                     "raw_source_encoding": serde_json::Value::Null,
                 }));
             }
         };
-        if raw.len() > input.max_bytes {
+        if input.offset_bytes > total_size_bytes {
             return Err(AppError::InvalidInput(
-                "message exceeds max_bytes; increase max_bytes".to_owned(),
+                "offset_bytes must not exceed total message size".to_owned(),
             ));
         }
+
+        let raw = match imap::fetch_raw_message_range(
+            &self.config,
+            &mut session,
+            message_id.uid,
+            input.offset_bytes,
+            input.max_bytes,
+        )
+        .await
+        {
+            Ok(raw) => raw,
+            Err(error) => {
+                issues.push(
+                    ToolIssue::from_error("fetch_raw_message_range", &error)
+                        .with_uid(message_id.uid)
+                        .with_message_id(&encoded_message_id),
+                );
+                log_runtime_issues(
+                    "imap_get_message_raw",
+                    "failed",
+                    &message_id.account_id,
+                    Some(&message_id.mailbox),
+                    &issues,
+                );
+                return Ok(serde_json::json!({
+                    "status": "failed",
+                    "issues": issues,
+                    "account_id": message_id.account_id,
+                    "message_id": encoded_message_id,
+                    "message_uri": build_message_uri(&message_id.account_id, &message_id.mailbox, message_id.uidvalidity, message_id.uid),
+                    "message_raw_uri": build_message_raw_uri(&message_id.account_id, &message_id.mailbox, message_id.uidvalidity, message_id.uid),
+                    "total_size_bytes": total_size_bytes,
+                    "returned_bytes": 0,
+                    "offset_bytes": input.offset_bytes,
+                    "truncated": false,
+                    "raw_source_base64": serde_json::Value::Null,
+                    "raw_source_encoding": serde_json::Value::Null,
+                }));
+            }
+        };
+        let truncated = input.offset_bytes.saturating_add(raw.len()) < total_size_bytes;
 
         log_runtime_issues(
             "imap_get_message_raw",
@@ -580,7 +632,10 @@ impl MailImapServer {
             "message_id": encoded_message_id,
             "message_uri": build_message_uri(&message_id.account_id, &message_id.mailbox, message_id.uidvalidity, message_id.uid),
             "message_raw_uri": build_message_raw_uri(&message_id.account_id, &message_id.mailbox, message_id.uidvalidity, message_id.uid),
-            "size_bytes": raw.len(),
+            "total_size_bytes": total_size_bytes,
+            "returned_bytes": raw.len(),
+            "offset_bytes": input.offset_bytes,
+            "truncated": truncated,
             "raw_source_base64": base64::engine::general_purpose::STANDARD.encode(raw),
             "raw_source_encoding": "base64",
         }))
@@ -649,7 +704,7 @@ async fn start_new_search(
     }
 
     Ok(SearchSnapshot {
-        uids_desc: searched_uids,
+        uids_desc: Arc::<[u32]>::from(searched_uids),
         offset: 0,
         snippet_max_chars: input.snippet_max_chars.map(|value| value.clamp(50, 500)),
         cursor_id_from_request: None,
@@ -665,20 +720,47 @@ async fn build_message_summaries(
     let mut messages = Vec::with_capacity(uids.len());
     let mut issues = Vec::new();
     let mut failed = 0usize;
+    if uids.is_empty() {
+        return SummaryBuildResult {
+            messages,
+            issues,
+            attempted: 0,
+            failed: 0,
+        };
+    }
+    let uid_set = build_uid_set(uids);
+
+    let fetched = match imap::fetch_headers_and_flags_by_uid_set(config, session, &uid_set).await {
+        Ok(fetched) => fetched,
+        Err(error) => {
+            failed = uids.len();
+            issues.extend(uids.iter().map(|uid| {
+                ToolIssue::from_error("fetch_headers_and_flags", &error).with_uid(*uid)
+            }));
+            return SummaryBuildResult {
+                messages,
+                issues,
+                attempted: uids.len(),
+                failed,
+            };
+        }
+    };
 
     for uid in uids {
-        let (header_bytes, flags) = match imap::fetch_headers_and_flags(config, session, *uid).await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                failed += 1;
-                issues
-                    .push(ToolIssue::from_error("fetch_headers_and_flags", &error).with_uid(*uid));
-                continue;
-            }
+        let Some(fetched_message) = fetched.get(uid) else {
+            failed += 1;
+            issues.push(ToolIssue {
+                code: "internal".to_owned(),
+                stage: "fetch_headers_and_flags".to_owned(),
+                message: format!("UID {uid} missing from batch fetch response"),
+                retryable: true,
+                uid: Some(*uid),
+                message_id: None,
+            });
+            continue;
         };
 
-        let headers = match mime::parse_header_bytes(&header_bytes) {
+        let headers = match mime::parse_header_bytes(&fetched_message.header_bytes) {
             Ok(headers) => headers,
             Err(error) => {
                 failed += 1;
@@ -719,7 +801,7 @@ async fn build_message_summaries(
             date: header_value(&headers, "date"),
             from: header_value(&headers, "from"),
             subject: header_value(&headers, "subject"),
-            flags: Some(flags),
+            flags: Some(fetched_message.flags.clone()),
             snippet,
         });
     }
@@ -729,6 +811,33 @@ async fn build_message_summaries(
         issues,
         attempted: uids.len(),
         failed,
+    }
+}
+
+fn build_uid_set(uids: &[u32]) -> String {
+    let mut sorted = uids.to_vec();
+    sorted.sort_unstable();
+    let mut ranges = Vec::new();
+    let mut start = sorted[0];
+    let mut end = sorted[0];
+    for uid in sorted.into_iter().skip(1) {
+        if uid == end + 1 {
+            end = uid;
+            continue;
+        }
+        ranges.push(format_uid_range(start, end));
+        start = uid;
+        end = uid;
+    }
+    ranges.push(format_uid_range(start, end));
+    ranges.join(",")
+}
+
+fn format_uid_range(start: u32, end: u32) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}:{end}")
     }
 }
 
@@ -753,7 +862,7 @@ mod tests {
                 account_id: "default".to_owned(),
                 mailbox: "&ZeVnLIqe-".to_owned(),
                 uidvalidity: 42,
-                uids_desc: vec![10, 9],
+                uids_desc: vec![10, 9].into(),
                 offset: 1,
                 snippet_max_chars: Some(200),
                 expires_at: Instant::now(),
@@ -780,7 +889,7 @@ mod tests {
             .await
             .expect("legacy encoded cursor should resume");
         assert_eq!(snapshot.offset, 1);
-        assert_eq!(snapshot.uids_desc, vec![10, 9]);
+        assert_eq!(&*snapshot.uids_desc, &[10, 9]);
     }
 
     #[tokio::test]
@@ -792,7 +901,7 @@ mod tests {
                 account_id: "default".to_owned(),
                 mailbox: "日本語".to_owned(),
                 uidvalidity: 42,
-                uids_desc: vec![10, 9],
+                uids_desc: vec![10, 9].into(),
                 offset: 1,
                 snippet_max_chars: Some(120),
                 expires_at: Instant::now(),
