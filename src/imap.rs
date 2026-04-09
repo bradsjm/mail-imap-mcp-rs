@@ -3,6 +3,7 @@
 //! Provides timeout-bounded wrappers around `async-imap` operations. All network
 //! calls are enforced to use TLS, and timeouts are derived from server config.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +21,12 @@ use tokio_rustls::TlsConnector;
 use crate::config::{AccountConfig, ServerConfig};
 use crate::errors::{AppError, AppResult};
 use crate::mailbox_codec::encode_mailbox_name_for_command;
+
+#[derive(Debug, Clone)]
+pub struct HeaderAndFlags {
+    pub header_bytes: Vec<u8>,
+    pub flags: Vec<String>,
+}
 
 /// Type alias for authenticated IMAP session over TLS
 ///
@@ -227,7 +234,7 @@ pub async fn create_parent_mailboxes(
     session: &mut ImapSession,
     mailbox: &str,
 ) -> AppResult<()> {
-    for parent in mailbox_parent_paths(mailbox) {
+    for parent in mailbox_parent_paths(server, session, mailbox).await? {
         create_mailbox_if_missing(server, session, &parent).await?;
     }
     Ok(())
@@ -243,18 +250,44 @@ pub async fn create_mailbox_path(
     create_mailbox_if_missing(server, session, mailbox).await
 }
 
-fn mailbox_parent_paths(mailbox: &str) -> Vec<String> {
-    let delimiter = if mailbox.contains('/') {
-        Some('/')
-    } else if mailbox.contains('.') {
-        Some('.')
-    } else {
-        None
+async fn mailbox_parent_paths(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    mailbox: &str,
+) -> AppResult<Vec<String>> {
+    let Some(delimiter) = hierarchy_delimiter(server, session).await? else {
+        return Ok(Vec::new());
     };
+    Ok(build_mailbox_parent_paths(delimiter, mailbox))
+}
 
-    let Some(delimiter) = delimiter else {
+/// Discover the server's mailbox hierarchy delimiter, if any.
+pub async fn hierarchy_delimiter(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+) -> AppResult<Option<char>> {
+    let stream = timeout(socket_timeout(server), session.list(None, Some("")))
+        .await
+        .map_err(|_| AppError::Timeout("LIST delimiter probe timed out".to_owned()))
+        .and_then(|r| {
+            r.map_err(|e| AppError::Internal(format!("LIST delimiter probe failed: {e}")))
+        })?;
+    let names = timeout(socket_timeout(server), stream.try_collect::<Vec<_>>())
+        .await
+        .map_err(|_| AppError::Timeout("LIST delimiter probe stream timed out".to_owned()))
+        .and_then(|r| {
+            r.map_err(|e| AppError::Internal(format!("LIST delimiter probe stream failed: {e}")))
+        })?;
+
+    Ok(names
+        .into_iter()
+        .find_map(|name| name.delimiter().and_then(|value| value.chars().next())))
+}
+
+fn build_mailbox_parent_paths(delimiter: char, mailbox: &str) -> Vec<String> {
+    if !mailbox.contains(delimiter) {
         return Vec::new();
-    };
+    }
 
     let parts: Vec<&str> = mailbox.split(delimiter).collect();
     let mut parents = Vec::new();
@@ -368,6 +401,7 @@ pub async fn fetch_raw_message(
 ///
 /// Returns standard headers (Date, From, To, CC, Subject) and message flags.
 /// Uses `BODY.PEEK` to avoid marking the message as read.
+#[allow(dead_code)]
 pub async fn fetch_headers_and_flags(
     server: &ServerConfig,
     session: &mut ImapSession,
@@ -388,6 +422,46 @@ pub async fn fetch_headers_and_flags(
     Ok((header_bytes, flags_to_strings(&fetch)))
 }
 
+/// Fetch curated headers and flags for a UID set in one round trip.
+pub async fn fetch_headers_and_flags_by_uid_set(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid_set: &str,
+) -> AppResult<HashMap<u32, HeaderAndFlags>> {
+    let stream = timeout(
+        socket_timeout(server),
+        session.uid_fetch(
+            uid_set,
+            "(UID FLAGS BODY.PEEK[HEADER.FIELDS (DATE FROM TO CC SUBJECT)])",
+        ),
+    )
+    .await
+    .map_err(|_| AppError::Timeout("UID FETCH timed out".to_owned()))
+    .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid fetch failed: {e}"))))?;
+    let fetches: Vec<Fetch> = timeout(socket_timeout(server), stream.try_collect())
+        .await
+        .map_err(|_| AppError::Timeout("UID FETCH stream timed out".to_owned()))
+        .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid fetch stream failed: {e}"))))?;
+
+    let mut by_uid = HashMap::new();
+    for fetch in fetches {
+        let Some(uid) = fetch.uid else {
+            continue;
+        };
+        let Some(header_bytes) = fetch.header().or_else(|| fetch.body()).map(|v| v.to_vec()) else {
+            continue;
+        };
+        by_uid.insert(
+            uid,
+            HeaderAndFlags {
+                header_bytes,
+                flags: flags_to_strings(&fetch),
+            },
+        );
+    }
+    Ok(by_uid)
+}
+
 /// Fetch message flags only
 ///
 /// Returns IMAP flags (e.g., `\Seen`, `\Flagged`, `\Draft`) as strings.
@@ -398,6 +472,32 @@ pub async fn fetch_flags(
 ) -> AppResult<Vec<String>> {
     let fetch = fetch_one(server, session, uid, "FLAGS").await?;
     Ok(flags_to_strings(&fetch))
+}
+
+/// Fetch flags for a UID set in one round trip.
+pub async fn fetch_flags_by_uid_set(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid_set: &str,
+) -> AppResult<HashMap<u32, Vec<String>>> {
+    let stream = timeout(
+        socket_timeout(server),
+        session.uid_fetch(uid_set, "(UID FLAGS)"),
+    )
+    .await
+    .map_err(|_| AppError::Timeout("UID FETCH timed out".to_owned()))
+    .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid fetch failed: {e}"))))?;
+    let fetches: Vec<Fetch> = timeout(socket_timeout(server), stream.try_collect())
+        .await
+        .map_err(|_| AppError::Timeout("UID FETCH stream timed out".to_owned()))
+        .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid fetch stream failed: {e}"))))?;
+    let mut by_uid = HashMap::new();
+    for fetch in fetches {
+        if let Some(uid) = fetch.uid {
+            by_uid.insert(uid, flags_to_strings(&fetch));
+        }
+    }
+    Ok(by_uid)
 }
 
 /// Convert fetch flags to IMAP string representation
@@ -438,23 +538,60 @@ pub async fn uid_search(
     Ok(uids)
 }
 
+/// Fetch the total RFC822 size for a message UID.
+pub async fn fetch_message_size(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid: u32,
+) -> AppResult<usize> {
+    let fetch = fetch_one(server, session, uid, "(UID RFC822.SIZE)").await?;
+    let size = fetch
+        .size
+        .ok_or_else(|| AppError::Internal("message size not available".to_owned()))?;
+    Ok(size as usize)
+}
+
+/// Fetch a bounded raw RFC822 range without setting `\\Seen`.
+pub async fn fetch_raw_message_range(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid: u32,
+    offset: usize,
+    max_bytes: usize,
+) -> AppResult<Vec<u8>> {
+    let query = format!("BODY.PEEK[]<{offset}.{max_bytes}>");
+    let fetch = fetch_one(server, session, uid, &query).await?;
+    let body = fetch
+        .body()
+        .ok_or_else(|| AppError::Internal("message has no raw message body".to_owned()))?;
+    Ok(body.to_vec())
+}
+
 /// Store flags on a message
 ///
 /// Runs `UID STORE` with a flag query string. Use `+FLAGS.SILENT` to add
 /// flags or `-FLAGS.SILENT` to remove flags.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn uid_store(
     server: &ServerConfig,
     session: &mut ImapSession,
     uid: u32,
     query: &str,
 ) -> AppResult<()> {
-    let stream = timeout(
-        socket_timeout(server),
-        session.uid_store(uid.to_string(), query),
-    )
-    .await
-    .map_err(|_| AppError::Timeout("UID STORE timed out".to_owned()))
-    .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid store failed: {e}"))))?;
+    uid_store_sequence(server, session, &uid.to_string(), query).await
+}
+
+/// Store flags on a UID sequence.
+pub async fn uid_store_sequence(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid_set: &str,
+    query: &str,
+) -> AppResult<()> {
+    let stream = timeout(socket_timeout(server), session.uid_store(uid_set, query))
+        .await
+        .map_err(|_| AppError::Timeout("UID STORE timed out".to_owned()))
+        .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid store failed: {e}"))))?;
     let _: Vec<Fetch> = timeout(socket_timeout(server), stream.try_collect())
         .await
         .map_err(|_| AppError::Timeout("UID STORE stream timed out".to_owned()))
@@ -466,16 +603,27 @@ pub async fn uid_store(
 ///
 /// Runs `UID COPY` to duplicate the message. Returns the new UID on success
 /// (currently not captured due to protocol limitations).
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn uid_copy(
     server: &ServerConfig,
     session: &mut ImapSession,
     uid: u32,
     mailbox: &str,
 ) -> AppResult<()> {
+    uid_copy_sequence(server, session, &uid.to_string(), mailbox).await
+}
+
+/// Copy a UID sequence to another mailbox.
+pub async fn uid_copy_sequence(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid_set: &str,
+    mailbox: &str,
+) -> AppResult<()> {
     let encoded_mailbox = encode_mailbox_name_for_command(mailbox);
     timeout(
         socket_timeout(server),
-        session.uid_copy(uid.to_string(), &encoded_mailbox),
+        session.uid_copy(uid_set, &encoded_mailbox),
     )
     .await
     .map_err(|_| AppError::Timeout("UID COPY timed out".to_owned()))
@@ -486,16 +634,27 @@ pub async fn uid_copy(
 ///
 /// Runs `UID MOVE` if server supports it (RFC 6851). More efficient than
 /// copy+delete as it's atomic.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn uid_move(
     server: &ServerConfig,
     session: &mut ImapSession,
     uid: u32,
     mailbox: &str,
 ) -> AppResult<()> {
+    uid_move_sequence(server, session, &uid.to_string(), mailbox).await
+}
+
+/// Move a UID sequence to another mailbox.
+pub async fn uid_move_sequence(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid_set: &str,
+    mailbox: &str,
+) -> AppResult<()> {
     let encoded_mailbox = encode_mailbox_name_for_command(mailbox);
     timeout(
         socket_timeout(server),
-        session.uid_mv(uid.to_string(), &encoded_mailbox),
+        session.uid_mv(uid_set, &encoded_mailbox),
     )
     .await
     .map_err(|_| AppError::Timeout("UID MOVE timed out".to_owned()))
@@ -505,12 +664,22 @@ pub async fn uid_move(
 /// Permanently delete a message
 ///
 /// Runs `UID EXPUNGE` to immediately remove the message marked as `\Deleted`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn uid_expunge(
     server: &ServerConfig,
     session: &mut ImapSession,
     uid: u32,
 ) -> AppResult<()> {
-    let stream = timeout(socket_timeout(server), session.uid_expunge(uid.to_string()))
+    uid_expunge_sequence(server, session, &uid.to_string()).await
+}
+
+/// Permanently delete a UID sequence already marked as `\Deleted`.
+pub async fn uid_expunge_sequence(
+    server: &ServerConfig,
+    session: &mut ImapSession,
+    uid_set: &str,
+) -> AppResult<()> {
+    let stream = timeout(socket_timeout(server), session.uid_expunge(uid_set))
         .await
         .map_err(|_| AppError::Timeout("UID EXPUNGE timed out".to_owned()))
         .and_then(|r| r.map_err(|e| AppError::Internal(format!("UID EXPUNGE failed: {e}"))))?;
@@ -527,6 +696,7 @@ pub async fn uid_expunge(
 ///
 /// Used for cross-account copy operations. Does not return the new UID
 /// directly (would require `UIDPLUS` capability).
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn append(
     server: &ServerConfig,
     session: &mut ImapSession,
@@ -562,7 +732,7 @@ mod tests {
     use crate::mailbox_codec::encode_mailbox_name_for_command;
 
     use super::{
-        append, fetch_flags, fetch_raw_message, list_all_mailboxes, mailbox_parent_paths,
+        append, build_mailbox_parent_paths, fetch_flags, fetch_raw_message, list_all_mailboxes,
         select_mailbox_readonly, select_mailbox_readwrite, socket_timeout, uid_copy, uid_expunge,
         uid_move, uid_search, uid_store,
     };
@@ -600,7 +770,7 @@ mod tests {
     #[test]
     fn mailbox_parent_paths_builds_hierarchy_for_slash_paths() {
         assert_eq!(
-            mailbox_parent_paths("Archive/Projects/2026"),
+            build_mailbox_parent_paths('/', "Archive/Projects/2026"),
             vec!["Archive".to_owned(), "Archive/Projects".to_owned()]
         );
     }
@@ -608,7 +778,7 @@ mod tests {
     #[test]
     fn mailbox_parent_paths_uses_dot_when_no_slash_exists() {
         assert_eq!(
-            mailbox_parent_paths("Archive.Projects.2026"),
+            build_mailbox_parent_paths('.', "Archive.Projects.2026"),
             vec!["Archive".to_owned(), "Archive.Projects".to_owned()]
         );
     }
@@ -636,6 +806,7 @@ mod tests {
             socket_timeout_ms: 15_000,
             cursor_ttl_seconds: 600,
             cursor_max_entries: 128,
+            operation_max_entries: 256,
         }
     }
 

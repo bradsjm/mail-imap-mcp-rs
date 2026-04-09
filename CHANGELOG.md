@@ -5,11 +5,11 @@
 ### Added
 
 - Added client-safe MCP input schema enforcement tests that validate every published tool schema and reject schema combinators that common MCP clients do not handle reliably.
-- Expanded the GreenMail MCP inspector integration script into a contract-level test that checks tool discovery, parameter schema completeness, shared response envelope fields, and happy-path output shapes for all 7 MCP tools.
+- Expanded the GreenMail MCP inspector integration script into a contract-level test that checks tool discovery, parameter schema completeness, shared response envelope fields, and happy-path output shapes for all 8 MCP tools.
 
 ### Changed
 
-- Flattened the public input contracts for `imap_apply_to_messages` and `imap_manage_mailbox` so they publish client-safe schemas while preserving the existing tool names and runtime validation rules.
+- Refactored bulk writes so `imap_apply_to_messages` is id-only, added `imap_update_message_flags`, and batched message mutations by mailbox/UID set in the backend.
 - Synced the documented MCP contract with the current server payloads, including URI fields on message-bearing tools and the flattened write-tool argument shapes.
 
 ## [0.3.0]

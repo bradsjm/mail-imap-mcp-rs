@@ -3,7 +3,7 @@ set -euo pipefail
 
 IMAGE="greenmail/standalone:2.1.8"
 NAME="mail-imap-mcp-rs-greenmail-test"
-GREENMAIL_HOST="${GREENMAIL_HOST:-localhost}"
+GREENMAIL_HOST="${GREENMAIL_HOST:-127.0.0.1}"
 GREENMAIL_SMTP_PORT="${GREENMAIL_SMTP_PORT:-3025}"
 GREENMAIL_IMAP_PORT="${GREENMAIL_IMAP_PORT:-3143}"
 GREENMAIL_USER="${GREENMAIL_USER:-test@localhost}"

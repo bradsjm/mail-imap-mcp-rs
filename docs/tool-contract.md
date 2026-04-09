@@ -5,7 +5,7 @@ It is the source of truth for tool names, input/output shapes, validation bounds
 
 ## Design Decisions
 
-- Transport: stdio only.
+- Transport: stdio by default, with optional streamable HTTP transport at `/mcp`.
 - Auth/config: environment variables only.
 - Message locator: stable `message_id` format `imap:{account_id}:{mailbox}:{uidvalidity}:{uid}`.
 - Destructive/write operations: disabled by default and explicitly gated.
@@ -127,11 +127,10 @@ Input:
   - `start_date?` (`YYYY-MM-DD`)
   - `end_date?` (`YYYY-MM-DD`)
 - `limit` (optional)
-- `include_snippet?` (boolean, default false)
-- `snippet_max_chars?` (50..500, default 200; only valid if `include_snippet=true`)
+- `snippet_max_chars?` (50..500; when present, snippets are returned truncated to this length)
 
 Validation:
-- When `cursor` is present, pagination resumes the stored cursor snapshot and ignores search criteria fields plus request-level snippet settings.
+- When `cursor` is present, pagination resumes the stored cursor snapshot and ignores replayed search criteria plus `snippet_max_chars`.
 - `last_days` cannot be combined with `start_date`/`end_date`.
 - `start_date <= end_date`.
 - Search text fields and mailbox values must not contain ASCII control characters.
@@ -167,14 +166,13 @@ Output `data`:
 Purpose: return parsed message details with optional bounded enrichments.
 
 Input:
-- `account_id` (optional)
 - `message_id` (required)
 - `body_max_chars?` (100..20000, default 2000)
+- `body_mode?` (`text|html|both`, default `text`)
 - `include_headers?` (boolean, default true)
 - `include_all_headers?` (boolean, default false)
-- `include_html?` (boolean, default false; returned HTML is sanitized)
-- `extract_attachment_text?` (boolean, default false)
-- `attachment_text_max_chars?` (100..50000, default 10000; only valid when extraction is enabled)
+- `attachment_mode?` (`none|metadata|extract_text`, default `metadata`)
+- `attachment_text_max_chars?` (100..50000, default 10000; only valid when `attachment_mode=extract_text`)
 
 Output `data`:
 - `status`: `ok|partial|failed`
@@ -194,28 +192,30 @@ Output `data`:
   - `subject?`
   - `flags?`
   - `headers?` (curated by default; full when requested)
-  - `body_text?` (bounded; prefers `text/plain`, otherwise derived from sanitized HTML when no meaningful plain-text body exists)
-  - `body_html?` (sanitized and bounded)
+  - `body_text?` (bounded; returned for `body_mode=text|both`; prefers `text/plain`, otherwise derived from sanitized HTML when no meaningful plain-text body exists)
+  - `body_html?` (sanitized and bounded; returned for `body_mode=html|both`)
   - `attachments?`: array (max 50) of:
     - `filename?`
     - `content_type`
     - `size_bytes`
     - `part_id`
-    - `extracted_text?` (bounded)
+    - `extracted_text?` (bounded; only when `attachment_mode=extract_text`)
 
 PDF extraction rules:
 - only `application/pdf`
 - max attachment size for extraction: 5 MB
 - extraction failures do not fail the whole tool call
+- `attachment_mode=metadata` reports attachment metadata without attempting extraction
+- messages with more than 50 attachments return the first 50 plus a truncation issue
 
 ### 5) `imap_get_message_raw`
 
-Purpose: return bounded RFC822 source for diagnostics.
+Purpose: return a bounded RFC822 byte range for diagnostics.
 
 Input:
-- `account_id` (optional)
 - `message_id` (required)
 - `max_bytes?` (1024..1000000, default 200000)
+- `offset_bytes?` (integer, default 0)
 
 Output `data`:
 - `status`: `ok|partial|failed`
@@ -224,72 +224,65 @@ Output `data`:
 - `message_id`
 - `message_uri`
 - `message_raw_uri`
-- `size_bytes`
+- `total_size_bytes`
+- `returned_bytes`
+- `offset_bytes`
+- `truncated`
 - `raw_source_base64` (byte-faithful RFC822 source, base64 encoded)
 - `raw_source_encoding` (`"base64"` on success)
 
 ### 6) `imap_apply_to_messages`
 
-Purpose: apply one mutation action to a selected set of messages.
+Purpose: apply one mutation action to explicit messages.
 
 Write gate: requires `MAIL_IMAP_WRITE_ENABLED=true`.
 
 Input:
-- `account_id` (optional)
-- `selector` (required), exactly one of:
-  - `message_ids`: string[] (1..1000)
-  - `search`: object with:
-    - `mailbox` (required)
-    - `cursor?` (string, opaque)
-    - `query?` (1..256)
-    - `from?` (1..256)
-    - `to?` (1..256)
-    - `subject?` (1..256)
-    - `unread_only?` (boolean)
-    - `last_days?` (1..365)
-    - `start_date?` (`YYYY-MM-DD`)
-    - `end_date?` (`YYYY-MM-DD`)
-- `action` (required), one of:
-  - `move` with `destination_mailbox`
-  - `copy` with `destination_mailbox`, `destination_account_id?`
-  - `delete`
-  - `update_flags` with `add_flags?`, `remove_flags?`
-- action-specific top-level fields:
-  - `destination_mailbox?`
-  - `destination_account_id?`
-  - `add_flags?`
-  - `remove_flags?`
-- `max_messages` (optional, default `100`, range `1..1000`)
-- `dry_run` (optional, default `false`)
+- `message_ids` (required): string[] (`1..250`)
+- `action` (required): `move|copy|delete`
+- `destination_mailbox?` (required for `move` and `copy`, rejected for `delete`)
 
 Validation:
-- selector must include exactly one of `message_ids` or `search`
-- when `search.cursor` is present, search criteria replay is accepted and ignored
-- `update_flags` requires at least one of `add_flags` or `remove_flags`
-- `move` is same-account only
-- the resolved selection must not exceed `max_messages`
+- message discovery happens in read tools such as `imap_search_messages`
+- duplicate `message_ids` are deduplicated before execution
+- all message ids must belong to the same account inferred from their IDs
+- destination mailbox must already exist for `move` and `copy`
+- live mailbox `uidvalidity` is revalidated before the operation is accepted
 
 Output `data`:
-- `status`: `ok|partial|failed`
+- `status`: `accepted|running|ok|partial|failed|canceled`
 - `issues`: array of diagnostic issues
-- `account_id`
-- `action`: `move|copy|delete|update_flags`
-- `dry_run` (boolean)
-- `matched`: integer
-- `attempted`: integer
-- `succeeded`: integer
-- `failed`: integer
-- `results`: array of:
-  - `message_id`
-  - `status`: `planned|ok|partial|failed`
-  - `issues`
-  - `source_mailbox`
-  - `destination_mailbox?`
-  - `destination_account_id?`
-  - `flags?`
-  - `new_message_id?`
+- `operation`: `{ operation_id, kind, state, done, cancel_supported, created_at, started_at?, finished_at?, progress }`
+- `result?`: final completed payload when `done=true`
+- `next_action?`: polling instruction for `imap_get_operation` when `done=false`
 
-### 7) `imap_manage_mailbox`
+### 7) `imap_update_message_flags`
+
+Purpose: add, remove, or replace flags on explicit messages.
+
+Write gate: requires `MAIL_IMAP_WRITE_ENABLED=true`.
+
+Input:
+- `message_ids` (required): string[] (`1..250`)
+- `operation` (required): `add|remove|replace`
+- `flags` (required): string[] (`1..32`)
+
+Validation:
+- duplicate `message_ids` are deduplicated before execution
+- all message ids must belong to the same account inferred from their IDs
+- valid standard flags are `\Seen`, `\Answered`, `\Flagged`, `\Deleted`, `\Draft`
+- custom keywords may also be allowed if they are valid IMAP atoms and the server accepts them
+- invalid standard flags return a corrective hint listing the valid standard flags
+- live mailbox `uidvalidity` is revalidated before the operation is accepted
+
+Output `data`:
+- `status`: `accepted|running|ok|partial|failed|canceled`
+- `issues`: array of diagnostic issues
+- `operation`: `{ operation_id, kind, state, done, cancel_supported, created_at, started_at?, finished_at?, progress }`
+- `result?`: final completed payload when `done=true`
+- `next_action?`: polling instruction for `imap_get_operation` when `done=false`
+
+### 8) `imap_manage_mailbox`
 
 Purpose: create, rename, or delete a mailbox.
 
@@ -307,12 +300,39 @@ Behavior:
 - `delete` is non-recursive and surfaces the server error for non-empty mailboxes or mailboxes with children
 
 Output `data`:
-- `status`: `ok|partial|failed`
+- `status`: `accepted|running|ok|partial|failed|canceled`
 - `issues`: array of diagnostic issues
-- `account_id`
-- `action`: `create|rename|delete`
-- `mailbox`
-- `destination_mailbox?`
+- `operation`: `{ operation_id, kind, state, done, cancel_supported, created_at, started_at?, finished_at?, progress }`
+- `result?`: final completed payload when `done=true`
+- `next_action?`: polling instruction for `imap_get_operation` when `done=false`
+
+### 9) `imap_get_operation`
+
+Purpose: poll a previously accepted write operation.
+
+Input:
+- `operation_id` (required)
+
+Output `data`:
+- `status`: `accepted|running|ok|partial|failed|canceled`
+- `issues`: array of currently accumulated diagnostic issues
+- `operation`: `{ operation_id, kind, state, done, cancel_supported, created_at, started_at?, finished_at?, progress }`
+- `result?`: final completed payload when `done=true`
+- `next_action?`: polling instruction for `imap_get_operation` when `done=false`
+
+### 10) `imap_cancel_operation`
+
+Purpose: request cancellation for a running write operation.
+
+Input:
+- `operation_id` (required)
+
+Output `data`:
+- `status`: `accepted|running|ok|partial|failed|canceled`
+- `issues`: array of currently accumulated diagnostic issues
+- `operation`: `{ operation_id, kind, state, done, cancel_supported, created_at, started_at?, finished_at?, progress }`
+- `result?`: final completed payload when `done=true`
+- `next_action?`: polling instruction for `imap_get_operation` when `done=false`
 
 ## Security and Guardrails
 
@@ -340,7 +360,8 @@ Server-wide:
 - `MAIL_IMAP_CONNECT_TIMEOUT_MS` (default `30000`)
 - `MAIL_IMAP_GREETING_TIMEOUT_MS` (default `15000`)
 - `MAIL_IMAP_SOCKET_TIMEOUT_MS` (default `300000`)
+- `MAIL_IMAP_OPERATION_MAX_ENTRIES` (default `256`; completed write operations retained in memory)
 
 ## Implementation Notes for Next Artifact
 
-Next artifact will generate Rust types and schema definitions from this contract, then register all tools in an `rmcp` stdio server skeleton with unified error handling.
+Next artifact will generate Rust types and schema definitions from this contract, then register all tools in an `rmcp` server skeleton with unified error handling across stdio and optional streamable HTTP transport.

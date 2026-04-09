@@ -59,6 +59,8 @@ pub struct ServerConfig {
     pub cursor_ttl_seconds: u64,
     /// Maximum number of cursors to retain (LRU eviction when exceeded)
     pub cursor_max_entries: usize,
+    /// Maximum number of completed write operations to retain in memory
+    pub operation_max_entries: usize,
 }
 
 impl ServerConfig {
@@ -119,6 +121,7 @@ impl ServerConfig {
             socket_timeout_ms: parse_u64_env("MAIL_IMAP_SOCKET_TIMEOUT_MS", 300_000)?,
             cursor_ttl_seconds: parse_u64_env("MAIL_IMAP_CURSOR_TTL_SECONDS", 600)?,
             cursor_max_entries: parse_usize_env("MAIL_IMAP_CURSOR_MAX_ENTRIES", 512)?,
+            operation_max_entries: parse_usize_env("MAIL_IMAP_OPERATION_MAX_ENTRIES", 256)?,
         })
     }
 
