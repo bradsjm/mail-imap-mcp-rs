@@ -46,6 +46,35 @@ Behavior:
 - When the limit is exceeded, the oldest completed operations are evicted first.
 - After eviction, polling or canceling that operation returns `not_found`.
 
+## Read Session Cache
+
+### Read Session Cache TTL
+
+Idle authenticated IMAP read sessions are cached per account for reuse by read tools.
+
+```bash
+# Default: 120 seconds
+MAIL_IMAP_READ_SESSION_CACHE_TTL_SECONDS=120
+```
+
+**Trade-offs:**
+- Shorter TTL: Less idle server state, more reconnects
+- Longer TTL: Better reuse for bursty MCP clients, more idle authenticated sessions
+
+### Read Session Cache Size
+
+Maximum number of idle read sessions retained per account.
+
+```bash
+# Default: 4 idle sessions per account
+MAIL_IMAP_READ_SESSION_CACHE_MAX_PER_ACCOUNT=4
+```
+
+Behavior:
+- `0` disables the read-session cache
+- In-flight read requests may still open more connections than this limit
+- Excess returned sessions are logged out instead of retained
+
 ## Timeout Configuration
 
 All timeouts are in milliseconds. Adjust based on network conditions and server performance.
@@ -263,6 +292,9 @@ For high-volume operations across large mailboxes:
 # Increase cursor capacity
 MAIL_IMAP_CURSOR_MAX_ENTRIES=1024
 
+# Keep more warm read sessions per account
+MAIL_IMAP_READ_SESSION_CACHE_MAX_PER_ACCOUNT=8
+
 # Longer cursor TTL for batch processing
 MAIL_IMAP_CURSOR_TTL_SECONDS=1800
 
@@ -280,6 +312,9 @@ MAIL_IMAP_CONNECT_TIMEOUT_MS=15000
 MAIL_IMAP_GREETING_TIMEOUT_MS=10000
 MAIL_IMAP_SOCKET_TIMEOUT_MS=120000
 
+# Keep a smaller idle read-session footprint
+MAIL_IMAP_READ_SESSION_CACHE_TTL_SECONDS=60
+
 # Fewer stored cursors
 MAIL_IMAP_CURSOR_MAX_ENTRIES=256
 ```
@@ -291,6 +326,9 @@ For environments with limited memory:
 ```bash
 # Fewer cursors stored
 MAIL_IMAP_CURSOR_MAX_ENTRIES=128
+
+# Disable idle read-session reuse entirely
+MAIL_IMAP_READ_SESSION_CACHE_MAX_PER_ACCOUNT=0
 
 # Shorter cursor TTL
 MAIL_IMAP_CURSOR_TTL_SECONDS=300

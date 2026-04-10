@@ -40,6 +40,7 @@ use rmcp::transport::{
     },
 };
 use tokio_util::sync::CancellationToken;
+use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
 use config::ServerConfig;
@@ -101,8 +102,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => error.exit(),
     };
 
+    let env_filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
         .init();
 
@@ -138,9 +142,12 @@ async fn serve_http(
 
     tracing::info!(
         transport = "http",
-        bind_address = %local_addr,
+        configured_bind_address = %args.http_bind_address,
+        configured_port = args.http_port,
+        listener_address = %local_addr,
+        listener_port = local_addr.port(),
         endpoint = %format!("http://{local_addr}{MCP_HTTP_PATH}"),
-        "starting MCP server"
+        "HTTP MCP server is running and waiting for connections"
     );
 
     axum::serve(listener, router)
@@ -369,6 +376,8 @@ mod tests {
             socket_timeout_ms: 300_000,
             cursor_ttl_seconds: 600,
             cursor_max_entries: 512,
+            read_session_cache_ttl_seconds: 120,
+            read_session_cache_max_per_account: 4,
             operation_max_entries: 256,
         }
     }

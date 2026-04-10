@@ -1,13 +1,14 @@
 //! MCP server implementation with tool handlers.
 
 mod read;
+mod session_cache;
 mod types;
 mod validation;
 mod write_ops;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -22,6 +23,7 @@ use crate::models::{
 };
 use crate::pagination::CursorStore;
 
+use self::session_cache::{IdleSessionCache, ReadSessionCache, ReadSessionLease};
 use self::types::{
     GetMessageData, GetMessageRawData, ListAccountsData, ListMailboxesData, OperationStatusData,
     SearchResultData, StoredOperation, finalize_tool, operation_summary,
@@ -42,6 +44,7 @@ const WRITE_INLINE_BUDGET_MS: u64 = 1_500;
 pub struct MailImapServer {
     config: Arc<ServerConfig>,
     cursors: Arc<Mutex<CursorStore>>,
+    read_sessions: Arc<ReadSessionCache>,
     operations: Arc<Mutex<BTreeMap<String, StoredOperation>>>,
     account_write_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     tool_router: ToolRouter<Self>,
@@ -51,9 +54,14 @@ pub struct MailImapServer {
 impl MailImapServer {
     pub fn new(config: ServerConfig) -> Self {
         let cursor_store = CursorStore::new(config.cursor_ttl_seconds, config.cursor_max_entries);
+        let read_session_cache = IdleSessionCache::new(
+            Duration::from_secs(config.read_session_cache_ttl_seconds),
+            config.read_session_cache_max_per_account,
+        );
         Self {
             config: Arc::new(config),
             cursors: Arc::new(Mutex::new(cursor_store)),
+            read_sessions: Arc::new(Mutex::new(read_session_cache)),
             operations: Arc::new(Mutex::new(BTreeMap::new())),
             account_write_locks: Arc::new(Mutex::new(BTreeMap::new())),
             tool_router: Self::tool_router(),
@@ -256,6 +264,32 @@ impl MailImapServer {
                 .map(|data| (operation_summary(&data.status, &data.operation.kind), data)),
         )
     }
+
+    async fn checkout_read_session(
+        &self,
+        account_id: &str,
+    ) -> crate::errors::AppResult<ReadSessionLease> {
+        loop {
+            let cached = {
+                let mut cache = self.read_sessions.lock().await;
+                cache.checkout(account_id, Instant::now())
+            };
+            if let Some(mut session) = cached {
+                if crate::imap::noop_session(&self.config, &mut session)
+                    .await
+                    .is_ok()
+                {
+                    return Ok(ReadSessionLease::new(account_id.to_owned(), session));
+                }
+                let _ = crate::imap::logout_session_best_effort(&self.config, session).await;
+                continue;
+            }
+
+            let account = self.config.get_account(account_id)?;
+            let session = crate::imap::connect_authenticated(&self.config, account).await?;
+            return Ok(ReadSessionLease::new(account_id.to_owned(), session));
+        }
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -378,6 +412,8 @@ mod tests {
             socket_timeout_ms: 300_000,
             cursor_ttl_seconds: 600,
             cursor_max_entries: 512,
+            read_session_cache_ttl_seconds: 120,
+            read_session_cache_max_per_account: 4,
             operation_max_entries: 256,
         }
     }

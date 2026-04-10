@@ -33,6 +33,7 @@ npx @bradsjm/mail-imap-mcp-rs@latest --transport http
 
 Supported npm/native targets:
 - macOS: Apple Silicon (`aarch64-apple-darwin`), Intel (`x86_64-apple-darwin`)
+- Linux `arm64`: glibc (`aarch64-unknown-linux-gnu`)
 - Linux x64: glibc (`x86_64-unknown-linux-gnu`), musl/Alpine (`x86_64-unknown-linux-musl`)
 - Windows x64: MSVC (`x86_64-pc-windows-msvc`)
 
@@ -80,7 +81,7 @@ docker build -t mail-imap-mcp-rs .
 docker run --rm -i --env-file .env mail-imap-mcp-rs
 ```
 
-Docker remains the recommended path for Linux `arm64`, which is not part of the npm/native release matrix.
+Docker remains an option for Linux `arm64`, but it is now part of the npm/native release matrix.
 
 ### From Source
 
@@ -172,7 +173,7 @@ MAIL_IMAP_PERSONAL_PASS=personal-password
 
 ### Advanced Configuration
 
-For timeouts, cursor settings, and other advanced options, see [Advanced Configuration](docs/advanced-configuration.md).
+For timeouts, cursor settings, read-session cache tuning, and other advanced options, see [Advanced Configuration](docs/advanced-configuration.md).
 
 To trust a private or self-signed IMAP server certificate without disabling TLS verification, set:
 

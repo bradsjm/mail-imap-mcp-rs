@@ -15,6 +15,7 @@ use crate::models::{
 };
 use crate::pagination::{CursorEntry, CursorStore};
 
+use super::session_cache::ReadSessionLease;
 use super::types::{
     GetMessageData, GetMessageRawData, ListMailboxesData, SearchResultData, SummaryBuildResult,
     ToolIssue, build_message_raw_uri, build_message_uri, is_hard_precondition_error,
@@ -48,10 +49,9 @@ impl MailImapServer {
         input: AccountOnlyInput,
     ) -> AppResult<ListMailboxesData> {
         validate_account_id(&input.account_id)?;
-        let account = self.config.get_account(&input.account_id)?;
         let mut issues = Vec::new();
 
-        let mut session = match imap::connect_authenticated(&self.config, account).await {
+        let mut session = match self.checkout_read_session(&input.account_id).await {
             Ok(session) => session,
             Err(error) => {
                 issues.push(ToolIssue::from_error("connect_authenticated", &error));
@@ -66,17 +66,31 @@ impl MailImapServer {
                     status: "failed".to_owned(),
                     issues,
                     next_action: next_action_list_accounts(),
-                    account_id: account.account_id.clone(),
+                    account_id: input.account_id.clone(),
                     mailboxes: Vec::new(),
                 });
             }
         };
 
-        let items = match imap::list_all_mailboxes(&self.config, &mut session).await {
+        let items = match imap::list_all_mailboxes(&self.config, session.session()).await {
             Ok(items) => items,
             Err(error) => {
                 issues.push(ToolIssue::from_error("list_mailboxes", &error));
-                Vec::new()
+                let _ = release_read_session(self, session, false).await;
+                log_runtime_issues(
+                    "imap_list_mailboxes",
+                    "failed",
+                    &input.account_id,
+                    None,
+                    &issues,
+                );
+                return Ok(ListMailboxesData {
+                    status: "failed".to_owned(),
+                    issues,
+                    next_action: next_action_list_accounts(),
+                    account_id: input.account_id.clone(),
+                    mailboxes: Vec::new(),
+                });
             }
         };
 
@@ -100,12 +114,14 @@ impl MailImapServer {
         let next_action = preferred_mailbox_name(&mailboxes)
             .map(|mailbox| next_action_search_mailbox(&input.account_id, &mailbox))
             .unwrap_or_else(next_action_list_accounts);
+        let account_id = input.account_id.clone();
+        let _ = release_read_session(self, session, issues.is_empty()).await;
 
         Ok(ListMailboxesData {
             status: status.to_owned(),
             issues,
             next_action,
-            account_id: account.account_id.clone(),
+            account_id,
             mailboxes,
         })
     }
@@ -117,9 +133,8 @@ impl MailImapServer {
         validate_search_input(&input)?;
         validate_account_id(&input.account_id)?;
         validate_mailbox(&input.mailbox)?;
-        let account = self.config.get_account(&input.account_id)?;
 
-        let mut session = match imap::connect_authenticated(&self.config, account).await {
+        let mut session = match self.checkout_read_session(&input.account_id).await {
             Ok(session) => session,
             Err(error) => {
                 let issues = vec![ToolIssue::from_error("connect_authenticated", &error)];
@@ -148,10 +163,13 @@ impl MailImapServer {
         };
 
         let uidvalidity =
-            match imap::select_mailbox_readonly(&self.config, &mut session, &input.mailbox).await {
+            match imap::select_mailbox_readonly(&self.config, session.session(), &input.mailbox)
+                .await
+            {
                 Ok(uidvalidity) => uidvalidity,
                 Err(error) => {
                     let issues = vec![ToolIssue::from_error("select_mailbox_readonly", &error)];
+                    let _ = release_read_session(self, session, false).await;
                     log_runtime_issues(
                         "imap_search_messages",
                         "failed",
@@ -177,13 +195,23 @@ impl MailImapServer {
             };
 
         let snapshot = if let Some(cursor) = input.cursor.clone() {
-            resume_cursor_search(&self.cursors, &input, uidvalidity, cursor).await?
-        } else {
-            match start_new_search(&self.config, &mut session, &input).await {
+            match resume_cursor_search(&self.cursors, &input, uidvalidity, cursor).await {
                 Ok(snapshot) => snapshot,
-                Err(error) if is_hard_precondition_error(&error) => return Err(error),
+                Err(error) => {
+                    let _ = release_read_session(self, session, true).await;
+                    return Err(error);
+                }
+            }
+        } else {
+            match start_new_search(&self.config, session.session(), &input).await {
+                Ok(snapshot) => snapshot,
+                Err(error) if is_hard_precondition_error(&error) => {
+                    let _ = release_read_session(self, session, false).await;
+                    return Err(error);
+                }
                 Err(error) => {
                     let issues = vec![ToolIssue::from_error("uid_search", &error)];
+                    let _ = release_read_session(self, session, false).await;
                     log_runtime_issues(
                         "imap_search_messages",
                         "failed",
@@ -218,6 +246,7 @@ impl MailImapServer {
 
         let total = uids_desc.len();
         if offset > total {
+            let _ = release_read_session(self, session, true).await;
             return Err(AppError::InvalidInput(
                 "cursor offset is out of range".to_owned(),
             ));
@@ -238,7 +267,7 @@ impl MailImapServer {
             failed,
         } = build_message_summaries(
             &self.config,
-            &mut session,
+            session.session(),
             &page_uids,
             SummaryBuildOptions {
                 account_id: &input.account_id,
@@ -292,6 +321,8 @@ impl MailImapServer {
             next_cursor.as_deref(),
             &messages,
         );
+        let reusable = issues.is_empty() || failed < attempted;
+        let _ = release_read_session(self, session, reusable).await;
 
         Ok(SearchResultData {
             status,
@@ -313,7 +344,7 @@ impl MailImapServer {
         &self,
         input: GetMessageInput,
     ) -> AppResult<GetMessageData> {
-        validate_chars(input.body_max_chars, 100, 20_000, "body_max_chars")?;
+        validate_chars(input.body_max_chars, 1, 16_000, "body_max_chars")?;
         let attachment_text_max_chars = input.attachment_text_max_chars.unwrap_or(10_000);
         if input.attachment_text_max_chars.is_some()
             && input.attachment_mode != crate::models::AttachmentMode::ExtractText
@@ -324,17 +355,16 @@ impl MailImapServer {
         }
         validate_chars(
             attachment_text_max_chars,
-            100,
-            50_000,
+            1,
+            64_000,
             "attachment_text_max_chars",
         )?;
 
         let message_id = parse_and_validate_message_id(&input.message_id)?;
         let encoded_message_id = message_id.encode();
-        let account = self.config.get_account(&message_id.account_id)?;
         let mut issues = Vec::new();
 
-        let mut session = match imap::connect_authenticated(&self.config, account).await {
+        let mut session = match self.checkout_read_session(&message_id.account_id).await {
             Ok(session) => session,
             Err(error) => {
                 issues.push(
@@ -356,31 +386,38 @@ impl MailImapServer {
                 });
             }
         };
-        ensure_uidvalidity_matches_readonly(&self.config, &mut session, &message_id).await?;
+        if let Err(error) =
+            ensure_uidvalidity_matches_readonly(&self.config, session.session(), &message_id).await
+        {
+            let _ = release_read_session(self, session, false).await;
+            return Err(error);
+        }
 
-        let raw = match imap::fetch_raw_message(&self.config, &mut session, message_id.uid).await {
-            Ok(raw) => raw,
-            Err(error) => {
-                issues.push(
-                    ToolIssue::from_error("fetch_raw_message", &error)
-                        .with_uid(message_id.uid)
-                        .with_message_id(&encoded_message_id),
-                );
-                log_runtime_issues(
-                    "imap_get_message",
-                    "failed",
-                    &message_id.account_id,
-                    Some(&message_id.mailbox),
-                    &issues,
-                );
-                return Ok(GetMessageData {
-                    status: "failed".to_owned(),
-                    issues,
-                    account_id: message_id.account_id.clone(),
-                    message: None,
-                });
-            }
-        };
+        let raw =
+            match imap::fetch_raw_message(&self.config, session.session(), message_id.uid).await {
+                Ok(raw) => raw,
+                Err(error) => {
+                    issues.push(
+                        ToolIssue::from_error("fetch_raw_message", &error)
+                            .with_uid(message_id.uid)
+                            .with_message_id(&encoded_message_id),
+                    );
+                    let _ = release_read_session(self, session, false).await;
+                    log_runtime_issues(
+                        "imap_get_message",
+                        "failed",
+                        &message_id.account_id,
+                        Some(&message_id.mailbox),
+                        &issues,
+                    );
+                    return Ok(GetMessageData {
+                        status: "failed".to_owned(),
+                        issues,
+                        account_id: message_id.account_id.clone(),
+                        message: None,
+                    });
+                }
+            };
 
         let parsed = match mime::parse_message(
             &raw,
@@ -396,6 +433,7 @@ impl MailImapServer {
                         .with_uid(message_id.uid)
                         .with_message_id(&encoded_message_id),
                 );
+                let _ = release_read_session(self, session, true).await;
                 log_runtime_issues(
                     "imap_get_message",
                     "failed",
@@ -436,7 +474,7 @@ impl MailImapServer {
             None
         };
 
-        let flags = match imap::fetch_flags(&self.config, &mut session, message_id.uid).await {
+        let flags = match imap::fetch_flags(&self.config, session.session(), message_id.uid).await {
             Ok(flags) => Some(flags),
             Err(error) => {
                 issues.push(
@@ -485,6 +523,8 @@ impl MailImapServer {
             Some(&message_id.mailbox),
             &issues,
         );
+        let reusable = issues.is_empty();
+        let _ = release_read_session(self, session, reusable).await;
 
         Ok(GetMessageData {
             status: status.to_owned(),
@@ -498,14 +538,13 @@ impl MailImapServer {
         &self,
         input: GetMessageRawInput,
     ) -> AppResult<GetMessageRawData> {
-        validate_chars(input.max_bytes, 1_024, 1_000_000, "max_bytes")?;
+        validate_chars(input.max_bytes, 1, 64_000, "max_bytes")?;
 
         let message_id = parse_and_validate_message_id(&input.message_id)?;
         let encoded_message_id = message_id.encode();
-        let account = self.config.get_account(&message_id.account_id)?;
         let mut issues = Vec::new();
 
-        let mut session = match imap::connect_authenticated(&self.config, account).await {
+        let mut session = match self.checkout_read_session(&message_id.account_id).await {
             Ok(session) => session,
             Err(error) => {
                 issues.push(
@@ -545,10 +584,15 @@ impl MailImapServer {
                 });
             }
         };
-        ensure_uidvalidity_matches_readonly(&self.config, &mut session, &message_id).await?;
+        if let Err(error) =
+            ensure_uidvalidity_matches_readonly(&self.config, session.session(), &message_id).await
+        {
+            let _ = release_read_session(self, session, false).await;
+            return Err(error);
+        }
 
         let total_size_bytes =
-            match imap::fetch_message_size(&self.config, &mut session, message_id.uid).await {
+            match imap::fetch_message_size(&self.config, session.session(), message_id.uid).await {
                 Ok(size) => size,
                 Err(error) => {
                     issues.push(
@@ -556,6 +600,7 @@ impl MailImapServer {
                             .with_uid(message_id.uid)
                             .with_message_id(&encoded_message_id),
                     );
+                    let _ = release_read_session(self, session, false).await;
                     log_runtime_issues(
                         "imap_get_message_raw",
                         "failed",
@@ -590,6 +635,7 @@ impl MailImapServer {
                 }
             };
         if input.offset_bytes > total_size_bytes {
+            let _ = release_read_session(self, session, true).await;
             return Err(AppError::InvalidInput(
                 "offset_bytes must not exceed total message size".to_owned(),
             ));
@@ -597,7 +643,7 @@ impl MailImapServer {
 
         let raw = match imap::fetch_raw_message_range(
             &self.config,
-            &mut session,
+            session.session(),
             message_id.uid,
             input.offset_bytes,
             input.max_bytes,
@@ -611,6 +657,7 @@ impl MailImapServer {
                         .with_uid(message_id.uid)
                         .with_message_id(&encoded_message_id),
                 );
+                let _ = release_read_session(self, session, false).await;
                 log_runtime_issues(
                     "imap_get_message_raw",
                     "failed",
@@ -653,6 +700,7 @@ impl MailImapServer {
             Some(&message_id.mailbox),
             &issues,
         );
+        let _ = release_read_session(self, session, issues.is_empty()).await;
 
         Ok(GetMessageRawData {
             status: "ok".to_owned(),
@@ -679,6 +727,20 @@ impl MailImapServer {
             raw_source_encoding: Some("base64".to_owned()),
         })
     }
+}
+
+async fn release_read_session(
+    server: &MailImapServer,
+    session: ReadSessionLease,
+    reusable: bool,
+) -> AppResult<()> {
+    if let Some(error) = session
+        .finish(&server.config, &server.read_sessions, reusable)
+        .await
+    {
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn ensure_uidvalidity_matches_readonly(

@@ -131,6 +131,27 @@ pub async fn connect_authenticated(
     Ok(session)
 }
 
+/// Verify that an authenticated session is still usable.
+pub async fn noop_session(server: &ServerConfig, session: &mut ImapSession) -> AppResult<()> {
+    timeout(socket_timeout(server), session.noop())
+        .await
+        .map_err(|_| AppError::Timeout("NOOP timed out".to_owned()))
+        .and_then(|r| r.map_err(|e| AppError::Internal(format!("NOOP failed: {e}"))))?;
+    Ok(())
+}
+
+/// Best-effort logout for a session that is no longer needed.
+pub async fn logout_session_best_effort(
+    server: &ServerConfig,
+    mut session: ImapSession,
+) -> AppResult<()> {
+    timeout(socket_timeout(server), session.logout())
+        .await
+        .map_err(|_| AppError::Timeout("LOGOUT timed out".to_owned()))
+        .and_then(|r| r.map_err(|e| AppError::Internal(format!("logout failed: {e}"))))?;
+    Ok(())
+}
+
 /// Query server capabilities
 ///
 /// Returns the IMAP capabilities supported by the server. Used to detect
@@ -806,6 +827,8 @@ mod tests {
             socket_timeout_ms: 15_000,
             cursor_ttl_seconds: 600,
             cursor_max_entries: 128,
+            read_session_cache_ttl_seconds: 120,
+            read_session_cache_max_per_account: 4,
             operation_max_entries: 256,
         }
     }

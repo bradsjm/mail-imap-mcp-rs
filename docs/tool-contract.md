@@ -167,12 +167,12 @@ Purpose: return parsed message details with optional bounded enrichments.
 
 Input:
 - `message_id` (required)
-- `body_max_chars?` (100..20000, default 2000)
+- `body_max_chars?` (1..16000, default 2000)
 - `body_mode?` (`text|html|both`, default `text`)
 - `include_headers?` (boolean, default true)
 - `include_all_headers?` (boolean, default false)
 - `attachment_mode?` (`none|metadata|extract_text`, default `metadata`)
-- `attachment_text_max_chars?` (100..50000, default 10000; only valid when `attachment_mode=extract_text`)
+- `attachment_text_max_chars?` (1..64000, default 10000; only valid when `attachment_mode=extract_text`)
 
 Output `data`:
 - `status`: `ok|partial|failed`
@@ -214,7 +214,7 @@ Purpose: return a bounded RFC822 byte range for diagnostics.
 
 Input:
 - `message_id` (required)
-- `max_bytes?` (1024..1000000, default 200000)
+- `max_bytes?` (1..64000, default 16000)
 - `offset_bytes?` (integer, default 0)
 
 Output `data`:
@@ -360,6 +360,8 @@ Server-wide:
 - `MAIL_IMAP_CONNECT_TIMEOUT_MS` (default `30000`)
 - `MAIL_IMAP_GREETING_TIMEOUT_MS` (default `15000`)
 - `MAIL_IMAP_SOCKET_TIMEOUT_MS` (default `300000`)
+- `MAIL_IMAP_READ_SESSION_CACHE_TTL_SECONDS` (default `120`)
+- `MAIL_IMAP_READ_SESSION_CACHE_MAX_PER_ACCOUNT` (default `4`; set `0` to disable read-session caching)
 - `MAIL_IMAP_OPERATION_MAX_ENTRIES` (default `256`; completed write operations retained in memory)
 
 ## Implementation Notes for Next Artifact

@@ -1535,6 +1535,8 @@ mod tests {
             socket_timeout_ms: 300_000,
             cursor_ttl_seconds: 600,
             cursor_max_entries: 512,
+            read_session_cache_ttl_seconds: 120,
+            read_session_cache_max_per_account: 4,
             operation_max_entries: 256,
         };
         assert_eq!(config.operation_max_entries, 256);

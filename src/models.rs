@@ -255,9 +255,9 @@ pub struct SearchMessagesInput {
 pub struct GetMessageInput {
     /// Stable message identifier (format: `imap:{account}:{mailbox}:{uidvalidity}:{uid}`)
     pub message_id: String,
-    /// Maximum body characters (100..20000, default 2000)
+    /// Maximum body characters (1..16000, default 2000)
     #[serde(default = "default_body_max_chars")]
-    #[schemars(range(min = 100, max = 20_000), transform = remove_format)]
+    #[schemars(range(min = 1, max = 16_000), transform = remove_format)]
     pub body_max_chars: usize,
     /// Requested body content mode
     #[serde(default = "default_body_mode")]
@@ -271,8 +271,8 @@ pub struct GetMessageInput {
     /// Requested attachment handling mode
     #[serde(default = "default_attachment_mode")]
     pub attachment_mode: AttachmentMode,
-    /// Maximum attachment text length (100..50000, requires `attachment_mode=extract_text`)
-    #[schemars(range(min = 100, max = 50_000), transform = remove_format)]
+    /// Maximum attachment text length (1..64000, requires `attachment_mode=extract_text`)
+    #[schemars(range(min = 1, max = 64_000), transform = remove_format)]
     pub attachment_text_max_chars: Option<usize>,
 }
 
@@ -283,9 +283,9 @@ pub struct GetMessageInput {
 pub struct GetMessageRawInput {
     /// Stable message identifier
     pub message_id: String,
-    /// Maximum message bytes to return (1024..1000000, default 200000)
+    /// Maximum message bytes to return (1..64000, default 16000)
     #[serde(default = "default_raw_max_bytes")]
-    #[schemars(range(min = 1_024, max = 1_000_000), transform = remove_format)]
+    #[schemars(range(min = 1, max = 64_000), transform = remove_format)]
     pub max_bytes: usize,
     /// Starting offset in the raw RFC822 source
     #[serde(default)]
@@ -386,10 +386,10 @@ fn default_attachment_mode() -> AttachmentMode {
 
 /// Default value for `max_bytes` in get_message_raw
 ///
-/// Large enough to capture full message headers and body for most messages,
-/// but bounded to prevent excessive output. 200KB is a practical limit.
+/// Large enough to capture common diagnostic slices without overwhelming
+/// context. 16KB is a practical default for raw message inspection.
 fn default_raw_max_bytes() -> usize {
-    200_000
+    16_000
 }
 
 fn message_action_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -560,19 +560,19 @@ mod tests {
             .expect("get_message schema must expose properties");
         assert_eq!(
             schema_numeric_property(message_props, "body_max_chars", "minimum"),
-            Some(100)
+            Some(1)
         );
         assert_eq!(
             schema_numeric_property(message_props, "body_max_chars", "maximum"),
-            Some(20_000)
+            Some(16_000)
         );
         assert_eq!(
             schema_numeric_property(message_props, "attachment_text_max_chars", "minimum"),
-            Some(100)
+            Some(1)
         );
         assert_eq!(
             schema_numeric_property(message_props, "attachment_text_max_chars", "maximum"),
-            Some(50_000)
+            Some(64_000)
         );
         assert!(message_props.contains_key("body_mode"));
         assert!(message_props.contains_key("attachment_mode"));
@@ -583,11 +583,11 @@ mod tests {
             .expect("get_message_raw schema must expose properties");
         assert_eq!(
             schema_numeric_property(raw_props, "max_bytes", "minimum"),
-            Some(1_024)
+            Some(1)
         );
         assert_eq!(
             schema_numeric_property(raw_props, "max_bytes", "maximum"),
-            Some(1_000_000)
+            Some(64_000)
         );
         assert_eq!(
             schema_variant_for(raw_props, "offset_bytes")

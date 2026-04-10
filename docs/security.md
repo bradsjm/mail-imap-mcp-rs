@@ -89,7 +89,7 @@ All potentially large outputs are bounded to prevent resource exhaustion.
 
 ```json
 {
-  "body_max_chars": 2000  // Range: 100..20000, default: 2000
+  "body_max_chars": 2000  // Range: 1..16000, default: 2000
 }
 ```
 
@@ -105,7 +105,7 @@ All potentially large outputs are bounded to prevent resource exhaustion.
 ```json
 {
   "attachment_mode": "extract_text",
-  "attachment_text_max_chars": 10000  // Range: 100..50000, default: 10000
+  "attachment_text_max_chars": 10000  // Range: 1..64000, default: 10000
 }
 ```
 
@@ -114,7 +114,7 @@ All potentially large outputs are bounded to prevent resource exhaustion.
 ```json
 {
   "offset_bytes": 0,
-  "max_bytes": 200000  // Range: 1024..1000000, default: 200000
+  "max_bytes": 16000  // Range: 1..64000, default: 16000
 }
 ```
 

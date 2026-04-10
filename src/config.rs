@@ -59,6 +59,10 @@ pub struct ServerConfig {
     pub cursor_ttl_seconds: u64,
     /// Maximum number of cursors to retain (LRU eviction when exceeded)
     pub cursor_max_entries: usize,
+    /// Time-to-live for cached read-only IMAP sessions in seconds
+    pub read_session_cache_ttl_seconds: u64,
+    /// Maximum idle read-only IMAP sessions cached per account
+    pub read_session_cache_max_per_account: usize,
     /// Maximum number of completed write operations to retain in memory
     pub operation_max_entries: usize,
 }
@@ -121,6 +125,14 @@ impl ServerConfig {
             socket_timeout_ms: parse_u64_env("MAIL_IMAP_SOCKET_TIMEOUT_MS", 300_000)?,
             cursor_ttl_seconds: parse_u64_env("MAIL_IMAP_CURSOR_TTL_SECONDS", 600)?,
             cursor_max_entries: parse_usize_env("MAIL_IMAP_CURSOR_MAX_ENTRIES", 512)?,
+            read_session_cache_ttl_seconds: parse_u64_env(
+                "MAIL_IMAP_READ_SESSION_CACHE_TTL_SECONDS",
+                120,
+            )?,
+            read_session_cache_max_per_account: parse_usize_env(
+                "MAIL_IMAP_READ_SESSION_CACHE_MAX_PER_ACCOUNT",
+                4,
+            )?,
             operation_max_entries: parse_usize_env("MAIL_IMAP_OPERATION_MAX_ENTRIES", 256)?,
         })
     }
@@ -322,7 +334,14 @@ fn load_ca_certs_env(key: &str) -> AppResult<Vec<CertificateDer<'static>>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_ca_certs_env, parse_bool_value};
+    use std::sync::{Mutex, OnceLock};
+
+    use super::{ServerConfig, load_ca_certs_env, parse_bool_value};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn parse_bool_value_accepts_common_truthy_and_falsy_values() {
@@ -344,6 +363,7 @@ mod tests {
 
     #[test]
     fn load_ca_certs_env_rejects_empty_value() {
+        let _guard = env_lock().lock().expect("env lock");
         let key = "MAIL_IMAP_CA_CERT_PATH";
         unsafe { std::env::set_var(key, "   ") };
 
@@ -351,5 +371,50 @@ mod tests {
         assert!(err.to_string().contains("must not be empty"));
 
         unsafe { std::env::remove_var(key) };
+    }
+
+    #[test]
+    fn load_from_env_uses_read_session_cache_defaults() {
+        let _guard = env_lock().lock().expect("env lock");
+        let vars = [
+            ("MAIL_IMAP_DEFAULT_HOST", "imap.example.com"),
+            ("MAIL_IMAP_DEFAULT_USER", "user@example.com"),
+            ("MAIL_IMAP_DEFAULT_PASS", "secret"),
+        ];
+        for (key, value) in vars {
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        let config = ServerConfig::load_from_env().expect("config loads");
+        assert_eq!(config.read_session_cache_ttl_seconds, 120);
+        assert_eq!(config.read_session_cache_max_per_account, 4);
+
+        for (key, _) in vars {
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    #[test]
+    fn load_from_env_rejects_invalid_read_session_cache_size() {
+        let _guard = env_lock().lock().expect("env lock");
+        let vars = [
+            ("MAIL_IMAP_DEFAULT_HOST", "imap.example.com"),
+            ("MAIL_IMAP_DEFAULT_USER", "user@example.com"),
+            ("MAIL_IMAP_DEFAULT_PASS", "secret"),
+            ("MAIL_IMAP_READ_SESSION_CACHE_MAX_PER_ACCOUNT", "oops"),
+        ];
+        for (key, value) in vars {
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        let err = ServerConfig::load_from_env().expect_err("invalid cache size must fail");
+        assert!(
+            err.to_string()
+                .contains("MAIL_IMAP_READ_SESSION_CACHE_MAX_PER_ACCOUNT")
+        );
+
+        for (key, _) in vars {
+            unsafe { std::env::remove_var(key) };
+        }
     }
 }

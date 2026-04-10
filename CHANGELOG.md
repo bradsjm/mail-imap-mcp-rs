@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.3]
+
+### Added
+
+- Added optional streamable HTTP transport via `--transport http`, including configurable bind address and port with the MCP endpoint served at `/mcp`.
+- Added tracked write-operation polling and cancellation through `imap_get_operation` and `imap_cancel_operation`.
+- Added configurable read-session caching for read tools with `MAIL_IMAP_READ_SESSION_CACHE_TTL_SECONDS` and `MAIL_IMAP_READ_SESSION_CACHE_MAX_PER_ACCOUNT`.
+- Added Linux `arm64` (`aarch64-unknown-linux-gnu`) to the npm/native release matrix.
+- Published concrete output schemas for every MCP tool so clients can rely on server-declared response shapes.
+
+### Changed
+
+- Refactored write operations to run as tracked backend operations with progress metadata and reusable polling instructions in tool responses.
+- Tightened message fetch bounds by reducing `imap_get_message_raw.max_bytes` to `1..64000` with a default of `16000`, and aligning `imap_get_message` body and attachment extraction limits to the current runtime validation ranges.
+- Hardened MCP schema publication and validation so public tool inputs stay client-safe and documented contracts match the current server payloads.
+
 ## [0.3.2]
 
 ### Added
