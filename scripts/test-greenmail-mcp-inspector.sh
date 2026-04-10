@@ -445,7 +445,7 @@ assert_tool_schema "imap_search_messages" "search parameter contract" '
     and ($schema.properties.end_date.pattern == "^\\d{4}-\\d{2}-\\d{2}$")
     and has_type($schema.properties.limit; "integer")
     and ($schema.properties.limit.minimum == 1)
-    and ($schema.properties.limit.maximum == 50)
+    and ($schema.properties.limit.maximum == 100)
     and (($schema.properties | has("snippet_max_chars")))
     and ($schema.properties.snippet_max_chars.minimum == 50)
     and ($schema.properties.snippet_max_chars.maximum == 500)

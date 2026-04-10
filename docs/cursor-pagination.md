@@ -37,7 +37,7 @@ Search responses include pagination metadata in the `data` field:
 | Field | Type | Description |
 |-------|------|-------------|
 | `total` | integer | Total number of messages matching search criteria (up to 20,000) |
-| `messages` | array | Current page of messages (max `limit`, default 10, max 50) |
+| `messages` | array | Current page of messages (max `limit`, default 10, max 100) |
 | `next_cursor` | string? | Opaque cursor string for fetching next page; absent if no more results |
 | `has_more` | boolean | `true` if additional pages available |
 

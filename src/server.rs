@@ -30,7 +30,7 @@ use self::types::{
 };
 
 /// Maximum messages per search result page.
-const MAX_SEARCH_LIMIT: usize = 50;
+const MAX_SEARCH_LIMIT: usize = 100;
 /// Maximum UID search results stored in a cursor snapshot.
 const MAX_CURSOR_UIDS_STORED: usize = 1_000;
 /// Maximum number of explicit message ids accepted by bulk write tools.

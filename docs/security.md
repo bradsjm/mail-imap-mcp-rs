@@ -131,7 +131,7 @@ All inputs are validated before IMAP operations:
 - `query`, `from`, `to`, `subject`: 1..256 characters
 - `account_id`: 1..64 characters, pattern `^[A-Za-z0-9_-]+$`
 - `mailbox`: 1..256 characters
-- `limit`: 1..50 messages
+- `limit`: 1..100 messages
 
 ### Content Sanitization
 

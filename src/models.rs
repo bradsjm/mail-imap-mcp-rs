@@ -238,9 +238,9 @@ pub struct SearchMessagesInput {
     /// Filter to messages before this date (YYYY-MM-DD)
     #[schemars(pattern(r"^\d{4}-\d{2}-\d{2}$"))]
     pub end_date: Option<String>,
-    /// Maximum messages to return (1..50, default 10)
+    /// Maximum messages to return (1..100, default 10)
     #[serde(default = "default_limit")]
-    #[schemars(range(min = 1, max = 50), transform = remove_format)]
+    #[schemars(range(min = 1, max = 100), transform = remove_format)]
     pub limit: usize,
     /// Maximum snippet length (50..500). When omitted, snippets are not included.
     #[schemars(range(min = 50, max = 500), transform = remove_format)]
@@ -528,7 +528,7 @@ mod tests {
         );
         assert_eq!(
             schema_numeric_property(properties, "limit", "maximum"),
-            Some(50)
+            Some(100)
         );
         assert_eq!(
             schema_numeric_property(properties, "last_days", "minimum"),

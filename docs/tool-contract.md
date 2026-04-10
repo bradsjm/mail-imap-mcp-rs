@@ -38,7 +38,7 @@ It is the source of truth for tool names, input/output shapes, validation bounds
 ### `limit`
 
 - Type: integer
-- Range: 1..50
+- Range: 1..100
 - Default: 10
 
 ## Shared Output Envelope

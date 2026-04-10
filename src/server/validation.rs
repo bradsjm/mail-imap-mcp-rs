@@ -246,7 +246,7 @@ pub(super) fn validate_chars(value: usize, min: usize, max: usize, field: &str) 
 
 pub(super) fn validate_search_input(input: &SearchMessagesInput) -> AppResult<()> {
     validate_mailbox(&input.mailbox)?;
-    validate_chars(input.limit, 1, 50, "limit")?;
+    validate_chars(input.limit, 1, 100, "limit")?;
 
     if input.cursor.is_some() {
         return Ok(());
@@ -560,7 +560,7 @@ mod tests {
             last_days: Some(365),
             start_date: Some("2025-01-01".to_owned()),
             end_date: Some("2025-12-31".to_owned()),
-            limit: 50,
+            limit: 100,
             snippet_max_chars: Some(200),
         };
 
@@ -581,7 +581,7 @@ mod tests {
             last_days: Some(30),
             start_date: Some("2025-01-01".to_owned()),
             end_date: Some("2025-12-31".to_owned()),
-            limit: 50,
+            limit: 100,
             snippet_max_chars: None,
         };
 
@@ -606,7 +606,7 @@ mod tests {
             last_days: None,
             start_date: None,
             end_date: None,
-            limit: 50,
+            limit: 100,
             snippet_max_chars: Some(200),
         };
 
