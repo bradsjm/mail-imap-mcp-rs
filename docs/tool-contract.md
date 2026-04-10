@@ -134,7 +134,7 @@ Validation:
 - `last_days` cannot be combined with `start_date`/`end_date`.
 - `start_date <= end_date`.
 - Search text fields and mailbox values must not contain ASCII control characters.
-- Searches matching more than 20,000 messages are rejected; narrow filters and retry.
+- Searches matching more than 1,000 messages are rejected; narrow filters and retry.
 
 Output `data`:
 - `status`: `ok|partial|failed`

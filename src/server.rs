@@ -32,7 +32,7 @@ use self::types::{
 /// Maximum messages per search result page.
 const MAX_SEARCH_LIMIT: usize = 50;
 /// Maximum UID search results stored in a cursor snapshot.
-const MAX_CURSOR_UIDS_STORED: usize = 20_000;
+const MAX_CURSOR_UIDS_STORED: usize = 1_000;
 /// Maximum number of explicit message ids accepted by bulk write tools.
 const MAX_BULK_MESSAGE_IDS: usize = 250;
 /// Valid built-in IMAP system flags.

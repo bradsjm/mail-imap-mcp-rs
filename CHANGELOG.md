@@ -13,6 +13,7 @@
 ### Changed
 
 - Refactored write operations to run as tracked backend operations with progress metadata and reusable polling instructions in tool responses.
+- Tightened `imap_search_messages` so searches matching more than 1,000 messages are rejected instead of allowing up to 20,000.
 - Tightened message fetch bounds by reducing `imap_get_message_raw.max_bytes` to `1..64000` with a default of `16000`, and aligning `imap_get_message` body and attachment extraction limits to the current runtime validation ranges.
 - Hardened MCP schema publication and validation so public tool inputs stay client-safe and documented contracts match the current server payloads.
 

@@ -81,8 +81,6 @@ docker build -t mail-imap-mcp-rs .
 docker run --rm -i --env-file .env mail-imap-mcp-rs
 ```
 
-Docker remains an option for Linux `arm64`, but it is now part of the npm/native release matrix.
-
 ### From Source
 
 ```bash
@@ -259,7 +257,7 @@ Rerun the search without a cursor. See [Cursor Pagination](docs/cursor-paginatio
 ### Search Too Broad
 
 ```
-Error: invalid input: search matched 25000 messages; narrow filters to at most 20000 results
+Error: invalid input: search matched 25000 messages; narrow filters to at most 1000 results
 ```
 
 Add tighter filters (`last_days`, `from`, `subject`, date ranges) and rerun.
@@ -291,16 +289,6 @@ Key security features:
 - [Cursor Pagination](docs/cursor-pagination.md) - Pagination behavior, expiration, error handling
 - [Security Considerations](docs/security.md) - Security features, best practices, limitations
 - [Advanced Configuration](docs/advanced-configuration.md) - Timeouts, cursors, performance tuning
-
-## Development
-
-See `AGENTS.md` for contributor guidelines and build/lint/test commands.
-
-```bash
-cargo test
-cargo fmt -- --check
-cargo clippy --all-targets -- -D warnings
-```
 
 ## License
 

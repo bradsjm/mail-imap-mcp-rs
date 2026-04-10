@@ -952,7 +952,12 @@ mod tests {
     use super::resume_cursor_search;
     use crate::models::{MessageSummary, SearchMessagesInput};
     use crate::pagination::{CursorEntry, CursorStore};
-    use crate::server::types::next_action_for_search_result;
+    use crate::server::{MAX_CURSOR_UIDS_STORED, types::next_action_for_search_result};
+
+    #[test]
+    fn search_cursor_storage_limit_is_capped_at_one_thousand_results() {
+        assert_eq!(MAX_CURSOR_UIDS_STORED, 1_000);
+    }
 
     #[tokio::test]
     async fn resume_cursor_accepts_legacy_encoded_mailbox_with_decoded_input() {

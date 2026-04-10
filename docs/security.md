@@ -140,10 +140,10 @@ All inputs are validated before IMAP operations:
 
 ### Search Result Limits
 
-Searches matching more than 20,000 messages are rejected:
+Searches matching more than 1,000 messages are rejected:
 
 ```
-Error: invalid input: search matched 25000 messages; narrow filters to at most 20000 results
+Error: invalid input: search matched 25000 messages; narrow filters to at most 1000 results
 ```
 
 Resolution: Add tighter filters (`last_days`, `from`, `subject`, date ranges).
