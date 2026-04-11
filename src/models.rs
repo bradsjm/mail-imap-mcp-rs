@@ -342,12 +342,23 @@ pub struct ManageMailboxInput {
     pub destination_mailbox: Option<String>,
 }
 
-/// Input: fetch or cancel a previously started write operation.
+/// Input: cancel a previously started write operation.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct OperationIdInput {
     /// Opaque operation identifier returned by a write tool.
     #[schemars(length(min = 1, max = 64))]
     pub operation_id: String,
+}
+
+/// Input: fetch the status of a previously started write operation.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GetOperationInput {
+    /// Opaque operation identifier returned by a write tool.
+    #[schemars(length(min = 1, max = 64))]
+    pub operation_id: String,
+    /// Include the completed result payload when the operation is terminal.
+    #[serde(default)]
+    pub include_result: bool,
 }
 
 /// Default value for `account_id` field
@@ -491,8 +502,8 @@ mod tests {
 
     use super::{
         AccountOnlyInput, ApplyToMessagesInput, GetMessageInput, GetMessageRawInput,
-        ManageMailboxInput, OperationIdInput, SearchMessagesInput, UpdateMessageFlagsInput,
-        validate_client_safe_input_schema,
+        GetOperationInput, ManageMailboxInput, OperationIdInput, SearchMessagesInput,
+        UpdateMessageFlagsInput, validate_client_safe_input_schema,
     };
 
     #[test]
@@ -505,6 +516,7 @@ mod tests {
             schema_for_type::<ApplyToMessagesInput>(),
             schema_for_type::<UpdateMessageFlagsInput>(),
             schema_for_type::<ManageMailboxInput>(),
+            schema_for_type::<GetOperationInput>(),
             schema_for_type::<OperationIdInput>(),
         ] {
             assert_no_nonstandard_integer_formats(&Value::Object((*schema).clone()));
@@ -629,6 +641,16 @@ mod tests {
             !flag_props.contains_key("dry_run"),
             "update_message_flags schema must not publish dry_run"
         );
+
+        let get_operation_schema = schema_for_type::<GetOperationInput>();
+        let get_operation_props = get_operation_schema["properties"]
+            .as_object()
+            .expect("get_operation schema must expose properties");
+        assert_eq!(
+            schema_string_property(get_operation_props, "include_result", "type"),
+            Some("boolean")
+        );
+        assert!(get_operation_props.contains_key("operation_id"));
     }
 
     #[test]
@@ -637,6 +659,7 @@ mod tests {
             schema_for_type::<ApplyToMessagesInput>(),
             schema_for_type::<UpdateMessageFlagsInput>(),
             schema_for_type::<ManageMailboxInput>(),
+            schema_for_type::<GetOperationInput>(),
             schema_for_type::<OperationIdInput>(),
         ] {
             validate_client_safe_input_schema(&Value::Object((*schema).clone()))

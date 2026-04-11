@@ -313,6 +313,8 @@ assert_operation_wrapper() {
       and (
         ($data.operation.done == true and (($data.result | type) == "object") and (($data | has("next_action")) | not))
         or
+        ($data.operation.done == true and ($data.result == null) and ($data.next_action.tool == "imap_get_operation") and ($data.next_action.arguments.operation_id == $data.operation.operation_id) and ($data.next_action.arguments.include_result == true))
+        or
         ($data.operation.done == false and ($data.result == null) and ($data.next_action.tool == "imap_get_operation") and ($data.next_action.arguments.operation_id == $data.operation.operation_id))
       )
   ' --arg kind "$kind"
@@ -343,6 +345,14 @@ wait_for_terminal_operation_json() {
   assert_operation_wrapper "${description} operation wrapper" "$json" "$kind"
   done=$(printf '%s\n' "$json" | jq -r '(.structuredContent.data // .data).operation.done')
   if [[ "$done" == "true" ]]; then
+    if printf '%s\n' "$json" | jq -e '((.structuredContent.data // .data).result == null) and ((.structuredContent.data // .data).next_action.arguments.include_result == true)' >/dev/null; then
+      run_inspector \
+        --method tools/call \
+        --tool-name imap_get_operation \
+        --tool-arg "operation_id=${operation_id}" \
+        --tool-arg include_result=true
+      return 0
+    fi
     printf '%s\n' "$json"
     return 0
   fi
@@ -357,6 +367,14 @@ wait_for_terminal_operation_json() {
     assert_operation_wrapper "${description} polled operation wrapper" "$polled_json" "$kind"
     done=$(printf '%s\n' "$polled_json" | jq -r '(.structuredContent.data // .data).operation.done')
     if [[ "$done" == "true" ]]; then
+      if printf '%s\n' "$polled_json" | jq -e '((.structuredContent.data // .data).result == null) and ((.structuredContent.data // .data).next_action.arguments.include_result == true)' >/dev/null; then
+        run_inspector \
+          --method tools/call \
+          --tool-name imap_get_operation \
+          --tool-arg "operation_id=${operation_id}" \
+          --tool-arg include_result=true
+        return 0
+      fi
       printf '%s\n' "$polled_json"
       return 0
     fi
@@ -528,6 +546,8 @@ assert_tool_schema "imap_get_operation" "get_operation parameter contract" '
   | ($schema.type == "object")
     and (($schema.required // []) | index("operation_id") != null)
     and (($schema.properties | has("operation_id")))
+    and (($schema.properties | has("include_result")))
+    and ($schema.properties.include_result.type == "boolean")
 '
 assert_tool_schema "imap_cancel_operation" "cancel_operation parameter contract" '
   .tools[] | select(.name == $name) | .inputSchema as $schema

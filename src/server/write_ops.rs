@@ -10,7 +10,8 @@ use crate::imap;
 use crate::mailbox_codec::normalize_mailbox_name;
 use crate::message_id::MessageId;
 use crate::models::{
-    ApplyToMessagesInput, ManageMailboxInput, OperationIdInput, UpdateMessageFlagsInput,
+    ApplyToMessagesInput, GetOperationInput, ManageMailboxInput, OperationIdInput,
+    UpdateMessageFlagsInput,
 };
 
 use super::types::{
@@ -20,8 +21,8 @@ use super::types::{
     OperationStep, OperationStepOutcome, StoredOperation, StoredOperationSpec, ToolIssue,
     UpdateFlagsOperation, canceled_tool_issue, destination_mailbox_for_action, flag_operation_name,
     mailbox_action_display, mailbox_action_stage, message_action_name, next_action_get_operation,
-    next_operation_step, now_utc_string, operation_kind_label, operation_total_units,
-    status_from_issue_and_counts,
+    next_action_get_operation_with_result, next_operation_step, now_utc_string,
+    operation_kind_label, operation_total_units, status_from_issue_and_counts,
 };
 use super::validation::{
     build_flag_update_request, build_mailbox_action, build_message_action, parse_bulk_message_ids,
@@ -84,12 +85,13 @@ impl MailImapServer {
 
     pub(super) async fn get_operation_impl(
         &self,
-        input: OperationIdInput,
+        input: GetOperationInput,
     ) -> AppResult<OperationStatusData> {
         validate_operation_id(&input.operation_id)?;
         self.ensure_operation_worker_running(&input.operation_id)
             .await?;
-        self.operation_response(&input.operation_id).await
+        self.operation_response(&input.operation_id, input.include_result)
+            .await
     }
 
     pub(super) async fn cancel_operation_impl(
@@ -109,7 +111,7 @@ impl MailImapServer {
         }
         self.ensure_operation_worker_running(&input.operation_id)
             .await?;
-        self.operation_response(&input.operation_id).await
+        self.operation_response(&input.operation_id, true).await
     }
 
     async fn preflight_apply_message_operation(
@@ -215,7 +217,7 @@ impl MailImapServer {
         self.run_operation_until(&operation_id, Some(deadline))
             .await?;
         self.ensure_operation_worker_running(&operation_id).await?;
-        self.operation_response(&operation_id).await
+        self.operation_response(&operation_id, true).await
     }
 
     pub(super) async fn create_operation(&self, spec: StoredOperationSpec) -> String {
@@ -530,12 +532,26 @@ impl MailImapServer {
     pub(super) async fn operation_response(
         &self,
         operation_id: &str,
+        include_result: bool,
     ) -> AppResult<OperationStatusData> {
         let operation = {
             let operations = self.operations.lock().await;
             operations.get(operation_id).cloned().ok_or_else(|| {
                 AppError::NotFound(format!("operation '{operation_id}' not found"))
             })?
+        };
+        let is_terminal = operation.state.is_terminal();
+        let result = if is_terminal && include_result {
+            operation.result.clone()
+        } else {
+            None
+        };
+        let next_action = if !is_terminal {
+            Some(next_action_get_operation(operation_id))
+        } else if operation.result.is_some() && !include_result {
+            Some(next_action_get_operation_with_result(operation_id))
+        } else {
+            None
         };
 
         Ok(OperationStatusData {
@@ -545,16 +561,15 @@ impl MailImapServer {
                 operation_id: operation.operation_id,
                 kind: operation.kind,
                 state: operation.state.state_label().to_owned(),
-                done: operation.state.is_terminal(),
+                done: is_terminal,
                 cancel_supported: operation.cancel_supported,
                 created_at: operation.created_at,
                 started_at: operation.started_at,
                 finished_at: operation.finished_at,
                 progress: operation.progress,
             },
-            result: operation.result,
-            next_action: (!operation.state.is_terminal())
-                .then(|| next_action_get_operation(operation_id)),
+            result,
+            next_action,
         })
     }
 

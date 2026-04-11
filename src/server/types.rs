@@ -501,6 +501,17 @@ pub(super) fn next_action_get_operation(operation_id: &str) -> NextAction {
     )
 }
 
+pub(super) fn next_action_get_operation_with_result(operation_id: &str) -> NextAction {
+    next_action(
+        "Fetch the completed operation result payload.",
+        "imap_get_operation",
+        serde_json::json!({
+            "operation_id": operation_id,
+            "include_result": true,
+        }),
+    )
+}
+
 pub(super) fn preferred_mailbox_name(mailboxes: &[MailboxInfo]) -> Option<String> {
     mailboxes
         .iter()

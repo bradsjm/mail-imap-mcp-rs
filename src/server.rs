@@ -19,7 +19,8 @@ use tokio::sync::Mutex;
 use crate::config::ServerConfig;
 use crate::models::{
     AccountInfo, AccountOnlyInput, ApplyToMessagesInput, GetMessageInput, GetMessageRawInput,
-    ManageMailboxInput, OperationIdInput, SearchMessagesInput, UpdateMessageFlagsInput,
+    GetOperationInput, ManageMailboxInput, OperationIdInput, SearchMessagesInput,
+    UpdateMessageFlagsInput,
 };
 use crate::pagination::CursorStore;
 
@@ -235,7 +236,7 @@ impl MailImapServer {
     )]
     async fn get_operation(
         &self,
-        Parameters(input): Parameters<OperationIdInput>,
+        Parameters(input): Parameters<GetOperationInput>,
     ) -> Result<Json<crate::models::ToolEnvelope<OperationStatusData>>, ErrorData> {
         let started = Instant::now();
         finalize_tool(
@@ -308,11 +309,13 @@ mod tests {
     use rmcp::handler::server::tool::schema_for_output;
 
     use super::*;
-    use crate::models::{OperationIdInput, ToolEnvelope, validate_client_safe_input_schema};
+    use crate::models::{
+        GetOperationInput, OperationIdInput, ToolEnvelope, validate_client_safe_input_schema,
+    };
     use crate::server::types::{
-        GetMessageData, GetMessageRawData, ListAccountsData, ListMailboxesData,
-        ManageMailboxOperation, OperationState, OperationStatusData, SearchResultData,
-        StoredOperationSpec,
+        GetMessageData, GetMessageRawData, ListAccountsData, ListMailboxesData, MailboxAction,
+        MailboxManagementResult, ManageMailboxOperation, OperationResultData, OperationState,
+        OperationStatusData, SearchResultData, StoredOperation, StoredOperationSpec,
     };
 
     #[test]
@@ -323,6 +326,39 @@ mod tests {
             validate_client_safe_input_schema(&schema).unwrap_or_else(|error| {
                 panic!("tool {} published unsafe schema: {error}", tool.name)
             });
+        }
+    }
+
+    fn completed_operation(operation_id: &str, finished_at: &str) -> StoredOperation {
+        StoredOperation {
+            operation_id: operation_id.to_owned(),
+            kind: "imap_manage_mailbox".to_owned(),
+            state: OperationState::Ok,
+            created_at: finished_at.to_owned(),
+            started_at: None,
+            finished_at: Some(finished_at.to_owned()),
+            cancel_supported: true,
+            worker_started: false,
+            progress: crate::server::types::OperationProgress::new(1, "ok"),
+            issues: Vec::new(),
+            result: Some(OperationResultData::MailboxManagement(
+                MailboxManagementResult {
+                    status: "ok".to_owned(),
+                    issues: Vec::new(),
+                    account_id: "default".to_owned(),
+                    action: "create".to_owned(),
+                    mailbox: "Archive".to_owned(),
+                    destination_mailbox: None,
+                },
+            )),
+            spec: StoredOperationSpec::ManageMailbox(ManageMailboxOperation {
+                account_id: "default".to_owned(),
+                action: MailboxAction::Create {
+                    mailbox: "Archive".to_owned(),
+                },
+                completed: true,
+                result: None,
+            }),
         }
     }
 
@@ -442,7 +478,7 @@ mod tests {
         }
 
         let response = server
-            .operation_response(&operation_id)
+            .operation_response(&operation_id, true)
             .await
             .expect("operation response should be available");
         assert_eq!(response.status, "running");
@@ -505,8 +541,9 @@ mod tests {
         }
 
         let initial = server
-            .get_operation_impl(OperationIdInput {
+            .get_operation_impl(GetOperationInput {
                 operation_id: operation_id.clone(),
+                include_result: false,
             })
             .await
             .expect("operation response should be available");
@@ -514,17 +551,76 @@ mod tests {
 
         for _ in 0..20 {
             let response = server
-                .operation_response(&operation_id)
+                .operation_response(&operation_id, false)
                 .await
                 .expect("operation response should be available");
             if response.operation.done {
                 assert_eq!(response.status, "canceled");
-                assert!(response.next_action.is_none());
+                let next_action = response
+                    .next_action
+                    .as_ref()
+                    .expect("next action should request the withheld terminal result");
+                assert_eq!(next_action.tool, "imap_get_operation");
+                assert_eq!(next_action.arguments["operation_id"], operation_id);
+                assert_eq!(next_action.arguments["include_result"], true);
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
         panic!("operation did not reach a terminal state after restart");
+    }
+
+    #[tokio::test]
+    async fn get_operation_terminal_status_only_points_to_result_fetch() {
+        let server = MailImapServer::new(schema_test_server_config());
+        let operation = completed_operation("terminal-status-only", "2026-01-01T00:00:00Z");
+        let operation_id = operation.operation_id.clone();
+        server
+            .operations
+            .lock()
+            .await
+            .insert(operation_id.clone(), operation);
+
+        let response = server
+            .get_operation_impl(GetOperationInput {
+                operation_id: operation_id.clone(),
+                include_result: false,
+            })
+            .await
+            .expect("operation response should be available");
+
+        assert!(response.operation.done);
+        assert!(response.result.is_none());
+        let next_action = response
+            .next_action
+            .as_ref()
+            .expect("next action should be present");
+        assert_eq!(next_action.tool, "imap_get_operation");
+        assert_eq!(next_action.arguments["operation_id"], operation_id);
+        assert_eq!(next_action.arguments["include_result"], true);
+    }
+
+    #[tokio::test]
+    async fn get_operation_terminal_with_include_result_returns_payload() {
+        let server = MailImapServer::new(schema_test_server_config());
+        let operation = completed_operation("terminal-with-result", "2026-01-01T00:00:00Z");
+        server
+            .operations
+            .lock()
+            .await
+            .insert(operation.operation_id.clone(), operation);
+
+        let response = server
+            .get_operation_impl(GetOperationInput {
+                operation_id: "terminal-with-result".to_owned(),
+                include_result: true,
+            })
+            .await
+            .expect("operation response should be available");
+
+        assert!(response.operation.done);
+        assert!(response.result.is_some());
+        assert!(response.next_action.is_none());
     }
 }

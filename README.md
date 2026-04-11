@@ -211,7 +211,7 @@ All tools return a consistent envelope:
 | `imap_apply_to_messages` | Apply one action (`move`, `copy`, `delete`) to explicit messages |
 | `imap_update_message_flags` | Add, remove, or replace flags on explicit messages |
 | `imap_manage_mailbox` | Create, rename, or delete a mailbox |
-| `imap_get_operation` | Poll a write operation until it reaches a terminal state |
+| `imap_get_operation` | Poll a write operation status and optionally fetch its terminal result |
 | `imap_cancel_operation` | Request cancellation for a running write operation |
 
 Write operations require `MAIL_IMAP_WRITE_ENABLED=true`.

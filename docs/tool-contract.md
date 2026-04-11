@@ -312,13 +312,14 @@ Purpose: poll a previously accepted write operation.
 
 Input:
 - `operation_id` (required)
+- `include_result?` (optional boolean, default `false`)
 
 Output `data`:
 - `status`: `accepted|running|ok|partial|failed|canceled`
 - `issues`: array of currently accumulated diagnostic issues
 - `operation`: `{ operation_id, kind, state, done, cancel_supported, created_at, started_at?, finished_at?, progress }`
-- `result?`: final completed payload when `done=true`
-- `next_action?`: polling instruction for `imap_get_operation` when `done=false`
+- `result?`: final completed payload when `done=true` and `include_result=true`
+- `next_action?`: polling instruction for `imap_get_operation` when `done=false`; if the operation is already complete and a result exists but `include_result=false`, `next_action` points to `imap_get_operation` with `include_result=true`
 
 ### 10) `imap_cancel_operation`
 
