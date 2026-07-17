@@ -65,6 +65,19 @@ pub struct ServerConfig {
     pub read_session_cache_max_per_account: usize,
     /// Maximum number of completed write operations to retain in memory
     pub operation_max_entries: usize,
+    /// Maximum number of bytes fetched from an IMAP message
+    pub message_fetch_budget_bytes: usize,
+    /// Maximum number of bytes decoded while processing an IMAP message
+    #[allow(dead_code)]
+    pub message_decode_budget_bytes: usize,
+    /// Maximum depth of MIME nesting accepted while processing a message
+    #[allow(dead_code)]
+    pub mime_max_depth: usize,
+    /// Maximum number of MIME parts accepted while processing a message
+    #[allow(dead_code)]
+    pub mime_max_parts: usize,
+    /// Maximum number of attachment bytes extracted from an IMAP message
+    pub attachment_extract_budget_bytes: usize,
 }
 
 impl ServerConfig {
@@ -134,6 +147,20 @@ impl ServerConfig {
                 4,
             )?,
             operation_max_entries: parse_usize_env("MAIL_IMAP_OPERATION_MAX_ENTRIES", 256)?,
+            message_fetch_budget_bytes: parse_usize_env(
+                "MAIL_IMAP_MESSAGE_FETCH_BUDGET_BYTES",
+                8_388_608,
+            )?,
+            message_decode_budget_bytes: parse_usize_env(
+                "MAIL_IMAP_MESSAGE_DECODE_BUDGET_BYTES",
+                16_777_216,
+            )?,
+            mime_max_depth: parse_usize_env("MAIL_IMAP_MIME_MAX_DEPTH", 32)?,
+            mime_max_parts: parse_usize_env("MAIL_IMAP_MIME_MAX_PARTS", 250)?,
+            attachment_extract_budget_bytes: parse_usize_env(
+                "MAIL_IMAP_ATTACHMENT_EXTRACT_BUDGET_BYTES",
+                10_485_760,
+            )?,
         })
     }
 
@@ -388,6 +415,11 @@ mod tests {
         let config = ServerConfig::load_from_env().expect("config loads");
         assert_eq!(config.read_session_cache_ttl_seconds, 120);
         assert_eq!(config.read_session_cache_max_per_account, 4);
+        assert_eq!(config.message_fetch_budget_bytes, 8_388_608);
+        assert_eq!(config.message_decode_budget_bytes, 16_777_216);
+        assert_eq!(config.mime_max_depth, 32);
+        assert_eq!(config.mime_max_parts, 250);
+        assert_eq!(config.attachment_extract_budget_bytes, 10_485_760);
 
         for (key, _) in vars {
             unsafe { std::env::remove_var(key) };

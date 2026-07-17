@@ -476,15 +476,17 @@ assert_tool_schema "imap_get_message" "get_message parameter contract" '
     and (($schema.properties | has("account_id") | not))
     and (($schema.properties | has("message_id")))
     and (($schema.properties | has("body_max_chars")))
-    and ($schema.properties.body_max_chars.minimum == 100)
-    and ($schema.properties.body_max_chars.maximum == 20000)
+    and ($schema.properties.body_max_chars.minimum == 1)
+    and ($schema.properties.body_max_chars.maximum == 16000)
+    and (($schema.properties | has("body_mode")))
     and (($schema.properties | has("include_headers")))
     and (($schema.properties | has("include_all_headers")))
-    and (($schema.properties | has("include_html")))
-    and (($schema.properties | has("extract_attachment_text")))
+    and (($schema.properties | has("attachment_mode")))
     and (($schema.properties | has("attachment_text_max_chars")))
-    and ($schema.properties.attachment_text_max_chars.minimum == 100)
-    and ($schema.properties.attachment_text_max_chars.maximum == 50000)
+    and ($schema.properties.attachment_text_max_chars.minimum == 1)
+    and ($schema.properties.attachment_text_max_chars.maximum == 64000)
+    and (($schema.properties | has("include_html") | not))
+    and (($schema.properties | has("extract_attachment_text") | not))
 '
 assert_tool_schema "imap_get_message_raw" "get_message_raw parameter contract" '
   .tools[] | select(.name == $name) | .inputSchema as $schema
@@ -493,8 +495,9 @@ assert_tool_schema "imap_get_message_raw" "get_message_raw parameter contract" '
     and (($schema.properties | has("account_id") | not))
     and (($schema.properties | has("message_id")))
     and (($schema.properties | has("max_bytes")))
-    and ($schema.properties.max_bytes.minimum == 1024)
-    and ($schema.properties.max_bytes.maximum == 1000000)
+    and ($schema.properties.max_bytes.minimum == 1)
+    and ($schema.properties.max_bytes.maximum == 64000)
+    and (($schema.properties | has("offset_bytes")))
 '
 assert_tool_schema "imap_apply_to_messages" "apply_to_messages parameter contract" '
   .tools[] | select(.name == $name) | .inputSchema as $schema
@@ -672,6 +675,45 @@ if [[ -z "$ATTACHMENT_MESSAGE_ID" ]]; then
   exit 1
 fi
 
+echo "Checking imap_get_message forced section-path output contract"
+MESSAGE_FETCH_BUDGET_WAS_SET=0
+MESSAGE_FETCH_BUDGET_SAVED=""
+if [[ -v MAIL_IMAP_MESSAGE_FETCH_BUDGET_BYTES ]]; then
+  MESSAGE_FETCH_BUDGET_WAS_SET=1
+  MESSAGE_FETCH_BUDGET_SAVED="$MAIL_IMAP_MESSAGE_FETCH_BUDGET_BYTES"
+fi
+export MAIL_IMAP_MESSAGE_FETCH_BUDGET_BYTES=256
+GET_SECTION_JSON=$(run_inspector \
+  --method tools/call \
+  --tool-name imap_get_message \
+  --tool-arg "message_id=${ATTACHMENT_MESSAGE_ID}" \
+  --tool-arg body_max_chars=500 \
+  --tool-arg body_mode=text \
+  --tool-arg attachment_mode=metadata)
+if [[ "$MESSAGE_FETCH_BUDGET_WAS_SET" -eq 1 ]]; then
+  export MAIL_IMAP_MESSAGE_FETCH_BUDGET_BYTES="$MESSAGE_FETCH_BUDGET_SAVED"
+else
+  unset MAIL_IMAP_MESSAGE_FETCH_BUDGET_BYTES
+fi
+assert_json "imap_get_message forced section-path output contract" "$GET_SECTION_JSON" '
+  def envelope_ok:
+    (.isError != true)
+    and ((.structuredContent.summary // .summary) | type == "string")
+    and (((.structuredContent.meta // .meta).now_utc | type) == "string")
+    and (((.structuredContent.meta // .meta).duration_ms | type) == "number");
+  (.structuredContent.data // .data) as $data
+  | envelope_ok
+    and ($data.status == "partial")
+    and (($data.issues | length) > 0)
+    and ($data.message.subject == null)
+    and ($data.message.body_text | contains("Nightly build failed on parser-edge-cases."))
+    and (($data.message.attachments | length) == 1)
+    and ($data.message.attachments[0].filename == "summary.txt")
+    and ($data.message.attachments[0].content_type == "text/plain")
+    and ($data.message.attachments[0].part_id == "2")
+    and ($data.message.attachments[0].size_bytes == null)
+'
+
 echo "Checking imap_get_message output contract"
 GET_JSON=$(run_inspector \
   --method tools/call \
@@ -714,7 +756,7 @@ GET_ATTACHMENT_JSON=$(run_inspector \
   --tool-arg "message_id=${ATTACHMENT_MESSAGE_ID}" \
   --tool-arg body_max_chars=500 \
   --tool-arg include_headers=true \
-  --tool-arg extract_attachment_text=true \
+  --tool-arg attachment_mode=extract_text \
   --tool-arg attachment_text_max_chars=1000)
 assert_json "imap_get_message attachment output contract" "$GET_ATTACHMENT_JSON" '
   def envelope_ok:
@@ -729,6 +771,7 @@ assert_json "imap_get_message attachment output contract" "$GET_ATTACHMENT_JSON"
     and (($data.message.attachments | length) > 0)
     and (($data.message.attachments[0].filename | type) == "string")
     and (($data.message.attachments[0].content_type | type) == "string")
+    and ($data.message.attachments[0].size_bytes != null)
     and (($data.message.attachments[0].size_bytes | type) == "number")
     and (($data.message.attachments[0].part_id | type) == "string")
     and ($data.message.attachments[0] | has("extracted_text"))
@@ -739,7 +782,7 @@ RAW_JSON=$(run_inspector \
   --method tools/call \
   --tool-name imap_get_message_raw \
   --tool-arg "message_id=${MESSAGE_ID}" \
-  --tool-arg max_bytes=200000)
+  --tool-arg max_bytes=64000)
 assert_json "imap_get_message_raw output contract" "$RAW_JSON" '
   def envelope_ok:
     (.isError != true)
@@ -754,7 +797,11 @@ assert_json "imap_get_message_raw output contract" "$RAW_JSON" '
     and (($data.message_id | type) == "string")
     and (($data.message_uri | type) == "string")
     and (($data.message_raw_uri | type) == "string")
-    and (($data.size_bytes | type) == "number")
+    and (($data.total_size_bytes | type) == "number")
+    and (($data.returned_bytes | type) == "number")
+    and ($data.total_size_bytes >= $data.offset_bytes + $data.returned_bytes)
+    and ($data.offset_bytes == 0)
+    and ($data.truncated == false)
     and (($data.raw_source_base64 | type) == "string")
     and (($data.raw_source_base64 | length) > 0)
     and ($data.raw_source_encoding == "base64")

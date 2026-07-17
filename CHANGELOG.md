@@ -9,6 +9,8 @@
 - Added configurable read-session caching for read tools with `MAIL_IMAP_READ_SESSION_CACHE_TTL_SECONDS` and `MAIL_IMAP_READ_SESSION_CACHE_MAX_PER_ACCOUNT`.
 - Added Linux `arm64` (`aarch64-unknown-linux-gnu`) to the npm/native release matrix.
 - Published concrete output schemas for every MCP tool so clients can rely on server-declared response shapes.
+- Added cursor-paginated `imap_list_mailboxes` responses with bounded snapshots, raw IMAP LIST attributes, normalized special-use roles, and selectable/provider-managed metadata.
+- Added configurable message fetch, MIME decode/depth/part, and attachment extraction ceilings for bounded message processing.
 
 ### Changed
 
@@ -16,6 +18,13 @@
 - Tightened `imap_search_messages` so searches matching more than 1,000 messages are rejected instead of allowing up to 20,000.
 - Tightened message fetch bounds by reducing `imap_get_message_raw.max_bytes` to `1..64000` with a default of `16000`, and aligning `imap_get_message` body and attachment extraction limits to the current runtime validation ranges.
 - Hardened MCP schema publication and validation so public tool inputs stay client-safe and documented contracts match the current server payloads.
+- Shared mailbox cursors, cached read sessions, tracked operations, write locks, and MIME parsing capacity across MCP transport sessions.
+- Large messages now use BODYSTRUCTURE-selected complete sections within the fetch budget, report omitted content as partial-result issues, and expose unknown attachment sizes as `null`.
+
+### Fixed
+
+- Fixed mailbox rename orchestration to create missing destination parents before issuing exactly one `RENAME`, avoiding unsafe retries after indeterminate IMAP failures.
+- Fixed attachment `size_bytes` to represent complete decoded payload size only, including cumulative decode-budget handling and `null` for metadata-only or incomplete payloads.
 
 ## [0.3.2]
 

@@ -24,6 +24,13 @@ pub(super) struct ListMailboxesData {
     pub(super) next_action: NextAction,
     pub(super) account_id: String,
     pub(super) mailboxes: Vec<MailboxInfo>,
+    pub(super) returned: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) total: Option<usize>,
+    pub(super) has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) next_cursor: Option<String>,
+    pub(super) truncated: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
@@ -479,6 +486,22 @@ pub(super) fn next_action_list_mailboxes(account_id: &str) -> NextAction {
     )
 }
 
+pub(super) fn next_action_continue_list_mailboxes(
+    account_id: &str,
+    cursor: &str,
+    limit: usize,
+) -> NextAction {
+    next_action(
+        "Continue pagination to discover more mailboxes.",
+        "imap_list_mailboxes",
+        serde_json::json!({
+            "account_id": account_id,
+            "cursor": cursor,
+            "limit": limit,
+        }),
+    )
+}
+
 pub(super) fn next_action_search_mailbox(account_id: &str, mailbox: &str) -> NextAction {
     next_action(
         "Search for messages in the selected mailbox.",
@@ -515,9 +538,15 @@ pub(super) fn next_action_get_operation_with_result(operation_id: &str) -> NextA
 pub(super) fn preferred_mailbox_name(mailboxes: &[MailboxInfo]) -> Option<String> {
     mailboxes
         .iter()
-        .find(|m| m.name.eq_ignore_ascii_case("INBOX"))
-        .map(|m| m.name.clone())
-        .or_else(|| mailboxes.first().map(|m| m.name.clone()))
+        .find(|mailbox| {
+            mailbox.selectable
+                && (mailbox.name.eq_ignore_ascii_case("INBOX")
+                    || mailbox
+                        .role
+                        .is_some_and(|role| role == crate::models::MailboxRole::Inbox))
+        })
+        .or_else(|| mailboxes.iter().find(|mailbox| mailbox.selectable))
+        .map(|mailbox| mailbox.name.clone())
 }
 
 pub(super) fn next_action_for_search_result(
@@ -765,4 +794,47 @@ pub(super) fn build_message_raw_uri(
         "{}/raw",
         build_message_uri(account_id, mailbox, uidvalidity, uid)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preferred_mailbox_name;
+    use crate::models::{MailboxInfo, MailboxRole};
+
+    fn mailbox(name: &str, selectable: bool, role: Option<MailboxRole>) -> MailboxInfo {
+        MailboxInfo {
+            name: name.to_owned(),
+            delimiter: Some("/".to_owned()),
+            attributes: Vec::new(),
+            role,
+            selectable,
+            provider_managed: false,
+        }
+    }
+
+    #[test]
+    fn preferred_mailbox_never_selects_noselect_container() {
+        let mailboxes = [
+            mailbox("INBOX", false, Some(MailboxRole::Inbox)),
+            mailbox("Archive", true, Some(MailboxRole::Archive)),
+        ];
+
+        assert_eq!(
+            preferred_mailbox_name(&mailboxes).as_deref(),
+            Some("Archive")
+        );
+    }
+
+    #[test]
+    fn preferred_mailbox_prefers_selectable_inbox() {
+        let mailboxes = [
+            mailbox("Archive", true, Some(MailboxRole::Archive)),
+            mailbox("Primary", true, Some(MailboxRole::Inbox)),
+        ];
+
+        assert_eq!(
+            preferred_mailbox_name(&mailboxes).as_deref(),
+            Some("Primary")
+        );
+    }
 }

@@ -197,7 +197,7 @@ Output `data`:
   - `attachments?`: array (max 50) of:
     - `filename?`
     - `content_type`
-    - `size_bytes`
+    - `size_bytes?` (complete decoded payload size when known; `null`/absent when unavailable or incomplete; never BODYSTRUCTURE encoded octets)
     - `part_id`
     - `extracted_text?` (bounded; only when `attachment_mode=extract_text`)
 
@@ -207,6 +207,9 @@ PDF extraction rules:
 - extraction failures do not fail the whole tool call
 - `attachment_mode=metadata` reports attachment metadata without attempting extraction
 - messages with more than 50 attachments return the first 50 plus a truncation issue
+
+Message processing is bounded by the server-wide fetch, decode, MIME-complexity, and attachment-extraction limits listed under [Environment Variables](#environment-variables). Reaching a limit yields a bounded partial result with a diagnostic issue where possible; it does not turn an unknown or incomplete attachment size into zero.
+When the full message exceeds the fetch budget and bounded partial FETCH responses cannot be consumed safely, header-derived fields may be unavailable. In that case, BODYSTRUCTURE-selected content that fits the applicable limits is returned with `partial` status and diagnostic issues.
 
 ### 5) `imap_get_message_raw`
 
@@ -364,6 +367,11 @@ Server-wide:
 - `MAIL_IMAP_READ_SESSION_CACHE_TTL_SECONDS` (default `120`)
 - `MAIL_IMAP_READ_SESSION_CACHE_MAX_PER_ACCOUNT` (default `4`; set `0` to disable read-session caching)
 - `MAIL_IMAP_OPERATION_MAX_ENTRIES` (default `256`; completed write operations retained in memory)
+- `MAIL_IMAP_MESSAGE_FETCH_BUDGET_BYTES` (default `8388608`; maximum bytes fetched while assembling one message; exhaustion returns bounded partial content and an issue)
+- `MAIL_IMAP_MESSAGE_DECODE_BUDGET_BYTES` (default `16777216`; maximum decoded message payload bytes; exhaustion returns bounded partial content and an issue)
+- `MAIL_IMAP_MIME_MAX_DEPTH` (default `32`; deeper MIME structure is omitted and reported as a partial-result issue)
+- `MAIL_IMAP_MIME_MAX_PARTS` (default `250`; excess MIME parts are omitted and reported as a partial-result issue)
+- `MAIL_IMAP_ATTACHMENT_EXTRACT_BUDGET_BYTES` (default `10485760`; maximum complete attachment payload bytes fetched for extraction per message; attachments that do not fit remain metadata-only and are reported with an issue)
 
 ## Implementation Notes for Next Artifact
 

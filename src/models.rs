@@ -72,6 +72,21 @@ pub struct AccountInfo {
     pub secure: bool,
 }
 
+/// Normalized semantic role for a special-use mailbox.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MailboxRole {
+    Inbox,
+    All,
+    Archive,
+    Drafts,
+    Flagged,
+    Important,
+    Junk,
+    Sent,
+    Trash,
+}
+
 /// Mailbox/folder metadata
 ///
 /// Returned by `imap_list_mailboxes`.
@@ -81,6 +96,14 @@ pub struct MailboxInfo {
     pub name: String,
     /// Hierarchy delimiter if supported by server (e.g., `/`, `.`)
     pub delimiter: Option<String>,
+    /// Raw IMAP LIST attributes, including unrecognized extensions.
+    pub attributes: Vec<String>,
+    /// Normalized special-use role when the server reports one.
+    pub role: Option<MailboxRole>,
+    /// Whether this mailbox may be selected.
+    pub selectable: bool,
+    /// Whether the provider manages this mailbox and disallows rename/delete.
+    pub provider_managed: bool,
 }
 
 /// Message summary for search results
@@ -123,8 +146,8 @@ pub struct AttachmentInfo {
     pub filename: Option<String>,
     /// MIME content type (e.g., `application/pdf`, `image/jpeg`)
     pub content_type: String,
-    /// Attachment size in bytes
-    pub size_bytes: usize,
+    /// Complete decoded payload size in bytes, or unavailable when not fully known
+    pub size_bytes: Option<usize>,
     /// Part ID for MIME structure (e.g., `1`, `2`, `3.1`)
     pub part_id: String,
     /// Extracted text from PDF (if enabled and extraction succeeded)
@@ -189,15 +212,19 @@ pub struct MessageDetail {
     pub attachments: Option<Vec<AttachmentInfo>>,
 }
 
-/// Input: account_id only
-///
-/// Used by `imap_list_accounts` and `imap_list_mailboxes`.
+/// Input: list mailboxes with cursor pagination.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct AccountOnlyInput {
-    /// Account identifier (defaults to `"default"`)
+pub struct ListMailboxesInput {
+    /// Account identifier (defaults to `"default"`).
     #[serde(default = "default_account_id")]
     #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
     pub account_id: String,
+    /// Cursor from a previous mailbox-list response.
+    pub cursor: Option<String>,
+    /// Maximum mailboxes to return (1..200, default 100).
+    #[serde(default = "default_mailbox_limit")]
+    #[schemars(range(min = 1, max = 200), transform = remove_format)]
+    pub limit: usize,
 }
 
 /// Input: search messages with pagination
@@ -371,6 +398,11 @@ fn default_true() -> bool {
     true
 }
 
+/// Default value for mailbox-list page size.
+fn default_mailbox_limit() -> usize {
+    100
+}
+
 /// Default value for `limit` in search
 ///
 /// Chosen as a reasonable balance between response size and pagination overhead.
@@ -501,15 +533,15 @@ mod tests {
     use serde_json::{Map, Value};
 
     use super::{
-        AccountOnlyInput, ApplyToMessagesInput, GetMessageInput, GetMessageRawInput,
-        GetOperationInput, ManageMailboxInput, OperationIdInput, SearchMessagesInput,
+        ApplyToMessagesInput, GetMessageInput, GetMessageRawInput, GetOperationInput,
+        ListMailboxesInput, ManageMailboxInput, OperationIdInput, SearchMessagesInput,
         UpdateMessageFlagsInput, validate_client_safe_input_schema,
     };
 
     #[test]
     fn input_schemas_do_not_publish_nonstandard_unsigned_formats() {
         for schema in [
-            schema_for_type::<AccountOnlyInput>(),
+            schema_for_type::<ListMailboxesInput>(),
             schema_for_type::<SearchMessagesInput>(),
             schema_for_type::<GetMessageInput>(),
             schema_for_type::<GetMessageRawInput>(),
@@ -521,6 +553,41 @@ mod tests {
         ] {
             assert_no_nonstandard_integer_formats(&Value::Object((*schema).clone()));
         }
+    }
+
+    #[test]
+    fn list_mailboxes_schema_matches_runtime_bounds() {
+        let schema = schema_for_type::<ListMailboxesInput>();
+        let properties = schema["properties"]
+            .as_object()
+            .expect("list mailboxes schema must expose properties");
+
+        assert_eq!(
+            schema_string_property(properties, "account_id", "pattern"),
+            Some("^[A-Za-z0-9_-]+$")
+        );
+        assert_eq!(
+            schema_numeric_property(properties, "limit", "minimum"),
+            Some(1)
+        );
+        assert_eq!(
+            schema_numeric_property(properties, "limit", "maximum"),
+            Some(200)
+        );
+        assert_eq!(
+            schema_variant_for(properties, "limit")
+                .and_then(|value| value.get("default"))
+                .and_then(Value::as_u64),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn list_mailboxes_input_defaults_page_size() {
+        let input: ListMailboxesInput =
+            serde_json::from_str(r#"{"account_id":"default"}"#).expect("input must deserialize");
+        assert_eq!(input.limit, 100);
+        assert!(input.cursor.is_none());
     }
 
     #[test]

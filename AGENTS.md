@@ -233,6 +233,7 @@ The repository publishes GitHub Release archives/installers via cargo-dist.
 - If adding env vars, document them in `docs/tool-contract.md` and this file.
 - Current extra trust anchor env var: `MAIL_IMAP_CA_CERT_PATH` (server-wide optional PEM CA bundle).
 - Read-session cache env vars: `MAIL_IMAP_READ_SESSION_CACHE_TTL_SECONDS` and `MAIL_IMAP_READ_SESSION_CACHE_MAX_PER_ACCOUNT`.
+- Message-processing limits: `MAIL_IMAP_MESSAGE_FETCH_BUDGET_BYTES` (default `8388608`, fetched message bytes), `MAIL_IMAP_MESSAGE_DECODE_BUDGET_BYTES` (default `16777216`, decoded payload bytes), `MAIL_IMAP_MIME_MAX_DEPTH` (default `32`, MIME nesting), `MAIL_IMAP_MIME_MAX_PARTS` (default `250`, MIME part count), and `MAIL_IMAP_ATTACHMENT_EXTRACT_BUDGET_BYTES` (default `10485760`, complete attachment payload bytes fetched for extraction).
 
 ## Quick Pre-Commit Checklist
 

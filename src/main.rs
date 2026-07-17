@@ -26,10 +26,6 @@ mod models;
 mod pagination;
 mod server;
 
-use std::collections::BTreeMap;
-use std::io::{self, Write};
-use std::net::IpAddr;
-
 use axum::Router;
 use clap::{CommandFactory, Parser, ValueEnum, error::ErrorKind};
 use rmcp::ServiceExt;
@@ -39,6 +35,10 @@ use rmcp::transport::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     },
 };
+use std::collections::BTreeMap;
+use std::io::{self, Write};
+use std::net::IpAddr;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -121,7 +121,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn serve_stdio(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("starting MCP server transport=stdio");
-    let service = server::MailImapServer::new(config).serve(stdio()).await?;
+    let runtime = Arc::new(server::MailImapRuntime::new(config));
+    let service = server::MailImapServer::from_runtime(runtime)
+        .serve(stdio())
+        .await?;
     service.waiting().await?;
     Ok(())
 }
@@ -135,7 +138,8 @@ async fn serve_http(
         build_http_transport_config(&args.http_bind_address, shutdown_token.child_token());
     log_http_bind_policy(&bind_policy, &args.http_bind_address, args.http_port);
 
-    let router = build_http_router(config, http_config);
+    let runtime = Arc::new(server::MailImapRuntime::new(config));
+    let router = build_http_router(runtime, http_config);
     let listener =
         tokio::net::TcpListener::bind((args.http_bind_address.as_str(), args.http_port)).await?;
     let local_addr = listener.local_addr()?;
@@ -162,14 +166,20 @@ async fn serve_http(
     Ok(())
 }
 
-fn build_http_router(config: ServerConfig, http_config: StreamableHttpServerConfig) -> Router {
-    let service_config = config.clone();
+fn build_http_router(
+    runtime: Arc<server::MailImapRuntime>,
+    http_config: StreamableHttpServerConfig,
+) -> Router {
+    let service_runtime = runtime.clone();
     let service = StreamableHttpService::new(
-        move || Ok::<_, std::io::Error>(server::MailImapServer::new(service_config.clone())),
+        move || {
+            Ok::<_, std::io::Error>(server::MailImapServer::from_runtime(
+                service_runtime.clone(),
+            ))
+        },
         LocalSessionManager::default().into(),
         http_config,
     );
-
     Router::new().nest_service(MCP_HTTP_PATH, service)
 }
 
@@ -330,6 +340,7 @@ fn is_secret_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
@@ -379,6 +390,11 @@ mod tests {
             read_session_cache_ttl_seconds: 120,
             read_session_cache_max_per_account: 4,
             operation_max_entries: 256,
+            message_fetch_budget_bytes: 8_388_608,
+            message_decode_budget_bytes: 16_777_216,
+            mime_max_depth: 32,
+            mime_max_parts: 250,
+            attachment_extract_budget_bytes: 10_485_760,
         }
     }
 
@@ -514,11 +530,10 @@ mod tests {
         assert!(help.contains("do not leave the HTTP transport publicly available"));
         assert!(help.contains("MAIL_IMAP_DEFAULT_PASS=<redacted>"));
     }
-
     #[tokio::test]
     async fn http_router_serves_initialize_on_mcp_path_only() {
         let router = build_http_router(
-            test_server_config(),
+            Arc::new(crate::server::MailImapRuntime::new(test_server_config())),
             StreamableHttpServerConfig::default().with_sse_keep_alive(None),
         );
 

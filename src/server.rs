@@ -1,30 +1,34 @@
 //! MCP server implementation with tool handlers.
 
+pub(crate) mod provider;
 mod read;
+mod runtime;
 mod session_cache;
 mod types;
 mod validation;
 mod write_ops;
 
+pub(crate) use runtime::MailImapRuntime;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ErrorData, ServerCapabilities, ServerInfo};
 use rmcp::{Json, ServerHandler, tool, tool_handler, tool_router};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::config::ServerConfig;
 use crate::models::{
-    AccountInfo, AccountOnlyInput, ApplyToMessagesInput, GetMessageInput, GetMessageRawInput,
-    GetOperationInput, ManageMailboxInput, OperationIdInput, SearchMessagesInput,
+    AccountInfo, ApplyToMessagesInput, GetMessageInput, GetMessageRawInput, GetOperationInput,
+    ListMailboxesInput, ManageMailboxInput, OperationIdInput, SearchMessagesInput,
     UpdateMessageFlagsInput,
 };
-use crate::pagination::CursorStore;
+use crate::pagination::{CursorStore, MailboxCursorStore};
 
-use self::session_cache::{IdleSessionCache, ReadSessionCache, ReadSessionLease};
+use self::session_cache::{ReadSessionCache, ReadSessionLease};
 use self::types::{
     GetMessageData, GetMessageRawData, ListAccountsData, ListMailboxesData, OperationStatusData,
     SearchResultData, StoredOperation, finalize_tool, operation_summary,
@@ -45,26 +49,30 @@ const WRITE_INLINE_BUDGET_MS: u64 = 1_500;
 pub struct MailImapServer {
     config: Arc<ServerConfig>,
     cursors: Arc<Mutex<CursorStore>>,
+    mailbox_cursors: Arc<Mutex<MailboxCursorStore>>,
     read_sessions: Arc<ReadSessionCache>,
     operations: Arc<Mutex<BTreeMap<String, StoredOperation>>>,
     account_write_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
+    pub(super) mime_parse_semaphore: Arc<Semaphore>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl MailImapServer {
+    #[cfg(test)]
     pub fn new(config: ServerConfig) -> Self {
-        let cursor_store = CursorStore::new(config.cursor_ttl_seconds, config.cursor_max_entries);
-        let read_session_cache = IdleSessionCache::new(
-            Duration::from_secs(config.read_session_cache_ttl_seconds),
-            config.read_session_cache_max_per_account,
-        );
+        Self::from_runtime(Arc::new(MailImapRuntime::new(config)))
+    }
+
+    pub(crate) fn from_runtime(runtime: Arc<MailImapRuntime>) -> Self {
         Self {
-            config: Arc::new(config),
-            cursors: Arc::new(Mutex::new(cursor_store)),
-            read_sessions: Arc::new(Mutex::new(read_session_cache)),
-            operations: Arc::new(Mutex::new(BTreeMap::new())),
-            account_write_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            config: runtime.config.clone(),
+            cursors: runtime.cursors.clone(),
+            mailbox_cursors: runtime.mailbox_cursors.clone(),
+            read_sessions: runtime.read_sessions.clone(),
+            operations: runtime.operations.clone(),
+            account_write_locks: runtime.account_write_locks.clone(),
+            mime_parse_semaphore: runtime.mime_parse_semaphore.clone(),
             tool_router: Self::tool_router(),
         }
     }
@@ -115,7 +123,7 @@ impl MailImapServer {
     )]
     async fn list_mailboxes(
         &self,
-        Parameters(input): Parameters<AccountOnlyInput>,
+        Parameters(input): Parameters<ListMailboxesInput>,
     ) -> Result<Json<crate::models::ToolEnvelope<ListMailboxesData>>, ErrorData> {
         let started = Instant::now();
         finalize_tool(
@@ -305,6 +313,7 @@ impl ServerHandler for MailImapServer {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use rmcp::handler::server::tool::schema_for_output;
 
@@ -360,6 +369,33 @@ mod tests {
                 result: None,
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn servers_from_runtime_share_process_scoped_state() {
+        let runtime = Arc::new(MailImapRuntime::new(schema_test_server_config()));
+        let first = MailImapServer::from_runtime(runtime.clone());
+        let second = MailImapServer::from_runtime(runtime);
+
+        assert!(Arc::ptr_eq(&first.cursors, &second.cursors));
+        assert!(Arc::ptr_eq(&first.mailbox_cursors, &second.mailbox_cursors));
+        assert!(Arc::ptr_eq(
+            &first.mime_parse_semaphore,
+            &second.mime_parse_semaphore
+        ));
+
+        let operation_id = first
+            .create_operation(StoredOperationSpec::ManageMailbox(ManageMailboxOperation {
+                account_id: "default".to_owned(),
+                action: MailboxAction::Create {
+                    mailbox: "Archive".to_owned(),
+                },
+                completed: false,
+                result: None,
+            }))
+            .await;
+
+        assert!(second.operations.lock().await.contains_key(&operation_id));
     }
 
     #[test]
@@ -451,6 +487,11 @@ mod tests {
             read_session_cache_ttl_seconds: 120,
             read_session_cache_max_per_account: 4,
             operation_max_entries: 256,
+            message_fetch_budget_bytes: 8_388_608,
+            message_decode_budget_bytes: 16_777_216,
+            mime_max_depth: 32,
+            mime_max_parts: 250,
+            attachment_extract_budget_bytes: 10_485_760,
         }
     }
 

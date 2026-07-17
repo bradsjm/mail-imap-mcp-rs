@@ -6,7 +6,8 @@ use crate::config::ServerConfig;
 use crate::errors::{AppError, AppResult};
 use crate::message_id::MessageId;
 use crate::models::{
-    ApplyToMessagesInput, ManageMailboxInput, SearchMessagesInput, UpdateMessageFlagsInput,
+    ApplyToMessagesInput, ListMailboxesInput, ManageMailboxInput, SearchMessagesInput,
+    UpdateMessageFlagsInput,
 };
 
 use super::types::{FlagOperation, FlagUpdateRequest, MailboxAction, MessageActionInput};
@@ -244,6 +245,11 @@ pub(super) fn validate_chars(value: usize, min: usize, max: usize, field: &str) 
     Ok(())
 }
 
+pub(super) fn validate_list_mailboxes_input(input: &ListMailboxesInput) -> AppResult<()> {
+    validate_account_id(&input.account_id)?;
+    validate_chars(input.limit, 1, 200, "limit")
+}
+
 pub(super) fn validate_search_input(input: &SearchMessagesInput) -> AppResult<()> {
     validate_mailbox(&input.mailbox)?;
     validate_chars(input.limit, 1, 100, "limit")?;
@@ -408,11 +414,13 @@ mod tests {
     use super::{
         FlagOperation, FlagUpdateRequest, build_flag_update_request, build_mailbox_action,
         build_message_action, dedupe_and_parse_message_ids, escape_imap_quoted,
-        parse_bulk_message_ids, validate_flag, validate_flag_update_request, validate_mailbox,
-        validate_search_input, validate_search_text,
+        parse_bulk_message_ids, validate_flag, validate_flag_update_request,
+        validate_list_mailboxes_input, validate_mailbox, validate_search_input,
+        validate_search_text,
     };
     use crate::models::{
-        ApplyToMessagesInput, ManageMailboxInput, SearchMessagesInput, UpdateMessageFlagsInput,
+        ApplyToMessagesInput, ListMailboxesInput, ManageMailboxInput, SearchMessagesInput,
+        UpdateMessageFlagsInput,
     };
 
     #[test]
@@ -611,5 +619,27 @@ mod tests {
         };
 
         validate_search_input(&input).expect("snippet_max_chars alone should enable snippets");
+    }
+
+    #[test]
+    fn validate_list_mailboxes_input_enforces_page_bounds() {
+        for limit in [0, 201] {
+            let input = ListMailboxesInput {
+                account_id: "default".to_owned(),
+                cursor: None,
+                limit,
+            };
+            assert!(
+                validate_list_mailboxes_input(&input).is_err(),
+                "limit {limit} must be rejected"
+            );
+        }
+
+        let input = ListMailboxesInput {
+            account_id: "default".to_owned(),
+            cursor: Some("cursor-id".to_owned()),
+            limit: 200,
+        };
+        validate_list_mailboxes_input(&input).expect("maximum valid limit must be accepted");
     }
 }

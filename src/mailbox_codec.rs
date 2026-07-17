@@ -10,6 +10,7 @@ use base64::Engine;
 /// Decode an IMAP modified UTF-7 mailbox name for user-facing output.
 ///
 /// Falls back to the original input if decoding fails on malformed data.
+#[cfg(test)]
 pub fn decode_mailbox_name_for_display(mailbox: &str) -> String {
     decode_mailbox_name_inner(mailbox).unwrap_or_else(|| mailbox.to_owned())
 }

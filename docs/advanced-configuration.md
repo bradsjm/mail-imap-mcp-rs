@@ -75,6 +75,34 @@ Behavior:
 - In-flight read requests may still open more connections than this limit
 - Excess returned sessions are logged out instead of retained
 
+## Message Processing Limits
+
+These server-wide limits bound work performed by `imap_get_message`:
+
+```bash
+# Default: 8388608 bytes (8 MiB) fetched while assembling one message
+MAIL_IMAP_MESSAGE_FETCH_BUDGET_BYTES=8388608
+
+# Default: 16777216 bytes (16 MiB) decoded across one message
+MAIL_IMAP_MESSAGE_DECODE_BUDGET_BYTES=16777216
+
+# Default: 32 nested MIME levels
+MAIL_IMAP_MIME_MAX_DEPTH=32
+
+# Default: 250 MIME parts
+MAIL_IMAP_MIME_MAX_PARTS=250
+
+# Default: 10485760 bytes (10 MiB) of complete attachment payloads fetched for extraction
+MAIL_IMAP_ATTACHMENT_EXTRACT_BUDGET_BYTES=10485760
+```
+
+Behavior:
+- The fetch budget covers message sections retrieved to assemble a result. If it is exhausted, the tool returns the content assembled within the limit as a partial result and includes a diagnostic issue.
+- The decode budget bounds decoded MIME payload bytes. Content beyond the limit is omitted or truncated, and the result reports the limit.
+- MIME nesting deeper than the depth limit and parts beyond the part-count limit are omitted and reported as partial-result issues.
+- The attachment extraction budget applies when complete attachment payloads are fetched for extraction. Attachments that do not fit remain metadata-only and produce an issue rather than a partial extraction.
+- Attachment `size_bytes` is the complete decoded payload size when known. It is `null` or absent when the complete decoded size is unavailable; BODYSTRUCTURE encoded octet counts are never reported as decoded sizes, and unknown size is never represented as zero.
+
 ## Timeout Configuration
 
 All timeouts are in milliseconds. Adjust based on network conditions and server performance.

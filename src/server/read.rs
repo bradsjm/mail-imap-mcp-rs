@@ -2,30 +2,31 @@ use base64::Engine;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
+use super::provider::{is_gmail_capable, mailbox_info};
 use crate::errors::{AppError, AppResult};
 use crate::imap;
-use crate::mailbox_codec::{decode_mailbox_name_for_display, normalize_mailbox_name};
+use crate::mailbox_codec::normalize_mailbox_name;
 use crate::message_id::MessageId;
 use crate::mime;
 use crate::models::{
-    AccountOnlyInput, GetMessageInput, GetMessageRawInput, MailboxInfo, MessageDetail,
-    MessageSummary, SearchMessagesInput,
+    AttachmentInfo, GetMessageInput, GetMessageRawInput, ListMailboxesInput, MailboxInfo,
+    MessageDetail, MessageSummary, SearchMessagesInput,
 };
-use crate::pagination::{CursorEntry, CursorStore};
+use crate::pagination::{CursorEntry, CursorStore, MailboxCursorEntry, MailboxCursorStore};
 
 use super::session_cache::ReadSessionLease;
 use super::types::{
     GetMessageData, GetMessageRawData, ListMailboxesData, SearchResultData, SummaryBuildResult,
     ToolIssue, build_message_raw_uri, build_message_uri, is_hard_precondition_error,
-    log_runtime_issues, next_action_for_search_result, next_action_list_accounts,
-    next_action_list_mailboxes, next_action_search_mailbox, preferred_mailbox_name,
-    status_from_counts, status_from_issue_and_counts,
+    log_runtime_issues, next_action_continue_list_mailboxes, next_action_for_search_result,
+    next_action_list_accounts, next_action_list_mailboxes, next_action_search_mailbox,
+    preferred_mailbox_name, status_from_counts, status_from_issue_and_counts,
 };
 use super::validation::{
     build_search_query, header_value, parse_and_validate_message_id, validate_account_id,
-    validate_chars, validate_mailbox, validate_search_input,
+    validate_chars, validate_list_mailboxes_input, validate_mailbox, validate_search_input,
 };
 use super::{MAX_CURSOR_UIDS_STORED, MAX_SEARCH_LIMIT, MailImapServer};
 
@@ -43,14 +44,143 @@ struct SummaryBuildOptions<'a> {
     snippet_max_chars: Option<usize>,
 }
 
+const MAX_MAILBOXES_STORED: usize = 2_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageFetchPath {
+    FullMessage,
+    Sections,
+    Unavailable,
+}
+
+fn message_fetch_path(
+    size: Option<u32>,
+    budget: usize,
+    parts_truncated: bool,
+    depth_truncated: bool,
+    has_bodystructure: bool,
+) -> MessageFetchPath {
+    if size.is_some_and(|size| (size as usize) <= budget) && !parts_truncated && !depth_truncated {
+        MessageFetchPath::FullMessage
+    } else if has_bodystructure {
+        MessageFetchPath::Sections
+    } else {
+        MessageFetchPath::Unavailable
+    }
+}
+
+fn complete_section_length(
+    declared_octets: Option<u32>,
+    requested: usize,
+    remaining: usize,
+) -> Option<usize> {
+    let declared = declared_octets? as usize;
+    (declared > 0 && declared <= requested && declared <= remaining).then_some(declared)
+}
+
+fn normalize_attachment_sizes_for_raw_completeness(
+    attachments: &mut [AttachmentInfo],
+    raw_complete: bool,
+) {
+    if !raw_complete {
+        for attachment in attachments {
+            attachment.size_bytes = None;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FetchBudget {
+    remaining: usize,
+}
+
+impl FetchBudget {
+    fn new(limit: usize) -> Self {
+        Self { remaining: limit }
+    }
+
+    #[cfg(test)]
+    fn take(&mut self, requested: usize) -> Option<usize> {
+        let allowed = requested.min(self.remaining);
+        (allowed > 0).then_some(allowed)
+    }
+
+    fn consume(&mut self, bytes: usize) {
+        self.remaining = self.remaining.saturating_sub(bytes);
+    }
+}
+
+fn processing_limit_issue(limit: mime::ProcessingLimit, uid: u32, message_id: &str) -> ToolIssue {
+    let (stage, message) = match limit {
+        mime::ProcessingLimit::DecodeBudgetBytes => (
+            "decode_budget",
+            "message decode budget was reached; returned content is partial",
+        ),
+        mime::ProcessingLimit::MaxDepth => (
+            "mime_depth",
+            "MIME nesting depth limit was reached; returned content is partial",
+        ),
+        mime::ProcessingLimit::MaxParts => (
+            "mime_parts",
+            "MIME part limit was reached; returned content is partial",
+        ),
+        mime::ProcessingLimit::AttachmentExtractBudgetBytes => (
+            "attachment_extract_budget",
+            "attachment extraction budget was reached; returned attachment text is partial",
+        ),
+    };
+    ToolIssue {
+        code: "limit_exceeded".to_owned(),
+        stage: stage.to_owned(),
+        message: message.to_owned(),
+        retryable: false,
+        uid: Some(uid),
+        message_id: Some(message_id.to_owned()),
+    }
+}
+
+async fn run_bounded_mime_parse<T>(
+    semaphore: Arc<Semaphore>,
+    parse: impl FnOnce() -> AppResult<T> + Send + 'static,
+) -> AppResult<T>
+where
+    T: Send + 'static,
+{
+    let permit = semaphore
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::Internal("MIME parse executor is shutting down".to_owned()))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        parse()
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("MIME parse worker failed: {error}")))?
+}
+
+fn fetch_budget_issue(uid: u32, message_id: &str, message: &str) -> ToolIssue {
+    ToolIssue {
+        code: "limit_exceeded".to_owned(),
+        stage: "fetch_budget".to_owned(),
+        message: message.to_owned(),
+        retryable: false,
+        uid: Some(uid),
+        message_id: Some(message_id.to_owned()),
+    }
+}
+
 impl MailImapServer {
     pub(super) async fn list_mailboxes_impl(
         &self,
-        input: AccountOnlyInput,
+        input: ListMailboxesInput,
     ) -> AppResult<ListMailboxesData> {
-        validate_account_id(&input.account_id)?;
-        let mut issues = Vec::new();
+        validate_list_mailboxes_input(&input)?;
 
+        if let Some(cursor_id) = input.cursor.clone() {
+            return list_mailboxes_from_cursor(&self.mailbox_cursors, &input, cursor_id).await;
+        }
+
+        let mut issues = Vec::new();
         let mut session = match self.checkout_read_session(&input.account_id).await {
             Ok(session) => session,
             Err(error) => {
@@ -62,15 +192,26 @@ impl MailImapServer {
                     None,
                     &issues,
                 );
-                return Ok(ListMailboxesData {
-                    status: "failed".to_owned(),
-                    issues,
-                    next_action: next_action_list_accounts(),
-                    account_id: input.account_id.clone(),
-                    mailboxes: Vec::new(),
-                });
+                return Ok(failed_list_mailboxes_data(&input.account_id, issues));
             }
         };
+
+        let capabilities = match imap::capabilities(&self.config, session.session()).await {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                issues.push(ToolIssue::from_error("capabilities", &error));
+                let _ = release_read_session(self, session, false).await;
+                log_runtime_issues(
+                    "imap_list_mailboxes",
+                    "failed",
+                    &input.account_id,
+                    None,
+                    &issues,
+                );
+                return Ok(failed_list_mailboxes_data(&input.account_id, issues));
+            }
+        };
+        let gmail_capable = is_gmail_capable(&capabilities);
 
         let items = match imap::list_all_mailboxes(&self.config, session.session()).await {
             Ok(items) => items,
@@ -84,46 +225,28 @@ impl MailImapServer {
                     None,
                     &issues,
                 );
-                return Ok(ListMailboxesData {
-                    status: "failed".to_owned(),
-                    issues,
-                    next_action: next_action_list_accounts(),
-                    account_id: input.account_id.clone(),
-                    mailboxes: Vec::new(),
-                });
+                return Ok(failed_list_mailboxes_data(&input.account_id, issues));
             }
         };
 
+        let truncated = items.len() > MAX_MAILBOXES_STORED;
         let mailboxes = items
             .into_iter()
-            .take(200)
-            .map(|item| MailboxInfo {
-                name: decode_mailbox_name_for_display(item.name()),
-                delimiter: item.delimiter().map(|d| d.to_string()),
-            })
+            .take(MAX_MAILBOXES_STORED)
+            .map(|item| mailbox_info(&item, gmail_capable))
             .collect::<Vec<_>>();
+        let _ = release_read_session(self, session, true).await;
 
-        let status = status_from_counts(issues.is_empty(), !mailboxes.is_empty());
-        log_runtime_issues(
-            "imap_list_mailboxes",
-            status,
-            &input.account_id,
-            None,
-            &issues,
-        );
-        let next_action = preferred_mailbox_name(&mailboxes)
-            .map(|mailbox| next_action_search_mailbox(&input.account_id, &mailbox))
-            .unwrap_or_else(next_action_list_accounts);
-        let account_id = input.account_id.clone();
-        let _ = release_read_session(self, session, issues.is_empty()).await;
-
-        Ok(ListMailboxesData {
-            status: status.to_owned(),
-            issues,
-            next_action,
-            account_id,
-            mailboxes,
-        })
+        let total = (!truncated).then_some(mailboxes.len());
+        list_mailboxes_from_snapshot(
+            &self.mailbox_cursors,
+            &input,
+            mailboxes.into(),
+            0,
+            total,
+            truncated,
+        )
+        .await
     }
 
     pub(super) async fn search_messages_impl(
@@ -393,12 +516,14 @@ impl MailImapServer {
             return Err(error);
         }
 
-        let raw =
-            match imap::fetch_raw_message(&self.config, session.session(), message_id.uid).await {
-                Ok(raw) => raw,
+        let structure =
+            match imap::fetch_message_structure(&self.config, session.session(), message_id.uid)
+                .await
+            {
+                Ok(structure) => structure,
                 Err(error) => {
                     issues.push(
-                        ToolIssue::from_error("fetch_raw_message", &error)
+                        ToolIssue::from_error("fetch_message_structure", &error)
                             .with_uid(message_id.uid)
                             .with_message_id(&encoded_message_id),
                     );
@@ -418,14 +543,309 @@ impl MailImapServer {
                     });
                 }
             };
-
-        let parsed = match mime::parse_message(
-            &raw,
-            input.body_max_chars,
-            input.body_mode,
-            input.attachment_mode,
+        let plan = structure.fetch_plan;
+        let fetch_path = message_fetch_path(
+            structure.size,
+            self.config.message_fetch_budget_bytes,
+            plan.as_ref().is_some_and(|plan| plan.parts_truncated),
+            plan.as_ref().is_some_and(|plan| plan.depth_truncated),
+            plan.is_some(),
+        );
+        let limits = mime::ProcessingLimits {
+            decode_budget_bytes: self.config.message_decode_budget_bytes,
+            max_depth: self.config.mime_max_depth,
+            max_parts: self.config.mime_max_parts,
+            attachment_extract_budget_bytes: self.config.attachment_extract_budget_bytes,
             attachment_text_max_chars,
-        ) {
+        };
+        let mut fetch_budget = FetchBudget::new(self.config.message_fetch_budget_bytes);
+
+        let (parsed, raw_complete) = match fetch_path {
+            MessageFetchPath::FullMessage => {
+                let raw =
+                    match imap::fetch_raw_message(&self.config, session.session(), message_id.uid)
+                        .await
+                    {
+                        Ok(raw) => {
+                            fetch_budget.consume(raw.len());
+                            raw
+                        }
+                        Err(error) => {
+                            issues.push(
+                                ToolIssue::from_error("fetch_raw_message", &error)
+                                    .with_uid(message_id.uid)
+                                    .with_message_id(&encoded_message_id),
+                            );
+                            let _ = release_read_session(self, session, false).await;
+                            log_runtime_issues(
+                                "imap_get_message",
+                                "failed",
+                                &message_id.account_id,
+                                Some(&message_id.mailbox),
+                                &issues,
+                            );
+                            return Ok(GetMessageData {
+                                status: "failed".to_owned(),
+                                issues,
+                                account_id: message_id.account_id.clone(),
+                                message: None,
+                            });
+                        }
+                    };
+                let raw_is_partial = structure.size.is_none_or(|size| raw.len() < size as usize);
+                if raw_is_partial {
+                    issues.push(fetch_budget_issue(
+                        message_id.uid,
+                        &encoded_message_id,
+                        "raw message exceeded the fetch budget; returned content is partial",
+                    ));
+                }
+                let body_max_chars = input.body_max_chars;
+                let body_mode = input.body_mode;
+                let attachment_mode = input.attachment_mode;
+                (
+                    run_bounded_mime_parse(self.mime_parse_semaphore.clone(), move || {
+                        mime::parse_message(
+                            &raw,
+                            body_max_chars,
+                            body_mode,
+                            attachment_mode,
+                            &limits,
+                        )
+                    })
+                    .await,
+                    !raw_is_partial,
+                )
+            }
+            MessageFetchPath::Unavailable => {
+                issues.push(fetch_budget_issue(
+                    message_id.uid,
+                    &encoded_message_id,
+                    "message exceeded the fetch budget and BODYSTRUCTURE was unavailable; content was omitted",
+                ));
+                let _ = release_read_session(self, session, true).await;
+                log_runtime_issues(
+                    "imap_get_message",
+                    "failed",
+                    &message_id.account_id,
+                    Some(&message_id.mailbox),
+                    &issues,
+                );
+                return Ok(GetMessageData {
+                    status: "failed".to_owned(),
+                    issues,
+                    account_id: message_id.account_id.clone(),
+                    message: None,
+                });
+            }
+            MessageFetchPath::Sections => {
+                let plan = plan.ok_or_else(|| {
+                    AppError::Internal("section fetch requires BODYSTRUCTURE".to_owned())
+                })?;
+                issues.push(fetch_budget_issue(
+                    message_id.uid,
+                    &encoded_message_id,
+                    "message headers were omitted because the oversized message cannot be safely fetched with the supported IMAP parser",
+                ));
+
+                let section_limit = input.body_max_chars.saturating_mul(10);
+                let wants_text = matches!(
+                    input.body_mode,
+                    crate::models::BodyMode::Text | crate::models::BodyMode::Both
+                );
+                let text_bytes = if wants_text {
+                    if let Some(section) = plan.text_part.as_deref() {
+                        let declared_octets = plan
+                            .parts
+                            .iter()
+                            .find(|part| part.path == section)
+                            .and_then(|part| part.declared_octets);
+                        if complete_section_length(
+                            declared_octets,
+                            section_limit,
+                            fetch_budget.remaining,
+                        )
+                        .is_some()
+                        {
+                            match imap::fetch_body_section(
+                                &self.config,
+                                session.session(),
+                                message_id.uid,
+                                section,
+                                None,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(bytes) => {
+                                    fetch_budget.consume(bytes.len());
+                                    Some(bytes)
+                                }
+                                Err(error) => {
+                                    issues.push(
+                                        ToolIssue::from_error("fetch_text_section", &error)
+                                            .with_uid(message_id.uid)
+                                            .with_message_id(&encoded_message_id),
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            issues.push(fetch_budget_issue(
+                                message_id.uid,
+                                &encoded_message_id,
+                                "text section size was unknown or exceeded the remaining fetch budget; section was skipped",
+                            ));
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let wants_html = matches!(
+                    input.body_mode,
+                    crate::models::BodyMode::Text
+                        | crate::models::BodyMode::Html
+                        | crate::models::BodyMode::Both
+                );
+                let html_bytes = if wants_html {
+                    if let Some(section) = plan.html_part.as_deref() {
+                        let declared_octets = plan
+                            .parts
+                            .iter()
+                            .find(|part| part.path == section)
+                            .and_then(|part| part.declared_octets);
+                        if complete_section_length(
+                            declared_octets,
+                            section_limit,
+                            fetch_budget.remaining,
+                        )
+                        .is_some()
+                        {
+                            match imap::fetch_body_section(
+                                &self.config,
+                                session.session(),
+                                message_id.uid,
+                                section,
+                                None,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(bytes) => {
+                                    fetch_budget.consume(bytes.len());
+                                    Some(bytes)
+                                }
+                                Err(error) => {
+                                    issues.push(
+                                        ToolIssue::from_error("fetch_html_section", &error)
+                                            .with_uid(message_id.uid)
+                                            .with_message_id(&encoded_message_id),
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            issues.push(fetch_budget_issue(
+                                message_id.uid,
+                                &encoded_message_id,
+                                "HTML section size was unknown or exceeded the remaining fetch budget; section was skipped",
+                            ));
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let mut attachment_sections = Vec::new();
+                if input.attachment_mode == crate::models::AttachmentMode::ExtractText {
+                    for attachment in plan
+                        .attachment_parts
+                        .iter()
+                        .filter(|part| part.content_type.eq_ignore_ascii_case("application/pdf"))
+                        .take(mime::MAX_ATTACHMENTS)
+                    {
+                        let Some(_) = complete_section_length(
+                            attachment.declared_octets,
+                            usize::MAX,
+                            fetch_budget.remaining,
+                        ) else {
+                            issues.push(fetch_budget_issue(
+                                message_id.uid,
+                                &encoded_message_id,
+                                "attachment section size was unknown or exceeded the remaining fetch budget; section was skipped",
+                            ));
+                            continue;
+                        };
+                        match imap::fetch_body_section(
+                            &self.config,
+                            session.session(),
+                            message_id.uid,
+                            &attachment.path,
+                            None,
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(bytes) => {
+                                let complete = attachment
+                                    .declared_octets
+                                    .is_some_and(|size| bytes.len() >= size as usize);
+                                if !complete {
+                                    issues.push(fetch_budget_issue(
+                                        message_id.uid,
+                                        &encoded_message_id,
+                                        "attachment section was partial; extracted text may be partial",
+                                    ));
+                                }
+                                fetch_budget.consume(bytes.len());
+                                attachment_sections.push(mime::FetchedPart {
+                                    plan: attachment.clone(),
+                                    bytes,
+                                    complete,
+                                });
+                            }
+                            Err(error) => issues.push(
+                                ToolIssue::from_error("fetch_attachment_section", &error)
+                                    .with_uid(message_id.uid)
+                                    .with_message_id(&encoded_message_id),
+                            ),
+                        }
+                    }
+                }
+
+                let body_max_chars = input.body_max_chars;
+                let body_mode = input.body_mode;
+                let attachment_mode = input.attachment_mode;
+                (
+                    run_bounded_mime_parse(self.mime_parse_semaphore.clone(), move || {
+                        mime::parse_from_sections(
+                            mime::MessageSections {
+                                header_bytes: &[],
+                                text_bytes: text_bytes.as_deref(),
+                                html_bytes: html_bytes.as_deref(),
+                                attachment_sections: &attachment_sections,
+                            },
+                            &plan,
+                            body_max_chars,
+                            body_mode,
+                            attachment_mode,
+                            &limits,
+                        )
+                    })
+                    .await,
+                    true,
+                )
+            }
+        };
+
+        let mut parsed = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
                 issues.push(
@@ -449,6 +869,14 @@ impl MailImapServer {
                 });
             }
         };
+        normalize_attachment_sizes_for_raw_completeness(&mut parsed.attachments, raw_complete);
+        for limit in parsed.processing_limits.iter().copied() {
+            issues.push(processing_limit_issue(
+                limit,
+                message_id.uid,
+                &encoded_message_id,
+            ));
+        }
 
         if parsed.attachments_truncated {
             issues.push(ToolIssue {
@@ -691,6 +1119,7 @@ impl MailImapServer {
                 });
             }
         };
+        let total_size_bytes = total_size_bytes.max(input.offset_bytes.saturating_add(raw.len()));
         let truncated = input.offset_bytes.saturating_add(raw.len()) < total_size_bytes;
 
         log_runtime_issues(
@@ -727,6 +1156,107 @@ impl MailImapServer {
             raw_source_encoding: Some("base64".to_owned()),
         })
     }
+}
+
+fn failed_list_mailboxes_data(account_id: &str, issues: Vec<ToolIssue>) -> ListMailboxesData {
+    ListMailboxesData {
+        status: "failed".to_owned(),
+        issues,
+        next_action: next_action_list_accounts(),
+        account_id: account_id.to_owned(),
+        mailboxes: Vec::new(),
+        returned: 0,
+        total: None,
+        has_more: false,
+        next_cursor: None,
+        truncated: false,
+    }
+}
+
+async fn list_mailboxes_from_cursor(
+    cursors: &Arc<Mutex<MailboxCursorStore>>,
+    input: &ListMailboxesInput,
+    cursor_id: String,
+) -> AppResult<ListMailboxesData> {
+    let entry = {
+        let mut store = cursors.lock().await;
+        let entry = store
+            .get(&cursor_id)
+            .ok_or_else(|| AppError::InvalidInput("cursor is invalid or expired".to_owned()))?;
+        if entry.account_id != input.account_id {
+            return Err(AppError::InvalidInput(
+                "cursor does not match account".to_owned(),
+            ));
+        }
+        entry
+    };
+
+    list_mailboxes_from_snapshot(
+        cursors,
+        input,
+        entry.mailboxes,
+        entry.offset,
+        entry.total,
+        entry.truncated,
+    )
+    .await
+}
+
+async fn list_mailboxes_from_snapshot(
+    cursors: &Arc<Mutex<MailboxCursorStore>>,
+    input: &ListMailboxesInput,
+    mailboxes: Arc<[MailboxInfo]>,
+    offset: usize,
+    total: Option<usize>,
+    truncated: bool,
+) -> AppResult<ListMailboxesData> {
+    let offset = offset.min(mailboxes.len());
+    let end = offset.saturating_add(input.limit).min(mailboxes.len());
+    let page = mailboxes[offset..end].to_vec();
+    let has_more = end < mailboxes.len();
+    let next_cursor = if has_more {
+        let mut store = cursors.lock().await;
+        match input.cursor.as_deref() {
+            Some(cursor_id) => {
+                store.update_offset(cursor_id, end);
+                Some(cursor_id.to_owned())
+            }
+            None => Some(store.create(MailboxCursorEntry {
+                account_id: input.account_id.clone(),
+                mailboxes,
+                offset: end,
+                total,
+                truncated,
+                expires_at: Instant::now(),
+            })),
+        }
+    } else {
+        if let Some(cursor_id) = input.cursor.as_deref() {
+            cursors.lock().await.delete(cursor_id);
+        }
+        None
+    };
+    let next_action = next_cursor
+        .as_deref()
+        .map(|cursor| next_action_continue_list_mailboxes(&input.account_id, cursor, input.limit))
+        .or_else(|| {
+            preferred_mailbox_name(&page)
+                .map(|mailbox| next_action_search_mailbox(&input.account_id, &mailbox))
+        })
+        .unwrap_or_else(next_action_list_accounts);
+
+    Ok(ListMailboxesData {
+        status: status_from_counts(true, !page.is_empty()).to_owned(),
+        issues: Vec::new(),
+        next_action,
+        account_id: input.account_id.clone(),
+        returned: page.len(),
+        total,
+        has_more,
+        next_cursor,
+        truncated,
+        mailboxes: page,
+    })
 }
 
 async fn release_read_session(
@@ -944,19 +1474,92 @@ fn format_uid_range(start: u32, end: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        FetchBudget, MessageFetchPath, complete_section_length, list_mailboxes_from_cursor,
+        list_mailboxes_from_snapshot, message_fetch_path,
+        normalize_attachment_sizes_for_raw_completeness, resume_cursor_search,
+    };
+    use crate::models::{
+        AttachmentInfo, ListMailboxesInput, MailboxInfo, MessageSummary, SearchMessagesInput,
+    };
+    use crate::pagination::{CursorEntry, CursorStore, MailboxCursorEntry, MailboxCursorStore};
+    use crate::server::types::next_action_for_search_result;
     use std::sync::Arc;
     use std::time::Instant;
-
     use tokio::sync::Mutex;
 
-    use super::resume_cursor_search;
-    use crate::models::{MessageSummary, SearchMessagesInput};
-    use crate::pagination::{CursorEntry, CursorStore};
-    use crate::server::{MAX_CURSOR_UIDS_STORED, types::next_action_for_search_result};
+    #[test]
+    fn message_fetch_path_requires_size_or_bodystructure_for_bounded_fetches() {
+        assert_eq!(
+            message_fetch_path(Some(1_024), 1_024, false, false, true),
+            MessageFetchPath::FullMessage
+        );
+        assert_eq!(
+            message_fetch_path(Some(1_025), 1_024, false, false, true),
+            MessageFetchPath::Sections
+        );
+        assert_eq!(
+            message_fetch_path(None, 1_024, false, false, true),
+            MessageFetchPath::Sections
+        );
+        assert_eq!(
+            message_fetch_path(Some(1_024), 1_024, true, false, true),
+            MessageFetchPath::Sections
+        );
+        assert_eq!(
+            message_fetch_path(Some(1_024), 1_024, false, true, true),
+            MessageFetchPath::Sections
+        );
+        assert_eq!(
+            message_fetch_path(Some(1_024), 1_024, false, false, false),
+            MessageFetchPath::FullMessage
+        );
+        assert_eq!(
+            message_fetch_path(Some(1_025), 1_024, false, false, false),
+            MessageFetchPath::Unavailable
+        );
+        assert_eq!(
+            message_fetch_path(None, 1_024, false, false, false),
+            MessageFetchPath::Unavailable
+        );
+    }
 
     #[test]
-    fn search_cursor_storage_limit_is_capped_at_one_thousand_results() {
-        assert_eq!(MAX_CURSOR_UIDS_STORED, 1_000);
+    fn complete_section_length_requires_a_known_size_within_both_limits() {
+        assert_eq!(complete_section_length(Some(99), 101, 100), Some(99));
+        assert_eq!(complete_section_length(Some(101), 101, 100), None);
+        assert_eq!(complete_section_length(Some(102), 101, 200), None);
+        assert_eq!(complete_section_length(None, 101, 200), None);
+        assert_eq!(complete_section_length(Some(0), 101, 200), None);
+    }
+
+    #[test]
+    fn incomplete_raw_message_hides_attachment_sizes() {
+        let attachment = || AttachmentInfo {
+            filename: Some("document.pdf".to_owned()),
+            content_type: "application/pdf".to_owned(),
+            size_bytes: Some(42),
+            part_id: "2".to_owned(),
+            extracted_text: None,
+        };
+
+        let mut partial = vec![attachment()];
+        normalize_attachment_sizes_for_raw_completeness(&mut partial, false);
+        assert_eq!(partial[0].size_bytes, None);
+
+        let mut complete = vec![attachment()];
+        normalize_attachment_sizes_for_raw_completeness(&mut complete, true);
+        assert_eq!(complete[0].size_bytes, Some(42));
+    }
+
+    #[test]
+    fn fetch_budget_tracks_consumed_bytes_and_refuses_empty_remainder() {
+        let mut budget = FetchBudget::new(100);
+        assert_eq!(budget.take(60), Some(60));
+        budget.consume(60);
+        assert_eq!(budget.take(60), Some(40));
+        budget.consume(40);
+        assert_eq!(budget.take(1), None);
     }
 
     #[tokio::test]
@@ -1065,5 +1668,119 @@ mod tests {
             "imap:default:INBOX:42:7"
         );
         assert!(next_action.arguments.get("account_id").is_none());
+    }
+
+    fn mailbox(name: &str) -> MailboxInfo {
+        MailboxInfo {
+            name: name.to_owned(),
+            delimiter: Some("/".to_owned()),
+            attributes: Vec::new(),
+            role: None,
+            selectable: true,
+            provider_managed: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn mailbox_pages_use_stable_snapshot_boundaries() {
+        let cursors = Arc::new(Mutex::new(MailboxCursorStore::new(600, 8)));
+        let input = ListMailboxesInput {
+            account_id: "default".to_owned(),
+            cursor: None,
+            limit: 2,
+        };
+        let first = list_mailboxes_from_snapshot(
+            &cursors,
+            &input,
+            vec![mailbox("INBOX"), mailbox("Archive"), mailbox("Sent")].into(),
+            0,
+            Some(3),
+            false,
+        )
+        .await
+        .expect("first page");
+        assert_eq!(first.returned, 2);
+        assert_eq!(first.total, Some(3));
+        assert!(first.has_more);
+        let cursor = first.next_cursor.expect("first page has continuation");
+
+        let second = list_mailboxes_from_cursor(
+            &cursors,
+            &ListMailboxesInput {
+                account_id: "default".to_owned(),
+                cursor: Some(cursor.clone()),
+                limit: 2,
+            },
+            cursor,
+        )
+        .await
+        .expect("second page");
+        assert_eq!(
+            second
+                .mailboxes
+                .iter()
+                .map(|mailbox| mailbox.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Sent"]
+        );
+        assert!(!second.has_more);
+        assert!(second.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn mailbox_cursor_rejects_account_mismatch() {
+        let cursors = Arc::new(Mutex::new(MailboxCursorStore::new(600, 8)));
+        let cursor = {
+            let mut store = cursors.lock().await;
+            store.create(MailboxCursorEntry {
+                account_id: "default".to_owned(),
+                mailboxes: vec![mailbox("INBOX")].into(),
+                offset: 0,
+                total: Some(1),
+                truncated: false,
+                expires_at: Instant::now(),
+            })
+        };
+
+        let error = list_mailboxes_from_cursor(
+            &cursors,
+            &ListMailboxesInput {
+                account_id: "other".to_owned(),
+                cursor: Some(cursor.clone()),
+                limit: 1,
+            },
+            cursor,
+        )
+        .await
+        .expect_err("cursor must be bound to its account");
+        assert!(error.to_string().contains("cursor does not match account"));
+    }
+
+    #[tokio::test]
+    async fn truncated_mailbox_snapshot_omits_total() {
+        let cursors = Arc::new(Mutex::new(MailboxCursorStore::new(600, 8)));
+        let input = ListMailboxesInput {
+            account_id: "default".to_owned(),
+            cursor: None,
+            limit: 2_000,
+        };
+        let result = list_mailboxes_from_snapshot(
+            &cursors,
+            &input,
+            (0..2_000)
+                .map(|index| mailbox(&format!("Mailbox-{index}")))
+                .collect::<Vec<_>>()
+                .into(),
+            0,
+            None,
+            true,
+        )
+        .await
+        .expect("bounded snapshot");
+        assert_eq!(result.returned, 2_000);
+        assert_eq!(result.total, None);
+        assert!(result.truncated);
+        assert!(!result.has_more);
+        assert!(result.next_cursor.is_none());
     }
 }

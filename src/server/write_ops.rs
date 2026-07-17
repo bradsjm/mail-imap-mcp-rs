@@ -735,14 +735,7 @@ impl MailImapServer {
             MailboxAction::Rename {
                 mailbox,
                 destination_mailbox,
-            } => match imap::create_parent_mailboxes(&self.config, session, destination_mailbox)
-                .await
-            {
-                Ok(()) => {
-                    imap::rename_mailbox(&self.config, session, mailbox, destination_mailbox).await
-                }
-                Err(error) => Err(error),
-            },
+            } => imap::rename_mailbox(&self.config, session, mailbox, destination_mailbox).await,
             MailboxAction::Delete { mailbox } => {
                 imap::delete_mailbox(&self.config, session, mailbox).await
             }
@@ -1553,6 +1546,11 @@ mod tests {
             read_session_cache_ttl_seconds: 120,
             read_session_cache_max_per_account: 4,
             operation_max_entries: 256,
+            message_fetch_budget_bytes: 8_388_608,
+            message_decode_budget_bytes: 16_777_216,
+            mime_max_depth: 32,
+            mime_max_parts: 250,
+            attachment_extract_budget_bytes: 10_485_760,
         };
         assert_eq!(config.operation_max_entries, 256);
     }
