@@ -20,7 +20,7 @@ pub const MAX_ATTACHMENTS: usize = 50;
 #[cfg(test)]
 pub const MIME_MAX_PARTS: usize = 250;
 
-/// Resource ceilings shared by full-message and section-based MIME parsing.
+/// Resource ceilings for bounded raw-message MIME parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessingLimits {
     pub decode_budget_bytes: usize,
@@ -37,338 +37,6 @@ pub enum ProcessingLimit {
     MaxDepth,
     MaxParts,
     AttachmentExtractBudgetBytes,
-}
-
-/// A fetched attachment section and the metadata needed to process it.
-#[derive(Debug, Clone)]
-pub struct FetchedPart {
-    pub plan: PartPlan,
-    pub bytes: Vec<u8>,
-    /// Whether the fetched bytes contain the complete transfer-encoded payload.
-    pub complete: bool,
-}
-
-/// Bounded message sections fetched before synchronous MIME processing.
-#[derive(Debug, Clone, Copy)]
-pub struct MessageSections<'a> {
-    pub header_bytes: &'a [u8],
-    pub text_bytes: Option<&'a [u8]>,
-    pub html_bytes: Option<&'a [u8]>,
-    pub attachment_sections: &'a [FetchedPart],
-}
-
-/// The role a MIME part plays in a message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PartKind {
-    Text,
-    Html,
-    Attachment,
-    Inline,
-    MultipartWrapper,
-}
-
-/// A fetchable MIME section and the metadata needed to process it safely.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PartPlan {
-    /// IMAP section path, such as `1`, `1.2`, or `2`.
-    pub path: String,
-    pub kind: PartKind,
-    pub content_type: String,
-    pub encoding: String,
-    /// MIME charset parameter used to decode text parts.
-    pub charset: Option<String>,
-    pub declared_octets: Option<u32>,
-    pub filename: Option<String>,
-    pub disposition: Option<String>,
-}
-
-/// The bounded set of MIME sections selected for a message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MessageFetchPlan {
-    pub parts: Vec<PartPlan>,
-    pub text_part: Option<String>,
-    pub html_part: Option<String>,
-    pub attachment_parts: Vec<PartPlan>,
-    pub has_bodystructure: bool,
-    /// Whether planning stopped at the caller's part ceiling.
-    pub parts_truncated: bool,
-    /// Whether planning stopped at the caller's nesting-depth ceiling.
-    pub depth_truncated: bool,
-}
-
-/// Build a fetch plan from an IMAP BODYSTRUCTURE response.
-///
-/// Multipart containers are recorded as wrappers while their children receive
-/// the numbered IMAP section paths used for content fetches.
-pub fn plan_from_bodystructure(
-    bs: &async_imap::imap_proto::BodyStructure<'_>,
-    max_depth: usize,
-    max_parts: usize,
-) -> MessageFetchPlan {
-    let mut plan = MessageFetchPlan {
-        parts: Vec::new(),
-        text_part: None,
-        html_part: None,
-        attachment_parts: Vec::new(),
-        has_bodystructure: true,
-        parts_truncated: false,
-        depth_truncated: false,
-    };
-    walk_bodystructure(bs, None, 0, max_depth, max_parts, &mut plan);
-    plan
-}
-
-#[cfg(test)]
-/// Build the conservative fallback plan used when BODYSTRUCTURE is absent.
-///
-/// An empty path denotes `BODY.PEEK[]`; callers must use their configured
-/// partial-fetch budget rather than requesting an unbounded message body.
-pub fn plan_from_raw_headers(raw: &[u8]) -> MessageFetchPlan {
-    let headers = parse_header_bytes(raw).unwrap_or_default();
-    let content_type = headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-        .map_or_else(
-            || "text/plain".to_owned(),
-            |(_, value)| {
-                value
-                    .split(';')
-                    .next()
-                    .unwrap_or("text/plain")
-                    .trim()
-                    .to_ascii_lowercase()
-            },
-        );
-    let kind = part_kind(&content_type, None, None);
-    let part = PartPlan {
-        path: String::new(),
-        kind,
-        content_type,
-        encoding: "unknown".to_owned(),
-        charset: content_type_parameter(&headers, "charset"),
-        declared_octets: None,
-        filename: None,
-        disposition: None,
-    };
-    MessageFetchPlan {
-        text_part: if part.kind == PartKind::Text {
-            Some(part.path.clone())
-        } else {
-            None
-        },
-        html_part: if part.kind == PartKind::Html {
-            Some(part.path.clone())
-        } else {
-            None
-        },
-        attachment_parts: if part.kind == PartKind::Attachment {
-            vec![part.clone()]
-        } else {
-            Vec::new()
-        },
-        parts: vec![part],
-        has_bodystructure: false,
-        parts_truncated: false,
-        depth_truncated: false,
-    }
-}
-
-#[cfg(test)]
-fn content_type_parameter(headers: &[(String, String)], wanted: &str) -> Option<String> {
-    let value = headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))?
-        .1
-        .as_str();
-    value.split(';').skip(1).find_map(|parameter| {
-        let (name, value) = parameter.split_once('=')?;
-        name.trim()
-            .eq_ignore_ascii_case(wanted)
-            .then(|| value.trim().trim_matches('"').to_owned())
-    })
-}
-
-fn walk_bodystructure(
-    body: &async_imap::imap_proto::BodyStructure<'_>,
-    path: Option<String>,
-    depth: usize,
-    max_depth: usize,
-    max_parts: usize,
-    plan: &mut MessageFetchPlan,
-) {
-    if depth > max_depth {
-        plan.depth_truncated = true;
-        return;
-    }
-    if plan.parts.len() >= max_parts {
-        plan.parts_truncated = true;
-        return;
-    }
-
-    match body {
-        async_imap::imap_proto::BodyStructure::Multipart { common, bodies, .. } => {
-            if let Some(path) = &path {
-                push_wrapper(plan, path.clone(), common);
-                if plan.parts.len() >= max_parts && !bodies.is_empty() {
-                    plan.parts_truncated = true;
-                    return;
-                }
-            }
-            for (index, child) in bodies.iter().enumerate() {
-                if plan.parts.len() >= max_parts {
-                    plan.parts_truncated = true;
-                    break;
-                }
-                let child_path = match &path {
-                    Some(parent) => format!("{parent}.{}", index + 1),
-                    None => (index + 1).to_string(),
-                };
-                walk_bodystructure(
-                    child,
-                    Some(child_path),
-                    depth.saturating_add(1),
-                    max_depth,
-                    max_parts,
-                    plan,
-                );
-            }
-        }
-        async_imap::imap_proto::BodyStructure::Message {
-            common,
-            other,
-            body,
-            ..
-        } => {
-            let path = path.unwrap_or_else(|| "1".to_owned());
-            push_wrapper(plan, path.clone(), common);
-            if plan.parts.len() < max_parts {
-                walk_bodystructure(
-                    body,
-                    Some(format!("{path}.1")),
-                    depth.saturating_add(1),
-                    max_depth,
-                    max_parts,
-                    plan,
-                );
-            } else {
-                plan.parts_truncated = true;
-            }
-            let _ = other;
-        }
-        async_imap::imap_proto::BodyStructure::Basic { common, other, .. }
-        | async_imap::imap_proto::BodyStructure::Text { common, other, .. } => {
-            let path = path.unwrap_or_else(|| "1".to_owned());
-            let content_type = content_type(common);
-            let disposition = common
-                .disposition
-                .as_ref()
-                .map(|value| value.ty.to_string());
-            let filename = filename(common);
-            let kind = part_kind(&content_type, disposition.as_deref(), filename.as_deref());
-            let part = PartPlan {
-                path: path.clone(),
-                kind,
-                content_type,
-                encoding: encoding_name(&other.transfer_encoding),
-                charset: content_type_param(common, "charset"),
-                declared_octets: Some(other.octets),
-                filename,
-                disposition,
-            };
-            if kind == PartKind::Text && plan.text_part.is_none() {
-                plan.text_part = Some(path);
-            } else if kind == PartKind::Html && plan.html_part.is_none() {
-                plan.html_part = Some(path);
-            }
-            if kind == PartKind::Attachment
-                || part.disposition.as_deref().is_some_and(|value| {
-                    value.eq_ignore_ascii_case("inline") && part.filename.is_some()
-                })
-            {
-                plan.attachment_parts.push(part.clone());
-            }
-            plan.parts.push(part);
-        }
-    }
-}
-
-fn push_wrapper(
-    plan: &mut MessageFetchPlan,
-    path: String,
-    common: &async_imap::imap_proto::BodyContentCommon<'_>,
-) {
-    plan.parts.push(PartPlan {
-        path,
-        kind: PartKind::MultipartWrapper,
-        content_type: content_type(common),
-        encoding: "multipart".to_owned(),
-        charset: content_type_param(common, "charset"),
-        declared_octets: None,
-        filename: filename(common),
-        disposition: common
-            .disposition
-            .as_ref()
-            .map(|value| value.ty.to_string()),
-    });
-}
-
-fn content_type(common: &async_imap::imap_proto::BodyContentCommon<'_>) -> String {
-    format!("{}/{}", common.ty.ty, common.ty.subtype).to_ascii_lowercase()
-}
-
-fn content_type_param(
-    common: &async_imap::imap_proto::BodyContentCommon<'_>,
-    wanted: &str,
-) -> Option<String> {
-    common.ty.params.as_ref().and_then(|params| {
-        params
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
-            .map(|(_, value)| value.to_string())
-    })
-}
-
-fn filename(common: &async_imap::imap_proto::BodyContentCommon<'_>) -> Option<String> {
-    common
-        .disposition
-        .as_ref()
-        .and_then(|disposition| disposition.params.as_ref())
-        .and_then(|params| {
-            params
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case("filename"))
-                .map(|(_, value)| value.to_string())
-        })
-        .or_else(|| content_type_param(common, "name"))
-}
-
-fn part_kind(content_type: &str, disposition: Option<&str>, filename: Option<&str>) -> PartKind {
-    let inline = disposition.is_some_and(|value| value.eq_ignore_ascii_case("inline"));
-    if !inline
-        && (disposition.is_some_and(|value| value.eq_ignore_ascii_case("attachment"))
-            || filename.is_some())
-    {
-        PartKind::Attachment
-    } else if content_type.eq_ignore_ascii_case("text/plain") {
-        PartKind::Text
-    } else if content_type.eq_ignore_ascii_case("text/html") {
-        PartKind::Html
-    } else if inline {
-        PartKind::Inline
-    } else {
-        PartKind::Attachment
-    }
-}
-
-fn encoding_name(encoding: &async_imap::imap_proto::ContentEncoding<'_>) -> String {
-    match encoding {
-        async_imap::imap_proto::ContentEncoding::SevenBit => "7bit".to_owned(),
-        async_imap::imap_proto::ContentEncoding::EightBit => "8bit".to_owned(),
-        async_imap::imap_proto::ContentEncoding::Binary => "binary".to_owned(),
-        async_imap::imap_proto::ContentEncoding::Base64 => "base64".to_owned(),
-        async_imap::imap_proto::ContentEncoding::QuotedPrintable => "quoted-printable".to_owned(),
-        async_imap::imap_proto::ContentEncoding::Other(value) => value.to_ascii_lowercase(),
-    }
 }
 
 /// Parsed message representation
@@ -440,10 +108,14 @@ pub fn parse_message(
     attachment_mode: AttachmentMode,
     limits: &ProcessingLimits,
 ) -> AppResult<ParsedMessage> {
+    let headers = parse_all_headers(raw)?;
+    let preflight_limits = preflight_raw_mime(raw, limits.max_depth, limits.max_parts)?;
+    if !preflight_limits.is_empty() {
+        return Ok(header_only_message(headers, preflight_limits));
+    }
+
     let parsed = mailparse::parse_mail(raw)
         .map_err(|e| AppError::Internal(format!("failed to parse RFC822 message: {e}")))?;
-
-    let headers = parse_all_headers(raw)?;
     let mut state = WalkState {
         body_text: None,
         body_html: None,
@@ -491,182 +163,167 @@ pub fn parse_message(
         processing_limits: state.processing_limits,
     })
 }
-
-/// Assemble a parsed message from bounded IMAP body sections.
-/// Header bytes may be empty when the IMAP parser cannot safely retrieve them;
-/// body sections and BODYSTRUCTURE metadata are still assembled independently.
-pub fn parse_from_sections(
-    sections: MessageSections<'_>,
-    plan: &MessageFetchPlan,
-    body_max_chars: usize,
-    body_mode: BodyMode,
-    attachment_mode: AttachmentMode,
-    limits: &ProcessingLimits,
-) -> AppResult<ParsedMessage> {
-    let MessageSections {
-        header_bytes,
-        text_bytes,
-        html_bytes,
-        attachment_sections,
-    } = sections;
-    let headers = if header_bytes.is_empty() {
-        Vec::new()
-    } else {
-        parse_all_headers(header_bytes)?
-    };
-    let include_text = matches!(body_mode, BodyMode::Text | BodyMode::Both);
-    let include_html = matches!(body_mode, BodyMode::Html | BodyMode::Both);
-    let mut processing_limits = Vec::new();
-    if plan.parts_truncated {
-        processing_limits.push(ProcessingLimit::MaxParts);
-    }
-    if plan.depth_truncated {
-        processing_limits.push(ProcessingLimit::MaxDepth);
-    }
-    let mut decoded_bytes = 0;
-
-    let decoded_text = decode_section_bounded(
-        text_bytes,
-        plan.text_part.as_deref(),
-        plan,
-        &mut decoded_bytes,
-        limits.decode_budget_bytes,
-        &mut processing_limits,
-    )?
-    .map(|(bytes, charset)| decode_charset(&bytes, charset.as_deref()))
-    .transpose()?;
-    let sanitized_html = decode_section_bounded(
-        html_bytes,
-        plan.html_part.as_deref(),
-        plan,
-        &mut decoded_bytes,
-        limits.decode_budget_bytes,
-        &mut processing_limits,
-    )?
-    .map(|(bytes, charset)| {
-        decode_charset(&bytes, charset.as_deref()).map(|html| ammonia::clean(&html))
-    })
-    .transpose()?;
-
-    let body_text = include_text
-        .then(|| select_body_text(decoded_text, sanitized_html.as_deref()))
-        .flatten()
-        .map(|text| truncate_chars(text, body_max_chars));
-    let body_html_sanitized = include_html
-        .then_some(sanitized_html)
-        .flatten()
-        .map(|html| truncate_chars(html, body_max_chars));
-
-    let mut attachments = Vec::new();
-    let mut attachments_truncated = false;
-    let mut attachment_decoded_bytes = 0usize;
-    if attachment_mode != AttachmentMode::None {
-        for part in &plan.attachment_parts {
-            if attachments.len() >= MAX_ATTACHMENTS {
-                attachments_truncated = true;
-                break;
-            }
-            let payload = attachment_sections
-                .iter()
-                .find(|fetched| fetched.plan.path == part.path);
-            let mut extracted_text = None;
-            // BODYSTRUCTURE octets describe transfer-encoded bytes, not the
-            // decoded attachment size exposed by AttachmentInfo.
-            let mut size_bytes = None;
-            if let Some(payload) = payload {
-                let remaining = limits.decode_budget_bytes.saturating_sub(decoded_bytes);
-                let (decoded, decode_partial) =
-                    decode_transfer_encoded_bounded(&payload.bytes, &part.encoding, remaining)?;
-                if payload.complete && !decode_partial {
-                    size_bytes = Some(decoded.len());
-                }
-                if decode_partial {
-                    push_limit(&mut processing_limits, ProcessingLimit::DecodeBudgetBytes);
-                }
-                decoded_bytes += decoded.len();
-                let extract_pdf = attachment_mode == AttachmentMode::ExtractText
-                    && part.content_type.eq_ignore_ascii_case("application/pdf");
-                if extract_pdf {
-                    let extract_remaining = limits
-                        .attachment_extract_budget_bytes
-                        .saturating_sub(attachment_decoded_bytes);
-                    if decoded.len() > extract_remaining {
-                        push_limit(
-                            &mut processing_limits,
-                            ProcessingLimit::AttachmentExtractBudgetBytes,
-                        );
-                    } else if !decode_partial {
-                        attachment_decoded_bytes += decoded.len();
-                        if let Ok(text) = pdf_extract::extract_text_from_mem(&decoded) {
-                            extracted_text =
-                                Some(truncate_chars(text, limits.attachment_text_max_chars));
-                        }
-                    }
-                }
-            }
-            attachments.push(AttachmentInfo {
-                filename: part.filename.clone(),
-                content_type: part.content_type.clone(),
-                size_bytes,
-                part_id: part.path.clone(),
-                extracted_text,
-            });
-        }
-    }
-
+fn header_only_message(
+    headers: Vec<(String, String)>,
+    processing_limits: Vec<ProcessingLimit>,
+) -> ParsedMessage {
     let header_map = to_header_map(&headers);
-    Ok(ParsedMessage {
+    ParsedMessage {
         date: header_map.get("date").cloned(),
         from: header_map.get("from").cloned(),
         to: header_map.get("to").cloned(),
         cc: header_map.get("cc").cloned(),
         subject: header_map.get("subject").cloned(),
         headers_all: headers,
-        body_text,
-        body_html_sanitized,
-        attachments,
-        attachments_truncated,
+        body_text: None,
+        body_html_sanitized: None,
+        attachments: Vec::new(),
+        attachments_truncated: true,
         processing_limits,
-    })
+    }
 }
 
-fn decode_section_bounded(
-    bytes: Option<&[u8]>,
-    path: Option<&str>,
-    plan: &MessageFetchPlan,
-    decoded_bytes: &mut usize,
-    budget: usize,
-    processing_limits: &mut Vec<ProcessingLimit>,
-) -> AppResult<Option<(Vec<u8>, Option<String>)>> {
-    let Some(bytes) = bytes else {
-        return Ok(None);
-    };
-    let part = path.and_then(|path| plan.parts.iter().find(|part| part.path == path));
-    let encoding = part.map_or("unknown", |part| part.encoding.as_str());
-    let remaining = budget.saturating_sub(*decoded_bytes);
-    let (decoded, partial) = decode_transfer_encoded_bounded(bytes, encoding, remaining)?;
-    if partial {
-        push_limit(processing_limits, ProcessingLimit::DecodeBudgetBytes);
+fn preflight_raw_mime(
+    raw: &[u8],
+    max_depth: usize,
+    max_parts: usize,
+) -> AppResult<Vec<ProcessingLimit>> {
+    if max_parts == 0 {
+        return Ok(vec![ProcessingLimit::MaxParts]);
     }
-    if partial && decoded.is_empty() && !bytes.is_empty() {
-        return Ok(None);
+
+    let stack_limit = max_parts.saturating_add(1);
+    let mut stack = Vec::with_capacity(stack_limit.min(64));
+    stack.push((raw, 0usize));
+    let mut parts_seen = 0usize;
+    let mut limits = Vec::new();
+
+    while let Some((part, depth)) = stack.pop() {
+        if depth > max_depth {
+            push_limit(&mut limits, ProcessingLimit::MaxDepth);
+            continue;
+        }
+        if parts_seen >= max_parts {
+            push_limit(&mut limits, ProcessingLimit::MaxParts);
+            break;
+        }
+        parts_seen += 1;
+
+        let (headers, body_offset) = mailparse::parse_headers(part)
+            .map_err(|e| AppError::Internal(format!("failed to parse message headers: {e}")))?;
+        let content_type = headers
+            .iter()
+            .find(|header| header.get_key_ref().eq_ignore_ascii_case("content-type"))
+            .map_or_else(
+                || mailparse::parse_content_type("text/plain"),
+                |header| mailparse::parse_content_type(&header.get_value()),
+            );
+        if !content_type
+            .mimetype
+            .to_ascii_lowercase()
+            .starts_with("multipart/")
+        {
+            continue;
+        }
+        let Some(boundary) = content_type.params.get("boundary") else {
+            continue;
+        };
+
+        let child_depth = depth.saturating_add(1);
+        if child_depth > max_depth {
+            let children = multipart_child_slices(&part[body_offset..], boundary.as_bytes(), 1);
+            if !children.parts.is_empty() || children.overflowed {
+                push_limit(&mut limits, ProcessingLimit::MaxDepth);
+            }
+            continue;
+        }
+
+        let remaining = max_parts.saturating_sub(parts_seen.saturating_add(stack.len()));
+        let children = multipart_child_slices(&part[body_offset..], boundary.as_bytes(), remaining);
+        if children.overflowed {
+            push_limit(&mut limits, ProcessingLimit::MaxParts);
+            return Ok(limits);
+        }
+        for child in children.parts.into_iter().rev() {
+            if stack.len() >= stack_limit {
+                push_limit(&mut limits, ProcessingLimit::MaxParts);
+                break;
+            }
+            stack.push((child, child_depth));
+        }
     }
-    *decoded_bytes = decoded_bytes.saturating_add(decoded.len());
-    Ok(Some((decoded, part.and_then(|part| part.charset.clone()))))
+
+    Ok(limits)
 }
 
-fn decode_charset(bytes: &[u8], charset: Option<&str>) -> AppResult<String> {
-    let Some(charset) = charset.filter(|value| !value.eq_ignore_ascii_case("utf-8")) else {
-        return Ok(String::from_utf8_lossy(bytes).into_owned());
-    };
-    let mut message = format!(
-        "Content-Type: text/plain; charset=\"{charset}\"\r\nContent-Transfer-Encoding: 8bit\r\n\r\n"
-    )
-    .into_bytes();
-    message.extend_from_slice(bytes);
-    mailparse::parse_mail(&message)
-        .and_then(|part| part.get_body())
-        .map_err(|error| AppError::Internal(format!("failed decoding message charset: {error}")))
+struct MultipartChildren<'a> {
+    parts: Vec<&'a [u8]>,
+    overflowed: bool,
+}
+
+fn multipart_child_slices<'a>(
+    body: &'a [u8],
+    boundary: &[u8],
+    capacity: usize,
+) -> MultipartChildren<'a> {
+    let mut marker = Vec::with_capacity(boundary.len().saturating_add(2));
+    marker.extend_from_slice(b"--");
+    marker.extend_from_slice(boundary);
+
+    let mut parts = Vec::with_capacity(capacity.min(16));
+    let mut child_start = None;
+    let mut line_start = 0usize;
+    let mut overflowed = false;
+    let mut closed = false;
+
+    while line_start < body.len() {
+        let line_end = body[line_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(body.len(), |offset| line_start + offset + 1);
+        let line = &body[line_start..line_end];
+        if line.starts_with(&marker) {
+            let terminates_child = child_start.is_some();
+            if let Some(start) = child_start.take() {
+                let mut end = line_start;
+                if end > start && body[end - 1] == b'\n' {
+                    end -= 1;
+                    if end > start && body[end - 1] == b'\r' {
+                        end -= 1;
+                    }
+                }
+                if parts.len() >= capacity {
+                    overflowed = true;
+                    break;
+                }
+                parts.push(&body[start..end]);
+            }
+
+            if terminates_child && line[marker.len()..].starts_with(b"--") {
+                closed = true;
+                break;
+            }
+            if line.ends_with(b"\n") {
+                child_start = Some(line_end);
+            } else {
+                break;
+            }
+        }
+        line_start = line_end;
+    }
+
+    if !closed
+        && !overflowed
+        && let Some(start) = child_start
+    {
+        if parts.len() >= capacity {
+            overflowed = true;
+        } else {
+            parts.push(&body[start..]);
+        }
+    }
+
+    MultipartChildren { parts, overflowed }
 }
 
 fn push_limit(limits: &mut Vec<ProcessingLimit>, limit: ProcessingLimit) {
@@ -689,12 +346,6 @@ fn decode_parsed_part_bounded(
         }
         Body::Binary(body) => decode_transfer_encoded_bounded(body.get_raw(), "binary", remaining),
     }
-}
-
-#[cfg(test)]
-/// Decode a MIME transfer-encoded body section.
-pub fn decode_transfer_encoded(data: &[u8], encoding: &str) -> AppResult<Vec<u8>> {
-    decode_transfer_encoded_bounded(data, encoding, usize::MAX).map(|(decoded, _)| decoded)
 }
 
 fn decode_transfer_encoded_bounded(
@@ -845,8 +496,7 @@ fn walk_parts(
         let filename = attachment_filename(part, &disp.params);
         let explicit_attachment = disp.disposition == DispositionType::Attachment;
         let is_attachment = explicit_attachment || filename.is_some();
-        let body_candidate =
-            !explicit_attachment && matches!(ctype.as_str(), "text/plain" | "text/html");
+        let body_candidate = !is_attachment && matches!(ctype.as_str(), "text/plain" | "text/html");
 
         if body_candidate {
             if ctype == "text/plain" && state.body_text.is_none() {
@@ -918,9 +568,9 @@ fn decode_text_part(
     state: &mut WalkState,
     config: &WalkConfig,
 ) -> AppResult<()> {
-    let decoded = part
-        .get_body()
-        .map_err(|error| AppError::Internal(format!("failed decoding message body: {error}")))?;
+    let Ok(decoded) = part.get_body() else {
+        return Ok(());
+    };
     if decoded.len()
         > config
             .limits
@@ -1029,19 +679,12 @@ pub fn truncate_chars(input: String, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
 
     use super::{
-        FetchedPart, MAX_ATTACHMENTS, MIME_MAX_PARTS, MessageFetchPlan, MessageSections, PartKind,
-        PartPlan, ProcessingLimit, ProcessingLimits, attachment_size_bytes, curated_headers,
-        decode_transfer_encoded, decode_transfer_encoded_bounded, parse_from_sections,
-        parse_message, plan_from_bodystructure, plan_from_raw_headers, truncate_chars,
+        MAX_ATTACHMENTS, MIME_MAX_PARTS, ProcessingLimit, ProcessingLimits, attachment_size_bytes,
+        curated_headers, parse_message, truncate_chars,
     };
     use crate::models::{AttachmentMode, BodyMode};
-    use async_imap::imap_proto::{
-        BodyContentCommon, BodyContentSinglePart, BodyStructure, ContentDisposition,
-        ContentEncoding, ContentType,
-    };
 
     fn test_limits(attachment_text_max_chars: usize) -> ProcessingLimits {
         ProcessingLimits {
@@ -1051,148 +694,6 @@ mod tests {
             attachment_extract_budget_bytes: 5_000_000,
             attachment_text_max_chars,
         }
-    }
-
-    fn common(
-        ty: &'static str,
-        subtype: &'static str,
-        disposition: Option<(&'static str, Option<&'static str>)>,
-    ) -> BodyContentCommon<'static> {
-        let disposition = disposition.map(|(ty, filename)| ContentDisposition {
-            ty: Cow::Borrowed(ty),
-            params: filename
-                .map(|filename| vec![(Cow::Borrowed("filename"), Cow::Borrowed(filename))]),
-        });
-        BodyContentCommon {
-            ty: ContentType {
-                ty: Cow::Borrowed(ty),
-                subtype: Cow::Borrowed(subtype),
-                params: None,
-            },
-            disposition,
-            language: None,
-            location: None,
-        }
-    }
-
-    fn text_part(
-        ty: &'static str,
-        subtype: &'static str,
-        disposition: Option<(&'static str, Option<&'static str>)>,
-    ) -> BodyStructure<'static> {
-        BodyStructure::Text {
-            common: common(ty, subtype, disposition),
-            other: BodyContentSinglePart {
-                id: None,
-                md5: None,
-                description: None,
-                transfer_encoding: ContentEncoding::SevenBit,
-                octets: 42,
-            },
-            lines: 1,
-            extension: None,
-        }
-    }
-
-    fn nested_multipart(depth: usize) -> BodyStructure<'static> {
-        if depth == 0 {
-            return text_part("text", "plain", None);
-        }
-
-        BodyStructure::Multipart {
-            common: common("multipart", "mixed", None),
-            bodies: vec![nested_multipart(depth - 1)],
-            extension: None,
-        }
-    }
-
-    #[test]
-    fn plans_multipart_text_html_and_attachment_sections() {
-        let bodystructure = BodyStructure::Multipart {
-            common: common("multipart", "mixed", None),
-            bodies: vec![
-                text_part("text", "plain", None),
-                text_part("text", "html", None),
-                text_part(
-                    "application",
-                    "pdf",
-                    Some(("attachment", Some("report.pdf"))),
-                ),
-            ],
-
-            extension: None,
-        };
-
-        let plan = plan_from_bodystructure(&bodystructure, 64, MIME_MAX_PARTS);
-
-        assert_eq!(plan.parts.len(), 3);
-        assert_eq!(plan.parts[0].path, "1");
-        assert_eq!(plan.parts[0].kind, PartKind::Text);
-        assert_eq!(plan.parts[1].path, "2");
-        assert_eq!(plan.parts[1].kind, PartKind::Html);
-        assert_eq!(plan.parts[2].path, "3");
-        assert_eq!(plan.parts[2].kind, PartKind::Attachment);
-        assert_eq!(plan.parts[2].filename.as_deref(), Some("report.pdf"));
-        assert_eq!(plan.text_part.as_deref(), Some("1"));
-        assert_eq!(plan.html_part.as_deref(), Some("2"));
-        assert_eq!(plan.attachment_parts.len(), 1);
-    }
-
-    #[test]
-    fn bodystructure_carries_charset_and_inline_text_is_body_and_metadata() {
-        let mut inline = text_part("text", "plain", Some(("inline", Some("note.txt"))));
-        if let BodyStructure::Text { common, .. } = &mut inline {
-            common.ty.params = Some(vec![(
-                Cow::Borrowed("charset"),
-                Cow::Borrowed("iso-8859-1"),
-            )]);
-        }
-        let plan = plan_from_bodystructure(&inline, 64, MIME_MAX_PARTS);
-
-        assert_eq!(plan.parts[0].kind, PartKind::Text);
-        assert_eq!(plan.parts[0].charset.as_deref(), Some("iso-8859-1"));
-        assert_eq!(plan.text_part.as_deref(), Some("1"));
-        assert_eq!(plan.attachment_parts.len(), 1);
-    }
-
-    #[test]
-    fn bodystructure_plan_stops_at_max_parts() {
-        let bodystructure = nested_multipart(MIME_MAX_PARTS + 1);
-
-        let plan = plan_from_bodystructure(&bodystructure, usize::MAX, MIME_MAX_PARTS);
-
-        assert_eq!(plan.parts.len(), MIME_MAX_PARTS);
-        assert!(plan.parts_truncated);
-    }
-
-    #[test]
-    fn bodystructure_plan_reports_depth_limit() {
-        let plan = plan_from_bodystructure(&nested_multipart(3), 1, MIME_MAX_PARTS);
-
-        assert!(plan.depth_truncated);
-        assert!(!plan.parts_truncated);
-        assert_eq!(plan.parts.len(), 1);
-    }
-
-    #[test]
-    fn plans_single_part_message() {
-        let plan = plan_from_bodystructure(&text_part("text", "plain", None), 64, MIME_MAX_PARTS);
-
-        assert_eq!(plan.parts.len(), 1);
-        assert_eq!(plan.parts[0].path, "1");
-        assert_eq!(plan.parts[0].kind, PartKind::Text);
-        assert_eq!(plan.text_part.as_deref(), Some("1"));
-        assert!(!plan.parts_truncated);
-    }
-
-    #[test]
-    fn raw_header_fallback_uses_whole_message_section_marker() {
-        let plan = plan_from_raw_headers(b"Content-Type: text/html; charset=utf-8\r\n\r\n");
-
-        assert!(!plan.has_bodystructure);
-        assert_eq!(plan.parts.len(), 1);
-        assert_eq!(plan.parts[0].path, "");
-        assert_eq!(plan.parts[0].kind, PartKind::Html);
     }
 
     /// Tests that Unicode strings are truncated by character, not byte.
@@ -1444,241 +945,6 @@ mod tests {
         );
     }
 
-    fn section_plan(
-        parts: Vec<PartPlan>,
-        text_part: Option<&str>,
-        html_part: Option<&str>,
-    ) -> MessageFetchPlan {
-        let attachment_parts = parts
-            .iter()
-            .filter(|part| matches!(part.kind, PartKind::Attachment | PartKind::Inline))
-            .cloned()
-            .collect();
-        MessageFetchPlan {
-            parts,
-            text_part: text_part.map(str::to_owned),
-            html_part: html_part.map(str::to_owned),
-            attachment_parts,
-            has_bodystructure: true,
-            parts_truncated: false,
-            depth_truncated: false,
-        }
-    }
-
-    #[test]
-    fn assembles_text_and_html_from_sections() {
-        let plan = section_plan(
-            vec![
-                PartPlan {
-                    path: "1".to_owned(),
-                    kind: PartKind::Text,
-                    content_type: "text/plain".to_owned(),
-                    encoding: "7bit".to_owned(),
-                    charset: None,
-                    declared_octets: Some(10),
-                    filename: None,
-                    disposition: None,
-                },
-                PartPlan {
-                    path: "2".to_owned(),
-                    kind: PartKind::Html,
-                    content_type: "text/html".to_owned(),
-                    encoding: "7bit".to_owned(),
-                    charset: None,
-                    declared_octets: Some(20),
-                    filename: None,
-                    disposition: None,
-                },
-            ],
-            Some("1"),
-            Some("2"),
-        );
-
-        let parsed = parse_from_sections(
-            MessageSections {
-                header_bytes: b"",
-                text_bytes: Some(b"Plain body"),
-                html_bytes: Some(b"<p>HTML <b>body</b><script>alert(1)</script></p>"),
-                attachment_sections: &[],
-            },
-            &plan,
-            2000,
-            BodyMode::Both,
-            AttachmentMode::Metadata,
-            &test_limits(10_000),
-        )
-        .expect("sections should parse");
-
-        assert!(parsed.headers_all.is_empty());
-        assert_eq!(parsed.from, None);
-        assert_eq!(parsed.subject, None);
-        assert_eq!(parsed.body_text.as_deref(), Some("Plain body"));
-        assert_eq!(
-            parsed.body_html_sanitized.as_deref(),
-            Some("<p>HTML <b>body</b></p>")
-        );
-    }
-
-    #[test]
-    fn decodes_base64_section_text() {
-        let plan = section_plan(
-            vec![PartPlan {
-                path: "1".to_owned(),
-                kind: PartKind::Text,
-                content_type: "text/plain".to_owned(),
-                encoding: "base64".to_owned(),
-                charset: None,
-                declared_octets: Some(12),
-                filename: None,
-                disposition: None,
-            }],
-            Some("1"),
-            None,
-        );
-        let parsed = parse_from_sections(
-            MessageSections {
-                header_bytes: b"Subject: Encoded\r\n\r\n",
-                text_bytes: Some(b"SGVsbG8gYmFzZTY0"),
-                html_bytes: None,
-                attachment_sections: &[],
-            },
-            &plan,
-            2000,
-            BodyMode::Text,
-            AttachmentMode::Metadata,
-            &test_limits(10_000),
-        )
-        .expect("base64 section must parse");
-
-        assert_eq!(parsed.body_text.as_deref(), Some("Hello base64"));
-        assert_eq!(
-            decode_transfer_encoded(b"Hello=20quoted=2Dprintable", "quoted-printable")
-                .expect("quoted-printable must decode"),
-            b"Hello quoted-printable"
-        );
-        let (decoded, partial) = decode_transfer_encoded_bounded(b"a=\r\n", "quoted-printable", 1)
-            .expect("soft line break should not consume decoded-byte budget");
-        assert_eq!(decoded, b"a");
-        assert!(!partial);
-    }
-
-    #[test]
-    fn bounded_sections_decode_charset_and_complete_encoding_prefixes() {
-        let plan = section_plan(
-            vec![PartPlan {
-                path: "1".to_owned(),
-                kind: PartKind::Text,
-                content_type: "text/plain".to_owned(),
-                encoding: "quoted-printable".to_owned(),
-                charset: Some("iso-8859-1".to_owned()),
-                declared_octets: None,
-                filename: None,
-                disposition: None,
-            }],
-            Some("1"),
-            None,
-        );
-        let parsed = parse_from_sections(
-            MessageSections {
-                header_bytes: b"Subject: Prefix\r\n\r\n",
-                text_bytes: Some(b"caf=E9="),
-                html_bytes: None,
-                attachment_sections: &[],
-            },
-            &plan,
-            100,
-            BodyMode::Text,
-            AttachmentMode::None,
-            &test_limits(100),
-        )
-        .expect("bounded atom must return partial content");
-
-        assert_eq!(parsed.body_text.as_deref(), Some("café"));
-        assert!(
-            parsed
-                .processing_limits
-                .contains(&ProcessingLimit::DecodeBudgetBytes)
-        );
-    }
-
-    #[test]
-    fn assembles_attachment_metadata_from_plan() {
-        let attachment = PartPlan {
-            path: "3".to_owned(),
-            kind: PartKind::Attachment,
-            content_type: "application/pdf".to_owned(),
-            encoding: "base64".to_owned(),
-            charset: None,
-            declared_octets: Some(1234),
-            filename: Some("report.pdf".to_owned()),
-            disposition: Some("attachment".to_owned()),
-        };
-        let plan = section_plan(vec![attachment.clone()], None, None);
-
-        let parsed = parse_from_sections(
-            MessageSections {
-                header_bytes: b"",
-                text_bytes: None,
-                html_bytes: None,
-                attachment_sections: &[],
-            },
-            &plan,
-            2000,
-            BodyMode::Text,
-            AttachmentMode::Metadata,
-            &test_limits(10_000),
-        )
-        .expect("sections should parse");
-
-        assert_eq!(parsed.attachments.len(), 1);
-        assert!(parsed.headers_all.is_empty());
-        assert_eq!(parsed.subject, None);
-        assert_eq!(parsed.attachments[0].filename, attachment.filename);
-        assert_eq!(parsed.attachments[0].content_type, attachment.content_type);
-        assert_eq!(parsed.attachments[0].size_bytes, None);
-        assert_eq!(parsed.attachments[0].part_id, attachment.path);
-        assert_eq!(parsed.attachments[0].extracted_text, None);
-    }
-
-    #[test]
-    fn attachment_section_size_requires_a_complete_fetch() {
-        let attachment = PartPlan {
-            path: "2".to_owned(),
-            kind: PartKind::Attachment,
-            content_type: "application/octet-stream".to_owned(),
-            encoding: "base64".to_owned(),
-            charset: None,
-            declared_octets: Some(8),
-            filename: Some("hello.bin".to_owned()),
-            disposition: Some("attachment".to_owned()),
-        };
-        let plan = section_plan(vec![attachment.clone()], None, None);
-        let parse = |complete| {
-            let fetched = [FetchedPart {
-                plan: attachment.clone(),
-                bytes: b"aGVsbG8=".to_vec(),
-                complete,
-            }];
-            parse_from_sections(
-                MessageSections {
-                    header_bytes: b"Subject: Attachment\r\n\r\n",
-                    text_bytes: None,
-                    html_bytes: None,
-                    attachment_sections: &fetched,
-                },
-                &plan,
-                100,
-                BodyMode::Text,
-                AttachmentMode::Metadata,
-                &test_limits(100),
-            )
-            .expect("attachment section should parse")
-        };
-
-        assert_eq!(parse(true).attachments[0].size_bytes, Some(5));
-        assert_eq!(parse(false).attachments[0].size_bytes, None);
-    }
-
     #[test]
     fn full_attachment_size_is_unavailable_when_decode_budget_prevents_decoding() {
         let raw = concat!(
@@ -1820,70 +1086,6 @@ mod tests {
     }
 
     #[test]
-    fn attachment_sections_share_decode_and_extraction_budgets() {
-        let first = PartPlan {
-            path: "1".to_owned(),
-            kind: PartKind::Attachment,
-            content_type: "application/octet-stream".to_owned(),
-            encoding: "7bit".to_owned(),
-            charset: None,
-            declared_octets: None,
-            filename: Some("one.bin".to_owned()),
-            disposition: Some("attachment".to_owned()),
-        };
-        let second = PartPlan {
-            path: "2".to_owned(),
-            filename: Some("two.bin".to_owned()),
-            ..first.clone()
-        };
-        let plan = section_plan(vec![first.clone(), second.clone()], None, None);
-        let mut limits = test_limits(100);
-        limits.decode_budget_bytes = 5;
-        limits.attachment_extract_budget_bytes = 5;
-        let sections = vec![
-            FetchedPart {
-                plan: first,
-                bytes: b"abc".to_vec(),
-                complete: true,
-            },
-            FetchedPart {
-                plan: second,
-                bytes: b"def".to_vec(),
-                complete: true,
-            },
-        ];
-
-        let parsed = parse_from_sections(
-            MessageSections {
-                header_bytes: b"Subject: Attachments\r\n\r\n",
-                text_bytes: None,
-                html_bytes: None,
-                attachment_sections: &sections,
-            },
-            &plan,
-            100,
-            BodyMode::Text,
-            AttachmentMode::Metadata,
-            &limits,
-        )
-        .expect("budget hits return a partial message");
-
-        assert_eq!(parsed.attachments.len(), 2);
-        assert_eq!(parsed.attachments[0].size_bytes, Some(3));
-        assert_eq!(parsed.attachments[1].size_bytes, None);
-        assert!(
-            parsed
-                .processing_limits
-                .contains(&ProcessingLimit::DecodeBudgetBytes)
-        );
-        assert!(
-            !parsed
-                .processing_limits
-                .contains(&ProcessingLimit::AttachmentExtractBudgetBytes)
-        );
-    }
-
-    #[test]
     fn raw_parse_reports_part_limit() {
         let raw = concat!(
             "MIME-Version: 1.0\r\n",
@@ -1893,7 +1095,7 @@ mod tests {
         );
         let mut limits = test_limits(100);
         limits.max_parts = 1;
-        limits.max_depth = 0;
+        limits.max_depth = 10;
         limits.decode_budget_bytes = 4;
 
         let parsed = parse_message(
@@ -1940,6 +1142,59 @@ mod tests {
                 .contains(&ProcessingLimit::MaxDepth)
         );
     }
+    #[test]
+    fn depth_limit_takes_precedence_over_remaining_part_budget() {
+        let raw = concat!(
+            "Content-Type: multipart/mixed; boundary=b\r\n\r\n",
+            "--b\r\nContent-Type: text/plain\r\n\r\none\r\n",
+            "--b\r\nContent-Type: text/plain\r\n\r\ntwo\r\n",
+            "--b--\r\n"
+        );
+        let mut limits = test_limits(100);
+        limits.max_depth = 0;
+        limits.max_parts = 2;
+
+        let parsed = parse_message(
+            raw.as_bytes(),
+            100,
+            BodyMode::Text,
+            AttachmentMode::None,
+            &limits,
+        )
+        .expect("depth overflow returns a partial message");
+
+        assert!(parsed.body_text.is_none());
+        assert_eq!(parsed.processing_limits, vec![ProcessingLimit::MaxDepth]);
+    }
+
+    #[test]
+    fn initial_closing_delimiter_still_preflights_mailparse_child() {
+        let raw = concat!(
+            "Subject: Initial close\r\n",
+            "Content-Type: multipart/mixed; boundary=x\r\n\r\n",
+            "--x--\r\n",
+            "Content-Type: multipart/mixed; boundary=y\r\n\r\n",
+            "--y\r\n",
+            "Content-Type: text/plain\r\n\r\n",
+            "hidden\r\n",
+            "--y--\r\n"
+        );
+        let mut limits = test_limits(100);
+        limits.max_depth = 0;
+
+        let parsed = parse_message(
+            raw.as_bytes(),
+            100,
+            BodyMode::Text,
+            AttachmentMode::None,
+            &limits,
+        )
+        .expect("mailparse-compatible child must be rejected before recursive parsing");
+
+        assert_eq!(parsed.subject.as_deref(), Some("Initial close"));
+        assert!(parsed.body_text.is_none());
+        assert_eq!(parsed.processing_limits, vec![ProcessingLimit::MaxDepth]);
+    }
 
     #[test]
     fn metadata_and_non_pdf_attachments_do_not_charge_extraction_budget() {
@@ -1973,57 +1228,153 @@ mod tests {
     }
 
     #[test]
-    fn section_decode_budget_is_shared_by_body_parts() {
-        let plan = section_plan(
-            vec![
-                PartPlan {
-                    path: "1".to_owned(),
-                    kind: PartKind::Text,
-                    content_type: "text/plain".to_owned(),
-                    encoding: "7bit".to_owned(),
-                    charset: None,
-                    declared_octets: None,
-                    filename: None,
-                    disposition: None,
-                },
-                PartPlan {
-                    path: "2".to_owned(),
-                    kind: PartKind::Html,
-                    content_type: "text/html".to_owned(),
-                    encoding: "7bit".to_owned(),
-                    charset: None,
-                    declared_octets: None,
-                    filename: None,
-                    disposition: None,
-                },
-            ],
-            Some("1"),
-            Some("2"),
+    fn depth_overflow_returns_header_only_without_recursive_parse() {
+        let raw = concat!(
+            "Subject: Deep message\r\n",
+            "From: sender@example.com\r\n",
+            "X-Preserved: yes\r\n",
+            "Content-Type: multipart/mixed; boundary=outer\r\n\r\n",
+            "--outer\r\n",
+            "Content-Type: multipart/mixed; boundary=inner\r\n\r\n",
+            "--inner\r\n",
+            "Malformed Header\r\n\r\n",
+            "unreachable\r\n",
+            "--inner--\r\n",
+            "--outer--\r\n"
         );
         let mut limits = test_limits(100);
-        limits.decode_budget_bytes = 5;
+        limits.max_depth = 0;
 
-        let parsed = parse_from_sections(
-            MessageSections {
-                header_bytes: b"Subject: Budget\r\n\r\n",
-                text_bytes: Some(b"hello"),
-                html_bytes: Some(b"<b>x</b>"),
-                attachment_sections: &[],
-            },
-            &plan,
+        let parsed = parse_message(
+            raw.as_bytes(),
             100,
             BodyMode::Both,
-            AttachmentMode::None,
+            AttachmentMode::ExtractText,
             &limits,
         )
-        .expect("decode budget returns a partial message");
+        .expect("depth overflow returns top-level metadata");
 
-        assert_eq!(parsed.body_text.as_deref(), Some("hello"));
-        assert!(parsed.body_html_sanitized.is_none());
+        assert_eq!(parsed.subject.as_deref(), Some("Deep message"));
+        assert_eq!(parsed.from.as_deref(), Some("sender@example.com"));
         assert!(
-            parsed
-                .processing_limits
-                .contains(&ProcessingLimit::DecodeBudgetBytes)
+            parsed.headers_all.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("x-preserved") && value == "yes"
+            })
         );
+        assert!(parsed.body_text.is_none());
+        assert!(parsed.body_html_sanitized.is_none());
+        assert!(parsed.attachments.is_empty());
+        assert!(parsed.attachments_truncated);
+        assert_eq!(parsed.processing_limits, vec![ProcessingLimit::MaxDepth]);
+    }
+
+    #[test]
+    fn part_overflow_returns_header_only_without_recursive_parse() {
+        let raw = concat!(
+            "Subject: Wide message\r\n",
+            "To: recipient@example.com\r\n",
+            "X-Preserved: yes\r\n",
+            "Content-Type: multipart/mixed; boundary=outer\r\n\r\n",
+            "--outer\r\n",
+            "Content-Type: text/plain\r\n\r\n",
+            "first\r\n",
+            "--outer\r\n",
+            "Malformed Header\r\n\r\n",
+            "unreachable\r\n",
+            "--outer--\r\n"
+        );
+        let mut limits = test_limits(100);
+        limits.max_parts = 2;
+
+        let parsed = parse_message(
+            raw.as_bytes(),
+            100,
+            BodyMode::Both,
+            AttachmentMode::ExtractText,
+            &limits,
+        )
+        .expect("part overflow returns top-level metadata");
+
+        assert_eq!(parsed.subject.as_deref(), Some("Wide message"));
+        assert_eq!(parsed.to.as_deref(), Some("recipient@example.com"));
+        assert!(
+            parsed.headers_all.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("x-preserved") && value == "yes"
+            })
+        );
+        assert!(parsed.body_text.is_none());
+        assert!(parsed.body_html_sanitized.is_none());
+        assert!(parsed.attachments.is_empty());
+        assert!(parsed.attachments_truncated);
+        assert_eq!(parsed.processing_limits, vec![ProcessingLimit::MaxParts]);
+    }
+
+    #[test]
+    fn filename_only_text_attachment_is_not_selected_as_body() {
+        let raw = concat!(
+            "Subject: Attachment only\r\n",
+            "Content-Type: multipart/mixed; boundary=outer\r\n\r\n",
+            "--outer\r\n",
+            "Content-Type: text/plain; name=\"notes.txt\"\r\n\r\n",
+            "attachment contents\r\n",
+            "--outer--\r\n"
+        );
+
+        let parsed = parse_message(
+            raw.as_bytes(),
+            100,
+            BodyMode::Text,
+            AttachmentMode::Metadata,
+            &test_limits(100),
+        )
+        .expect("filename-only attachment parses");
+
+        assert_eq!(parsed.subject.as_deref(), Some("Attachment only"));
+        assert!(parsed.body_text.is_none());
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].filename.as_deref(), Some("notes.txt"));
+        assert_eq!(parsed.attachments[0].content_type, "text/plain");
+        assert!(parsed.processing_limits.is_empty());
+    }
+
+    #[test]
+    fn malformed_text_part_does_not_abort_valid_siblings() {
+        let raw = concat!(
+            "Subject: Recover siblings\r\n",
+            "X-Preserved: yes\r\n",
+            "Content-Type: multipart/mixed; boundary=outer\r\n\r\n",
+            "--outer\r\n",
+            "Content-Type: text/plain\r\n",
+            "Content-Transfer-Encoding: base64\r\n\r\n",
+            "%%%invalid%%%\r\n",
+            "--outer\r\n",
+            "Content-Type: text/plain\r\n\r\n",
+            "valid sibling\r\n",
+            "--outer\r\n",
+            "Content-Type: application/octet-stream; name=\"data.bin\"\r\n",
+            "Content-Disposition: attachment; filename=\"data.bin\"\r\n\r\n",
+            "payload\r\n",
+            "--outer--\r\n"
+        );
+
+        let parsed = parse_message(
+            raw.as_bytes(),
+            100,
+            BodyMode::Text,
+            AttachmentMode::Metadata,
+            &test_limits(100),
+        )
+        .expect("a malformed text part is a local omission");
+
+        assert_eq!(parsed.subject.as_deref(), Some("Recover siblings"));
+        assert!(
+            parsed.headers_all.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("x-preserved") && value == "yes"
+            })
+        );
+        assert_eq!(parsed.body_text.as_deref(), Some("valid sibling"));
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].filename.as_deref(), Some("data.bin"));
+        assert!(parsed.processing_limits.is_empty());
     }
 }

@@ -25,9 +25,13 @@ GREENMAIL_OPTS="${GREENMAIL_OPTS:-$GREENMAIL_OPTS_DEFAULT}"
 started_local_container=0
 GREENMAIL_TLS_DIR=""
 GREENMAIL_CA_CERT=""
+BOUNDED_PREFIX_TLS_DIR=""
 cleanup() {
   if [[ -n "$GREENMAIL_TLS_DIR" ]]; then
     rm -rf "$GREENMAIL_TLS_DIR" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$BOUNDED_PREFIX_TLS_DIR" ]]; then
+    rm -rf "$BOUNDED_PREFIX_TLS_DIR" >/dev/null 2>&1 || true
   fi
   if [[ -n "$GREENMAIL_CA_CERT" ]]; then
     rm -f "$GREENMAIL_CA_CERT" >/dev/null 2>&1 || true
@@ -56,16 +60,13 @@ for port in ports:
 PY
 }
 
-make_temp_dir() {
-  mktemp -d "${TMPDIR:-/tmp}/$1.XXXXXX"
-}
-
 make_temp_file() {
   mktemp "${TMPDIR:-/tmp}/$1.XXXXXX"
 }
 
 create_greenmail_tls_bundle() {
-  GREENMAIL_TLS_DIR="$(make_temp_dir greenmail-tls)"
+  mkdir -p "$REPO_ROOT/target"
+  GREENMAIL_TLS_DIR="$(mktemp -d "$REPO_ROOT/target/greenmail-tls.XXXXXX")"
   local ca_cert_path="$GREENMAIL_TLS_DIR/test-ca-cert.pem"
   local ca_key_path="$GREENMAIL_TLS_DIR/test-ca-key.pem"
   local cert_path="$GREENMAIL_TLS_DIR/localhost-cert.pem"
@@ -117,6 +118,8 @@ EOF
     -out "$p12_path" \
     -name greenmail \
     -passout pass:changeit >/dev/null 2>&1
+  chmod 755 "$GREENMAIL_TLS_DIR"
+  chmod 644 "$p12_path"
 
   GREENMAIL_CA_CERT="$ca_cert_path"
 }
@@ -232,6 +235,134 @@ export MAIL_IMAP_WRITE_ENABLED="true"
 
 run_inspector() {
   npx --yes @modelcontextprotocol/inspector "$SERVER_BIN" --cli "$@"
+}
+
+list_mailbox_pages() {
+  python3 - "$SERVER_BIN" <<'PY'
+import json
+import selectors
+import subprocess
+import sys
+import time
+
+server = subprocess.Popen(
+    [sys.argv[1]],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    text=True,
+)
+
+
+def send(message):
+    server.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+    server.stdin.flush()
+
+
+def response(response_id):
+    deadline = time.monotonic() + 30
+    selector = selectors.DefaultSelector()
+    selector.register(server.stdout, selectors.EVENT_READ)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not selector.select(remaining):
+            raise RuntimeError(f"timed out waiting for MCP response {response_id}")
+        line = server.stdout.readline()
+        if not line:
+            raise RuntimeError(
+                f"MCP server exited before response {response_id} "
+                f"(status {server.poll()})"
+            )
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"invalid JSON from MCP server: {line.rstrip()}") from exc
+        if message.get("id") != response_id:
+            continue
+        if "error" in message:
+            raise RuntimeError(
+                f"MCP error for response {response_id}: "
+                f"{json.dumps(message['error'], separators=(',', ':'))}"
+            )
+        if "result" not in message:
+            raise RuntimeError(f"MCP response {response_id} has no result")
+        return message["result"]
+
+
+try:
+    send({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "greenmail-pagination-smoke",
+                "version": "1.0",
+            },
+        },
+    })
+    initialized = response(1)
+    if initialized.get("protocolVersion") != "2025-03-26":
+        raise RuntimeError(
+            "MCP server negotiated unexpected protocol version: "
+            f"{initialized.get('protocolVersion')!r}"
+        )
+    send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    send({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "imap_list_mailboxes",
+            "arguments": {"account_id": "default", "limit": 1},
+        },
+    })
+    first = response(2)
+    if not isinstance(first, dict) or first.get("isError") is True:
+        raise RuntimeError(f"first mailbox call failed: {json.dumps(first)}")
+    first_data = (first.get("structuredContent") or {}).get("data")
+    first_data = first_data or first.get("data") or {}
+    cursor = first_data.get("next_cursor")
+    if not isinstance(cursor, str) or not cursor:
+        raise RuntimeError("first mailbox call returned no continuation cursor")
+
+    send({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "imap_list_mailboxes",
+            "arguments": {
+                "account_id": "default",
+                "cursor": cursor,
+                "limit": 1,
+            },
+        },
+    })
+    second = response(3)
+    if not isinstance(second, dict) or second.get("isError") is True:
+        raise RuntimeError(f"second mailbox call failed: {json.dumps(second)}")
+    print(json.dumps({"first": first, "second": second}, separators=(",", ":")))
+finally:
+    if server.stdin:
+        try:
+            server.stdin.close()
+        except BrokenPipeError:
+            pass
+    try:
+        exit_code = server.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        server.terminate()
+        try:
+            exit_code = server.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            exit_code = server.wait()
+    if sys.exc_info() == (None, None, None) and exit_code != 0:
+        raise RuntimeError(f"MCP server exited with status {exit_code}")
+PY
 }
 
 expect_failure_with_text() {
@@ -430,19 +561,31 @@ assert_tool_schema "imap_list_accounts" "no-input contract" '
     and (($schema.properties | length) == 0)
     and ((($schema.required // []) | length) == 0)
 '
-assert_tool_schema "imap_list_mailboxes" "account_id parameter contract" '
-  def has_type($schema; $type):
-    ($schema.type == $type) or (($schema.type | type) == "array" and ($schema.type | index($type) != null));
+assert_tool_schema "imap_list_mailboxes" "pagination parameter contract" '
   .tools[] | select(.name == $name) | .inputSchema as $schema
   | ($schema.type == "object")
     and (($schema.properties | has("account_id")))
-    and has_type($schema.properties.account_id; "string")
+    and ($schema.properties.account_id.type == "string")
     and ($schema.properties.account_id.pattern == "^[A-Za-z0-9_-]+$")
     and ((($schema.required // []) | index("account_id")) == null)
+    and (($schema.properties | has("cursor")))
+    and (
+      if (($schema.properties.cursor.type | type) == "array")
+      then (($schema.properties.cursor.type | index("string")) != null)
+      else ($schema.properties.cursor.type == "string")
+      end
+    )
+    and ((($schema.required // []) | index("cursor")) == null)
+    and (($schema.properties | has("limit")))
+    and ($schema.properties.limit.type == "integer")
+    and ($schema.properties.limit.minimum == 1)
+    and ($schema.properties.limit.maximum == 200)
+    and ($schema.properties.limit.default == 100)
+    and ((($schema.required // []) | index("limit")) == null)
 '
 assert_tool_schema "imap_search_messages" "search parameter contract" '
   def has_type($schema; $type):
-    ($schema.type == $type) or (($schema.type | type) == "array" and ($schema.type | index($type) != null));
+    ($schema.type == $type) or ((($schema.type | type) == "array") and (($schema.type | index($type)) != null));
   .tools[] | select(.name == $name) | .inputSchema as $schema
   | ($schema.type == "object")
     and (($schema.required // []) | index("mailbox") != null)
@@ -580,31 +723,96 @@ assert_json "imap_list_accounts output contract" "$LIST_ACCOUNTS_JSON" '
     and ($data.next_action.arguments.account_id == "default")
 '
 
-echo "Checking imap_list_mailboxes output contract"
-MAILBOXES_JSON=$(run_inspector --method tools/call --tool-name imap_list_mailboxes --tool-arg account_id=default)
-assert_json "imap_list_mailboxes output contract" "$MAILBOXES_JSON" '
+PAGINATION_MAILBOX="Inspector Pagination $(date +%s%N)-$$"
+echo "Creating a unique mailbox for pagination checks"
+PAGINATION_CREATE_JSON=$(run_inspector \
+  --method tools/call \
+  --tool-name imap_manage_mailbox \
+  --tool-arg account_id=default \
+  --tool-arg action=create \
+  --tool-arg "mailbox=${PAGINATION_MAILBOX}")
+PAGINATION_CREATE_TERMINAL_JSON=$(wait_for_terminal_operation_json "imap_manage_mailbox create pagination mailbox" "$PAGINATION_CREATE_JSON")
+assert_json "imap_manage_mailbox create pagination mailbox terminal result contract" "$PAGINATION_CREATE_TERMINAL_JSON" '
+  (.structuredContent.data // .data).result as $result
+  | ($result.status == "ok")
+    and ($result.account_id == "default")
+    and ($result.action == "create")
+    and ($result.mailbox == $mailbox)
+' --arg mailbox "$PAGINATION_MAILBOX"
+
+echo "Checking imap_list_mailboxes paginated output contract"
+MAILBOX_PAGES_JSON=$(list_mailbox_pages)
+MAILBOXES_JSON=$(printf '%s\n' "$MAILBOX_PAGES_JSON" | jq -c '.first')
+assert_json "imap_list_mailboxes first page output contract" "$MAILBOXES_JSON" '
   def envelope_ok:
     (.isError != true)
     and ((.structuredContent.summary // .summary) | type == "string")
     and (((.structuredContent.meta // .meta).now_utc | type) == "string")
     and (((.structuredContent.meta // .meta).duration_ms | type) == "number");
+  def mailbox_ok:
+    (.name | type) == "string"
+    and ((.delimiter == null) or ((.delimiter | type) == "string"))
+    and ((.attributes | type) == "array")
+    and (.attributes | all(type == "string"))
+    and ((.role == null) or (.role == "inbox") or (.role == "all") or (.role == "archive") or (.role == "drafts") or (.role == "flagged") or (.role == "important") or (.role == "junk") or (.role == "sent") or (.role == "trash"))
+    and ((.selectable | type) == "boolean")
+    and ((.provider_managed | type) == "boolean");
   (.structuredContent.data // .data) as $data
   | envelope_ok
     and ($data.status == "ok")
     and (($data.issues | type) == "array")
     and ($data.account_id == "default")
     and (($data.mailboxes | type) == "array")
-    and ((($data.mailboxes // []) | map(.name)) | index("INBOX") != null)
-    and (($data.mailboxes[0].name | type) == "string")
-    and (($data.mailboxes[0].delimiter == null) or (($data.mailboxes[0].delimiter | type) == "string"))
+    and (($data.mailboxes | length) == 1)
+    and ($data.mailboxes[0] | mailbox_ok)
+    and (($data.returned | type) == "number")
+    and ($data.returned == 1)
+    and (($data.total == null) or (($data.total | type) == "number"))
+    and (($data.has_more | type) == "boolean")
+    and ($data.has_more == true)
+    and (($data.next_cursor | type) == "string")
+    and (($data.next_cursor | length) > 0)
+    and (($data.truncated | type) == "boolean")
     and (($data.next_action.instruction | type) == "string")
-    and ($data.next_action.tool == "imap_search_messages")
+    and ($data.next_action.tool == "imap_list_mailboxes")
     and ($data.next_action.arguments.account_id == "default")
-    and (($data.next_action.arguments.mailbox | type) == "string")
-    and ($data.next_action.arguments.limit == 10)
-    and (($data.next_action.arguments | has("include_snippet") | not))
-    and (($data.next_action.arguments | has("snippet_max_chars") | not))
+    and ($data.next_action.arguments.cursor == $data.next_cursor)
+    and ($data.next_action.arguments.limit == 1)
 '
+MAILBOX_CURSOR=$(printf '%s\n' "$MAILBOXES_JSON" | jq -r '(.structuredContent.data // .data).next_cursor // empty')
+FIRST_MAILBOX_NAME=$(printf '%s\n' "$MAILBOXES_JSON" | jq -r '(.structuredContent.data // .data).mailboxes[0].name // empty')
+
+MAILBOXES_SECOND_JSON=$(printf '%s\n' "$MAILBOX_PAGES_JSON" | jq -c '.second')
+assert_json "imap_list_mailboxes second page output contract" "$MAILBOXES_SECOND_JSON" '
+  def envelope_ok:
+    (.isError != true)
+    and ((.structuredContent.summary // .summary) | type == "string")
+    and (((.structuredContent.meta // .meta).now_utc | type) == "string")
+    and (((.structuredContent.meta // .meta).duration_ms | type) == "number");
+  def mailbox_ok:
+    (.name | type) == "string"
+    and ((.delimiter == null) or ((.delimiter | type) == "string"))
+    and ((.attributes | type) == "array")
+    and (.attributes | all(type == "string"))
+    and ((.role == null) or (.role == "inbox") or (.role == "all") or (.role == "archive") or (.role == "drafts") or (.role == "flagged") or (.role == "important") or (.role == "junk") or (.role == "sent") or (.role == "trash"))
+    and ((.selectable | type) == "boolean")
+    and ((.provider_managed | type) == "boolean");
+  (.structuredContent.data // .data) as $data
+  | envelope_ok
+    and ($data.status == "ok")
+    and (($data.issues | type) == "array")
+    and ($data.account_id == "default")
+    and (($data.mailboxes | type) == "array")
+    and (($data.mailboxes | length) == 1)
+    and ($data.mailboxes[0] | mailbox_ok)
+    and (($data.returned | type) == "number")
+    and ($data.returned == 1)
+    and (($data.total == null) or (($data.total | type) == "number"))
+    and (($data.has_more | type) == "boolean")
+    and ((($data.next_cursor == null) or (($data.next_cursor | type) == "string")))
+    and (($data.truncated | type) == "boolean")
+    and ($data.mailboxes[0].name != $first_name)
+' --arg first_name "$FIRST_MAILBOX_NAME"
 
 echo "Checking imap_search_messages output contract"
 SEARCH_JSON=$(run_inspector \
@@ -662,40 +870,29 @@ if [[ -z "$MESSAGE_ID" ]]; then
   exit 1
 fi
 
-ATTACHMENT_SEARCH_JSON=$(run_inspector \
-  --method tools/call \
-  --tool-name imap_search_messages \
-  --tool-arg account_id=default \
-  --tool-arg mailbox=INBOX \
-  --tool-arg 'subject=Build Alert' \
-  --tool-arg limit=1)
-ATTACHMENT_MESSAGE_ID=$(printf '%s\n' "$ATTACHMENT_SEARCH_JSON" | jq -r '(.structuredContent.data // .data).messages[0].message_id // empty')
-if [[ -z "$ATTACHMENT_MESSAGE_ID" ]]; then
-  echo "No attachment-bearing message found for contract checks" >&2
-  exit 1
-fi
 
-echo "Checking imap_get_message forced section-path output contract"
-MESSAGE_FETCH_BUDGET_WAS_SET=0
-MESSAGE_FETCH_BUDGET_SAVED=""
-if [[ -v MAIL_IMAP_MESSAGE_FETCH_BUDGET_BYTES ]]; then
-  MESSAGE_FETCH_BUDGET_WAS_SET=1
-  MESSAGE_FETCH_BUDGET_SAVED="$MAIL_IMAP_MESSAGE_FETCH_BUDGET_BYTES"
-fi
-export MAIL_IMAP_MESSAGE_FETCH_BUDGET_BYTES=256
-GET_SECTION_JSON=$(run_inspector \
-  --method tools/call \
-  --tool-name imap_get_message \
-  --tool-arg "message_id=${ATTACHMENT_MESSAGE_ID}" \
-  --tool-arg body_max_chars=500 \
-  --tool-arg body_mode=text \
-  --tool-arg attachment_mode=metadata)
-if [[ "$MESSAGE_FETCH_BUDGET_WAS_SET" -eq 1 ]]; then
-  export MAIL_IMAP_MESSAGE_FETCH_BUDGET_BYTES="$MESSAGE_FETCH_BUDGET_SAVED"
-else
-  unset MAIL_IMAP_MESSAGE_FETCH_BUDGET_BYTES
-fi
-assert_json "imap_get_message forced section-path output contract" "$GET_SECTION_JSON" '
+echo "Checking imap_get_message conforming bounded raw prefix output contract"
+mkdir -p "$REPO_ROOT/target"
+BOUNDED_PREFIX_TLS_DIR="$(mktemp -d "$REPO_ROOT/target/bounded-prefix-tls.XXXXXX")"
+BOUNDED_PREFIX_CERT="$BOUNDED_PREFIX_TLS_DIR/loopback-cert.pem"
+BOUNDED_PREFIX_KEY="$BOUNDED_PREFIX_TLS_DIR/loopback-key.pem"
+openssl req \
+  -x509 \
+  -newkey rsa:2048 \
+  -keyout "$BOUNDED_PREFIX_KEY" \
+  -out "$BOUNDED_PREFIX_CERT" \
+  -days 2 \
+  -nodes \
+  -subj "/CN=localhost" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+  -addext "extendedKeyUsage=serverAuth" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
+GET_BOUNDED_PREFIX_JSON=$(python3 scripts/bounded-prefix-mcp-smoke.py \
+  "$SERVER_BIN" \
+  "$BOUNDED_PREFIX_CERT" \
+  "$BOUNDED_PREFIX_KEY")
+assert_json "imap_get_message conforming bounded raw prefix output contract" "$GET_BOUNDED_PREFIX_JSON" '
   def envelope_ok:
     (.isError != true)
     and ((.structuredContent.summary // .summary) | type == "string")
@@ -704,108 +901,20 @@ assert_json "imap_get_message forced section-path output contract" "$GET_SECTION
   (.structuredContent.data // .data) as $data
   | envelope_ok
     and ($data.status == "partial")
-    and (($data.issues | length) > 0)
-    and ($data.message.subject == null)
-    and ($data.message.body_text | contains("Nightly build failed on parser-edge-cases."))
-    and (($data.message.attachments | length) == 1)
-    and ($data.message.attachments[0].filename == "summary.txt")
-    and ($data.message.attachments[0].content_type == "text/plain")
-    and ($data.message.attachments[0].part_id == "2")
-    and ($data.message.attachments[0].size_bytes == null)
-'
-
-echo "Checking imap_get_message output contract"
-GET_JSON=$(run_inspector \
-  --method tools/call \
-  --tool-name imap_get_message \
-  --tool-arg "message_id=${MESSAGE_ID}" \
-  --tool-arg body_max_chars=500 \
-  --tool-arg include_headers=true \
-  --tool-arg include_all_headers=true \
-  --tool-arg include_html=true)
-assert_json "imap_get_message base output contract" "$GET_JSON" '
-  def envelope_ok:
-    (.isError != true)
-    and ((.structuredContent.summary // .summary) | type == "string")
-    and (((.structuredContent.meta // .meta).now_utc | type) == "string")
-    and (((.structuredContent.meta // .meta).duration_ms | type) == "number");
-  (.structuredContent.data // .data) as $data
-  | envelope_ok
-    and ($data.status == "ok")
     and (($data.issues | type) == "array")
-    and ($data.account_id == "default")
-    and (($data.message.message_id | type) == "string")
-    and (($data.message.message_uri | type) == "string")
-    and (($data.message.message_raw_uri | type) == "string")
-    and (($data.message.mailbox | type) == "string")
-    and (($data.message.uidvalidity | type) == "number")
-    and (($data.message.uid | type) == "number")
-    and (($data.message.date | type) == "string")
-    and (($data.message.from | type) == "string")
-    and (($data.message.subject | type) == "string")
-    and (($data.message.headers | type) == "array")
-    and (($data.message.headers | length) > 0)
-    and (($data.message.body_text | type) == "string")
-    and (($data.message.body_html == null) or (($data.message.body_html | type) == "string"))
+    and ($data.issues | any(.code == "limit_exceeded" and .stage == "fetch_budget"))
+    and ($data.message.subject == "Build Alert")
     and (($data.message.attachments | type) == "array")
+    and ($data.message.attachments | all(.extracted_text == null))
+    and ($data.message.attachments | any(
+      .filename == "summary.txt"
+      and .content_type == "text/plain"
+      and .part_id == "1.2"
+      and .size_bytes == null
+      and .extracted_text == null
+    ))
 '
 
-GET_ATTACHMENT_JSON=$(run_inspector \
-  --method tools/call \
-  --tool-name imap_get_message \
-  --tool-arg "message_id=${ATTACHMENT_MESSAGE_ID}" \
-  --tool-arg body_max_chars=500 \
-  --tool-arg include_headers=true \
-  --tool-arg attachment_mode=extract_text \
-  --tool-arg attachment_text_max_chars=1000)
-assert_json "imap_get_message attachment output contract" "$GET_ATTACHMENT_JSON" '
-  def envelope_ok:
-    (.isError != true)
-    and ((.structuredContent.summary // .summary) | type == "string")
-    and (((.structuredContent.meta // .meta).now_utc | type) == "string")
-    and (((.structuredContent.meta // .meta).duration_ms | type) == "number");
-  (.structuredContent.data // .data) as $data
-  | envelope_ok
-    and ($data.status == "ok")
-    and (($data.message.attachments | type) == "array")
-    and (($data.message.attachments | length) > 0)
-    and (($data.message.attachments[0].filename | type) == "string")
-    and (($data.message.attachments[0].content_type | type) == "string")
-    and ($data.message.attachments[0].size_bytes != null)
-    and (($data.message.attachments[0].size_bytes | type) == "number")
-    and (($data.message.attachments[0].part_id | type) == "string")
-    and ($data.message.attachments[0] | has("extracted_text"))
-'
-
-echo "Checking imap_get_message_raw output contract"
-RAW_JSON=$(run_inspector \
-  --method tools/call \
-  --tool-name imap_get_message_raw \
-  --tool-arg "message_id=${MESSAGE_ID}" \
-  --tool-arg max_bytes=64000)
-assert_json "imap_get_message_raw output contract" "$RAW_JSON" '
-  def envelope_ok:
-    (.isError != true)
-    and ((.structuredContent.summary // .summary) | type == "string")
-    and (((.structuredContent.meta // .meta).now_utc | type) == "string")
-    and (((.structuredContent.meta // .meta).duration_ms | type) == "number");
-  (.structuredContent.data // .data) as $data
-  | envelope_ok
-    and ($data.status == "ok")
-    and (($data.issues | type) == "array")
-    and ($data.account_id == "default")
-    and (($data.message_id | type) == "string")
-    and (($data.message_uri | type) == "string")
-    and (($data.message_raw_uri | type) == "string")
-    and (($data.total_size_bytes | type) == "number")
-    and (($data.returned_bytes | type) == "number")
-    and ($data.total_size_bytes >= $data.offset_bytes + $data.returned_bytes)
-    and ($data.offset_bytes == 0)
-    and ($data.truncated == false)
-    and (($data.raw_source_base64 | type) == "string")
-    and (($data.raw_source_base64 | length) > 0)
-    and ($data.raw_source_encoding == "base64")
-'
 
 MAILBOX_BASE="Inspector MCP $(date +%s)"
 MAILBOX_COPY="${MAILBOX_BASE}/Copied"

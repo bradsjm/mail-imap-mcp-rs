@@ -102,6 +102,10 @@ impl ReadSessionLease {
             .expect("read session lease must contain a session")
     }
 
+    pub(super) fn discard(mut self) {
+        drop(self.session.take());
+    }
+
     pub(super) async fn finish(
         mut self,
         config: &crate::config::ServerConfig,

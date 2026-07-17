@@ -7,8 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_imap::imap_proto::types::{MessageSection, SectionPath};
-use async_imap::types::{Fetch, Flag};
+use async_imap::types::{Fetch, Flag, Name};
 use async_imap::{Client, Session};
 use futures::{StreamExt, TryStreamExt};
 use rustls::ClientConfig;
@@ -23,23 +22,30 @@ use crate::config::{AccountConfig, ServerConfig};
 use crate::errors::{AppError, AppResult};
 use crate::mailbox_codec::encode_mailbox_name_for_command;
 use crate::mailbox_codec::normalize_mailbox_name;
-use crate::mime::{self, MessageFetchPlan};
+
 use crate::models::MailboxInfo;
 use crate::server::provider;
 
 /// Maximum LIST observations: 2,000 retained mailboxes plus one truncation sentinel.
 pub const MAILBOX_LIST_OBSERVATION_LIMIT: usize = 2_001;
+const MAX_MAILBOXES_RETAINED: usize = MAILBOX_LIST_OBSERVATION_LIMIT - 1;
+
+#[derive(Debug)]
+pub struct MailboxListObservation {
+    pub items: Vec<Name>,
+    pub truncated: bool,
+}
+
+fn bounded_mailbox_observation<T>(mut items: Vec<T>) -> (Vec<T>, bool) {
+    let truncated = items.len() >= MAILBOX_LIST_OBSERVATION_LIMIT;
+    items.truncate(MAX_MAILBOXES_RETAINED);
+    (items, truncated)
+}
 
 #[derive(Debug, Clone)]
 pub struct HeaderAndFlags {
     pub header_bytes: Vec<u8>,
     pub flags: Vec<String>,
-}
-
-#[derive(Debug)]
-pub struct MessageStructure {
-    pub size: Option<u32>,
-    pub fetch_plan: Option<MessageFetchPlan>,
 }
 
 /// Type alias for authenticated IMAP session over TLS
@@ -188,13 +194,13 @@ pub async fn capabilities(
 pub async fn list_all_mailboxes(
     server: &ServerConfig,
     session: &mut ImapSession,
-) -> AppResult<Vec<async_imap::types::Name>> {
+) -> AppResult<MailboxListObservation> {
     let stream = timeout(socket_timeout(server), session.list(None, Some("*")))
         .await
         .map_err(|_| AppError::Timeout("LIST timed out".to_owned()))
         .and_then(|r| r.map_err(|e| AppError::Internal(format!("LIST failed: {e}"))))?;
 
-    timeout(
+    let observations = timeout(
         socket_timeout(server),
         stream
             .take(MAILBOX_LIST_OBSERVATION_LIMIT)
@@ -202,7 +208,9 @@ pub async fn list_all_mailboxes(
     )
     .await
     .map_err(|_| AppError::Timeout("LIST stream timed out".to_owned()))
-    .and_then(|r| r.map_err(|e| AppError::Internal(format!("LIST stream failed: {e}"))))
+    .and_then(|r| r.map_err(|e| AppError::Internal(format!("LIST stream failed: {e}"))))?;
+    let (items, truncated) = bounded_mailbox_observation(observations);
+    Ok(MailboxListObservation { items, truncated })
 }
 
 /// Look up metadata for one mailbox without relying on approximate name matching.
@@ -504,125 +512,6 @@ pub async fn fetch_one(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-///
-/// Returns raw bytes of the entire message.
-pub async fn fetch_raw_message(
-    server: &ServerConfig,
-    session: &mut ImapSession,
-    uid: u32,
-) -> AppResult<Vec<u8>> {
-    let fetch = fetch_one(server, session, uid, "BODY.PEEK[]").await?;
-    let body = fetch
-        .body()
-        .ok_or_else(|| AppError::Internal("message has no full message body".to_owned()))?;
-    Ok(body.to_vec())
-}
-
-/// Fetch message size and MIME structure without setting `\Seen`.
-pub async fn fetch_message_structure(
-    server: &ServerConfig,
-    session: &mut ImapSession,
-    uid: u32,
-) -> AppResult<MessageStructure> {
-    let fetch = fetch_one(server, session, uid, "(UID RFC822.SIZE BODYSTRUCTURE)").await?;
-
-    Ok(MessageStructure {
-        size: fetch.size,
-        fetch_plan: fetch.bodystructure().map(|body_structure| {
-            mime::plan_from_bodystructure(
-                body_structure,
-                server.mime_max_depth,
-                server.mime_max_parts,
-            )
-        }),
-    })
-}
-
-/// Fetch a message body section without setting `\Seen`.
-///
-/// Ranges are supported only for the raw-message section. Some servers return
-/// ranged named sections in a response form that `async-imap` cannot parse.
-pub async fn fetch_body_section(
-    server: &ServerConfig,
-    session: &mut ImapSession,
-    uid: u32,
-    section: &str,
-    offset: Option<usize>,
-    length: Option<usize>,
-) -> AppResult<Vec<u8>> {
-    let query = body_section_query(section, offset, length)?;
-    let fetch = fetch_one(server, session, uid, &query).await?;
-    section_bytes(&fetch, section)
-}
-
-fn body_section_query(
-    section: &str,
-    offset: Option<usize>,
-    length: Option<usize>,
-) -> AppResult<String> {
-    match (section.is_empty(), offset, length) {
-        (_, None, None) => Ok(format!("BODY.PEEK[{section}]")),
-        (true, offset, Some(length)) => {
-            let offset = offset.unwrap_or_default();
-            Ok(format!("BODY.PEEK[]<{offset}.{length}>"))
-        }
-        (false, _, Some(_)) => Err(AppError::InvalidInput(
-            "ranged named body sections are not supported".to_owned(),
-        )),
-        (_, Some(_), None) => Err(AppError::InvalidInput(
-            "a body section offset requires a length".to_owned(),
-        )),
-    }
-}
-
-fn section_bytes(fetch: &Fetch, section: &str) -> AppResult<Vec<u8>> {
-    let bytes = match section_path(section)? {
-        None => fetch.body(),
-        Some(path) => fetch.section(&path),
-    }
-    .ok_or_else(|| AppError::Internal(format!("message body section '{section}' not available")))?;
-    Ok(bytes.to_vec())
-}
-
-fn section_path(section: &str) -> AppResult<Option<SectionPath>> {
-    if section.is_empty() {
-        return Ok(None);
-    }
-
-    let upper = section.to_ascii_uppercase();
-    let (part, message_section) = match upper.rsplit_once('.') {
-        Some((part, "HEADER")) => (part, Some(MessageSection::Header)),
-        Some((part, "MIME")) => (part, Some(MessageSection::Mime)),
-        Some((part, "TEXT")) => (part, Some(MessageSection::Text)),
-        _ => match upper.as_str() {
-            "HEADER" => return Ok(Some(SectionPath::Full(MessageSection::Header))),
-            "TEXT" => return Ok(Some(SectionPath::Full(MessageSection::Text))),
-            _ => (upper.as_str(), None),
-        },
-    };
-
-    let parts = part
-        .split('.')
-        .map(|segment| {
-            segment
-                .parse::<u32>()
-                .ok()
-                .filter(|part| *part > 0)
-                .ok_or_else(|| {
-                    AppError::InvalidInput(format!("invalid IMAP body section '{section}'"))
-                })
-        })
-        .collect::<AppResult<Vec<_>>>()?;
-    if parts.is_empty() {
-        return Err(AppError::InvalidInput(format!(
-            "invalid IMAP body section '{section}'"
-        )));
-    }
-
-    Ok(Some(SectionPath::Part(parts, message_section)))
-}
-
 /// Fetch curated headers and flags
 ///
 /// Returns standard headers (Date, From, To, CC, Subject) and message flags.
@@ -785,17 +674,36 @@ pub async fn fetch_raw_message_range(
     offset: usize,
     max_bytes: usize,
 ) -> AppResult<Vec<u8>> {
-    let size = fetch_message_size(server, session, uid).await?;
-    if offset == 0 && size <= max_bytes {
-        return fetch_raw_message(server, session, uid).await;
-    }
-
-    let query = format!("BODY.PEEK[]<{offset}.{max_bytes}>");
+    let requested = raw_body_range_length(max_bytes)?;
+    let query = raw_body_range_query(offset, requested);
     let fetch = fetch_one(server, session, uid, &query).await?;
     let body = fetch
         .body()
         .ok_or_else(|| AppError::Internal("message has no raw message body".to_owned()))?;
+    validate_raw_body_range_length(body.len(), requested)?;
     Ok(body.to_vec())
+}
+
+fn raw_body_range_length(max_bytes: usize) -> AppResult<usize> {
+    if max_bytes == 0 {
+        return Err(AppError::InvalidInput(
+            "body range length must be at least 1".to_owned(),
+        ));
+    }
+    Ok(max_bytes.min(u32::MAX as usize))
+}
+
+fn raw_body_range_query(offset: usize, requested: usize) -> String {
+    format!("BODY.PEEK[]<{offset}.{requested}>")
+}
+
+fn validate_raw_body_range_length(actual: usize, requested: usize) -> AppResult<()> {
+    if actual > requested {
+        return Err(AppError::Internal(
+            "IMAP server returned more than the requested body range".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Store flags on a message
@@ -963,10 +871,10 @@ mod tests {
     use crate::mailbox_codec::encode_mailbox_name_for_command;
 
     use super::{
-        MessageSection, SectionPath, append, body_section_query, build_mailbox_parent_paths,
-        fetch_body_section, fetch_flags, fetch_raw_message, list_all_mailboxes, rename_mailbox,
-        section_path, select_mailbox_readonly, select_mailbox_readwrite, socket_timeout, uid_copy,
-        uid_expunge, uid_move, uid_search, uid_store,
+        append, bounded_mailbox_observation, build_mailbox_parent_paths, fetch_flags,
+        list_all_mailboxes, raw_body_range_length, raw_body_range_query, rename_mailbox,
+        select_mailbox_readonly, select_mailbox_readwrite, socket_timeout, uid_copy, uid_expunge,
+        uid_move, uid_search, uid_store, validate_raw_body_range_length,
     };
     use crate::config::{AccountConfig, ServerConfig};
 
@@ -1016,58 +924,36 @@ mod tests {
     }
 
     #[test]
-    fn body_section_query_builds_supported_peek_forms() {
+    fn raw_body_range_query_is_always_bounded() {
+        assert_eq!(raw_body_range_query(0, 1), "BODY.PEEK[]<0.1>");
+        assert_eq!(raw_body_range_query(4, 12), "BODY.PEEK[]<4.12>");
         assert_eq!(
-            body_section_query("", None, None).expect("raw query should be valid"),
-            "BODY.PEEK[]"
-        );
-        assert_eq!(
-            body_section_query("2", None, None).expect("part query should be valid"),
-            "BODY.PEEK[2]"
-        );
-        assert_eq!(
-            body_section_query("", Some(4), Some(12)).expect("ranged raw query should be valid"),
-            "BODY.PEEK[]<4.12>"
-        );
-        assert!(body_section_query("2.MIME", Some(4), Some(12)).is_err());
-        assert!(body_section_query("2", Some(4), None).is_err());
-    }
-
-    #[test]
-    fn section_path_converts_supported_sections() {
-        assert!(matches!(
-            section_path("HEADER").expect("HEADER should be valid"),
-            Some(SectionPath::Full(MessageSection::Header))
-        ));
-        assert!(matches!(
-            section_path("2").expect("numeric part should be valid"),
-            Some(SectionPath::Part(parts, None)) if parts == vec![2]
-        ));
-        assert!(matches!(
-            section_path("1.2.TEXT").expect("nested TEXT should be valid"),
-            Some(SectionPath::Part(parts, Some(MessageSection::Text)))
-                if parts == vec![1, 2]
-        ));
-        assert!(matches!(
-            section_path("1.2.MIME").expect("nested MIME should be valid"),
-            Some(SectionPath::Part(parts, Some(MessageSection::Mime)))
-                if parts == vec![1, 2]
-        ));
-        assert!(
-            section_path("")
-                .expect("raw path should be valid")
-                .is_none()
+            raw_body_range_query(usize::MAX, u32::MAX as usize),
+            format!("BODY.PEEK[]<{}.{}>", usize::MAX, u32::MAX)
         );
     }
 
     #[test]
-    fn section_path_rejects_malformed_numeric_paths() {
-        for malformed in ["one", "1..2", ".1", "1.", "0", "1.0.TEXT"] {
-            assert!(
-                section_path(malformed).is_err(),
-                "{malformed:?} should be rejected"
-            );
-        }
+    fn raw_body_range_rejects_zero_length() {
+        assert!(matches!(
+            raw_body_range_length(0),
+            Err(crate::errors::AppError::InvalidInput(message))
+                if message == "body range length must be at least 1"
+        ));
+        assert_eq!(
+            raw_body_range_length(usize::MAX).expect("positive range should be valid"),
+            u32::MAX as usize
+        );
+    }
+
+    #[test]
+    fn raw_body_range_rejects_overlong_literal() {
+        assert!(validate_raw_body_range_length(12, 12).is_ok());
+        assert!(matches!(
+            validate_raw_body_range_length(13, 12),
+            Err(crate::errors::AppError::Internal(message))
+                if message == "IMAP server returned more than the requested body range"
+        ));
     }
 
     /// Constructs a ServerConfig for GreenMail integration tests.
@@ -1280,6 +1166,17 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn mailbox_observation_retains_limit_and_marks_sentinel() {
+        let observations: Vec<usize> = (0..2_001).collect();
+
+        let (items, truncated) = bounded_mailbox_observation(observations);
+
+        assert_eq!(items.len(), 2_000);
+        assert_eq!(items.first(), Some(&0));
+        assert_eq!(items.last(), Some(&1_999));
+        assert!(truncated);
+    }
 
     /// Connects to a GreenMail IMAP server and verifies basic read operations.
     ///
@@ -1303,6 +1200,7 @@ mod tests {
             .await
             .expect("LIST should succeed");
         let mailbox_names: Vec<String> = mailboxes
+            .items
             .into_iter()
             .map(|mailbox| mailbox.name().to_owned())
             .collect();
@@ -1369,99 +1267,6 @@ mod tests {
             "expected at least two seeded archive messages, got {}",
             archive_uids.len()
         );
-
-        select_mailbox_readonly(&config, &mut session, "INBOX")
-            .await
-            .expect("INBOX should be re-selectable");
-
-        let raw = fetch_raw_message(&config, &mut session, roadmap_uids[0])
-            .await
-            .expect("fetching seeded roadmap message should succeed");
-        let raw_text = String::from_utf8_lossy(&raw);
-        assert!(
-            raw_text.contains("Subject: Roadmap Review"),
-            "fetched seeded message should contain expected subject"
-        );
-
-        let unseen_after_fetch = uid_search(&config, &mut session, "UNSEEN")
-            .await
-            .expect("UID SEARCH UNSEEN should succeed after raw fetch");
-        assert!(
-            unseen_after_fetch.contains(&roadmap_uids[0]),
-            "raw message fetch should not mark the message as seen"
-        );
-    }
-
-    /// Verifies interoperable BODY.PEEK section syntax and extraction against GreenMail.
-    #[tokio::test]
-    #[ignore = "requires running GreenMail IMAP server"]
-    async fn greenmail_imap_body_sections_test() {
-        let endpoints = greenmail_endpoints();
-        let config = greenmail_test_config(&endpoints);
-        wait_until_login_works(&config, &endpoints)
-            .await
-            .expect("greenmail did not become ready");
-
-        let mut session = connect_authenticated_greenmail(&config)
-            .await
-            .expect("imap login should work");
-        select_mailbox_readonly(&config, &mut session, "INBOX")
-            .await
-            .expect("INBOX should be selectable");
-        let build_alert_uids = uid_search(&config, &mut session, "SUBJECT \"Build Alert\"")
-            .await
-            .expect("UID SEARCH should find the seeded Build Alert");
-        assert_eq!(
-            build_alert_uids.len(),
-            1,
-            "expected exactly one seeded Build Alert"
-        );
-        let uid = build_alert_uids[0];
-        let unseen_before = uid_search(&config, &mut session, "UNSEEN")
-            .await
-            .expect("UID SEARCH UNSEEN should succeed before section fetches");
-        assert!(
-            unseen_before.contains(&uid),
-            "seeded Build Alert should initially be unseen"
-        );
-
-        let header = fetch_body_section(&config, &mut session, uid, "HEADER", None, None)
-            .await
-            .expect("HEADER section should be fetchable");
-        assert!(
-            String::from_utf8_lossy(&header).contains("Subject: Build Alert: nightly regression")
-        );
-
-        let part_one = fetch_body_section(&config, &mut session, uid, "1", None, None)
-            .await
-            .expect("part 1 should be fetchable");
-        assert!(
-            String::from_utf8_lossy(&part_one)
-                .contains("Nightly build failed on parser-edge-cases.")
-        );
-
-        let part_two = fetch_body_section(&config, &mut session, uid, "2", None, None)
-            .await
-            .expect("part 2 should be fetchable");
-        assert!(String::from_utf8_lossy(&part_two).contains("failing test: parse_invalid_uid"));
-
-        let part_two_mime = fetch_body_section(&config, &mut session, uid, "2.MIME", None, None)
-            .await
-            .expect("part 2 MIME headers should be fetchable");
-        assert!(String::from_utf8_lossy(&part_two_mime).contains("filename=\"summary.txt\""));
-
-        let complete_part = fetch_body_section(&config, &mut session, uid, "2", None, None)
-            .await
-            .expect("complete bounded part 2 should be fetchable");
-        assert!(String::from_utf8_lossy(&complete_part).starts_with("failing test"));
-
-        let unseen_after = uid_search(&config, &mut session, "UNSEEN")
-            .await
-            .expect("UID SEARCH UNSEEN should succeed after section fetches");
-        assert!(
-            unseen_after.contains(&uid),
-            "BODY.PEEK section fetches must not mark the message seen"
-        );
     }
 
     /// Exercises IMAP write-path operations against GreenMail.
@@ -1497,6 +1302,7 @@ mod tests {
             .expect("LIST before nested rename should succeed");
         assert!(
             before_rename
+                .items
                 .iter()
                 .all(|mailbox| mailbox.name() != rename_parent
                     && mailbox.name() != rename_destination),
@@ -1610,15 +1416,6 @@ mod tests {
             after_delete.len(),
             1,
             "expected one message remaining after delete"
-        );
-
-        let raw = fetch_raw_message(&config, &mut session, after_delete[0])
-            .await
-            .expect("remaining message should be fetchable");
-        let raw_text = String::from_utf8_lossy(&raw);
-        assert!(
-            raw_text.contains(&subject),
-            "remaining message should contain test subject"
         );
     }
 }

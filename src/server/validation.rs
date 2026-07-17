@@ -254,10 +254,6 @@ pub(super) fn validate_search_input(input: &SearchMessagesInput) -> AppResult<()
     validate_mailbox(&input.mailbox)?;
     validate_chars(input.limit, 1, 100, "limit")?;
 
-    if input.cursor.is_some() {
-        return Ok(());
-    }
-
     if let Some(last_days) = input.last_days
         && !(1..=365).contains(&last_days)
     {
@@ -276,20 +272,25 @@ pub(super) fn validate_search_input(input: &SearchMessagesInput) -> AppResult<()
         validate_search_text(text)?;
     }
 
+    let start_date = input.start_date.as_deref().map(parse_ymd).transpose()?;
+    let end_date = input.end_date.as_deref().map(parse_ymd).transpose()?;
+
+    if input.cursor.is_some() {
+        return Ok(());
+    }
+
     if input.last_days.is_some() && (input.start_date.is_some() || input.end_date.is_some()) {
         return Err(AppError::InvalidInput(
             "last_days cannot be combined with start_date/end_date".to_owned(),
         ));
     }
 
-    if let (Some(start), Some(end)) = (&input.start_date, &input.end_date) {
-        let start_date = parse_ymd(start)?;
-        let end_date = parse_ymd(end)?;
-        if start_date > end_date {
-            return Err(AppError::InvalidInput(
-                "start_date must be <= end_date".to_owned(),
-            ));
-        }
+    if let (Some(start_date), Some(end_date)) = (start_date, end_date)
+        && start_date > end_date
+    {
+        return Err(AppError::InvalidInput(
+            "start_date must be <= end_date".to_owned(),
+        ));
     }
 
     Ok(())
@@ -554,25 +555,105 @@ mod tests {
         );
     }
 
-    #[test]
-    fn validate_search_input_allows_replayed_criteria_when_cursor_present() {
-        let input = SearchMessagesInput {
+    fn cursor_search_input() -> SearchMessagesInput {
+        SearchMessagesInput {
             account_id: "default".to_owned(),
             mailbox: "Donations".to_owned(),
             cursor: Some("cursor-id".to_owned()),
-            query: Some(".*".to_owned()),
-            from: Some(".*".to_owned()),
-            to: Some(".*".to_owned()),
-            subject: Some(".*".to_owned()),
-            unread_only: Some(false),
-            last_days: Some(365),
-            start_date: Some("2025-01-01".to_owned()),
-            end_date: Some("2025-12-31".to_owned()),
+            query: None,
+            from: None,
+            to: None,
+            subject: None,
+            unread_only: None,
+            last_days: None,
+            start_date: None,
+            end_date: None,
             limit: 100,
-            snippet_max_chars: Some(200),
+            snippet_max_chars: None,
+        }
+    }
+
+    #[test]
+    fn validate_search_input_allows_conflicting_and_reversed_replay_dates() {
+        let input = SearchMessagesInput {
+            last_days: Some(365),
+            start_date: Some("2025-12-31".to_owned()),
+            end_date: Some("2025-01-01".to_owned()),
+            ..cursor_search_input()
         };
 
-        validate_search_input(&input).expect("cursor mode should ignore replayed criteria");
+        validate_search_input(&input)
+            .expect("cursor mode should ignore relationships between valid replay criteria");
+    }
+
+    #[test]
+    fn validate_search_input_rejects_invalid_replay_text_fields() {
+        for field in ["query", "from", "to", "subject"] {
+            for value in ["x".repeat(257), "hello\nworld".to_owned()] {
+                let expected = if value.len() > 256 {
+                    "search text fields must be 1..256 chars"
+                } else {
+                    "search text must not contain control characters"
+                };
+                let mut input = cursor_search_input();
+                match field {
+                    "query" => input.query = Some(value),
+                    "from" => input.from = Some(value),
+                    "to" => input.to = Some(value),
+                    "subject" => input.subject = Some(value),
+                    _ => unreachable!(),
+                }
+
+                let err = validate_search_input(&input)
+                    .expect_err("invalid replay text must be rejected");
+                assert!(err.to_string().contains(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn validate_search_input_rejects_invalid_replay_bounds() {
+        for last_days in [0, 366] {
+            let input = SearchMessagesInput {
+                last_days: Some(last_days),
+                ..cursor_search_input()
+            };
+            let err = validate_search_input(&input).expect_err("last_days must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("last_days must be in range 1..365")
+            );
+        }
+
+        for snippet_max_chars in [49, 501] {
+            let input = SearchMessagesInput {
+                snippet_max_chars: Some(snippet_max_chars),
+                ..cursor_search_input()
+            };
+            let err =
+                validate_search_input(&input).expect_err("snippet_max_chars must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("snippet_max_chars must be in range 50..500")
+            );
+        }
+    }
+
+    #[test]
+    fn validate_search_input_rejects_individually_invalid_replay_dates() {
+        for (start_date, end_date) in [
+            (Some("not-a-date".to_owned()), None),
+            (None, Some("2025-02-30".to_owned())),
+        ] {
+            let input = SearchMessagesInput {
+                start_date,
+                end_date,
+                ..cursor_search_input()
+            };
+            let err =
+                validate_search_input(&input).expect_err("invalid replay date must be rejected");
+            assert!(err.to_string().contains("expected YYYY-MM-DD"));
+        }
     }
 
     #[test]
@@ -598,6 +679,19 @@ mod tests {
             err.to_string()
                 .contains("last_days cannot be combined with start_date/end_date")
         );
+    }
+
+    #[test]
+    fn validate_search_input_still_rejects_reversed_dates_without_cursor() {
+        let input = SearchMessagesInput {
+            cursor: None,
+            start_date: Some("2025-12-31".to_owned()),
+            end_date: Some("2025-01-01".to_owned()),
+            ..cursor_search_input()
+        };
+
+        let err = validate_search_input(&input).expect_err("must reject reversed date range");
+        assert!(err.to_string().contains("start_date must be <= end_date"));
     }
 
     #[test]

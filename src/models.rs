@@ -534,7 +534,7 @@ mod tests {
 
     use super::{
         ApplyToMessagesInput, GetMessageInput, GetMessageRawInput, GetOperationInput,
-        ListMailboxesInput, ManageMailboxInput, OperationIdInput, SearchMessagesInput,
+        ListMailboxesInput, MailboxInfo, ManageMailboxInput, OperationIdInput, SearchMessagesInput,
         UpdateMessageFlagsInput, validate_client_safe_input_schema,
     };
 
@@ -566,6 +566,11 @@ mod tests {
             schema_string_property(properties, "account_id", "pattern"),
             Some("^[A-Za-z0-9_-]+$")
         );
+        assert_schema_nullable_string(&schema, properties, "cursor");
+        assert!(
+            !schema_required_properties(&schema).contains(&"cursor"),
+            "cursor must remain optional"
+        );
         assert_eq!(
             schema_numeric_property(properties, "limit", "minimum"),
             Some(1)
@@ -580,6 +585,87 @@ mod tests {
                 .and_then(Value::as_u64),
             Some(100)
         );
+
+        let mailbox_schema = schema_for_type::<MailboxInfo>();
+        let mailbox_properties = mailbox_schema["properties"]
+            .as_object()
+            .expect("mailbox info schema must expose properties");
+        let mut property_names = mailbox_properties
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        property_names.sort_unstable();
+        assert_eq!(
+            property_names,
+            [
+                "attributes",
+                "delimiter",
+                "name",
+                "provider_managed",
+                "role",
+                "selectable",
+            ]
+        );
+        assert_eq!(
+            schema_string_property(mailbox_properties, "name", "type"),
+            Some("string")
+        );
+        assert_schema_nullable_string(&mailbox_schema, mailbox_properties, "delimiter");
+        assert_eq!(
+            schema_string_property(mailbox_properties, "attributes", "type"),
+            Some("array")
+        );
+        assert_eq!(
+            schema_variant_for(mailbox_properties, "attributes")
+                .and_then(|value| value.get("items"))
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str),
+            Some("string")
+        );
+        assert_schema_nullable_string_enum(
+            &mailbox_schema,
+            mailbox_properties,
+            "role",
+            [
+                "inbox",
+                "all",
+                "archive",
+                "drafts",
+                "flagged",
+                "important",
+                "junk",
+                "sent",
+                "trash",
+            ],
+        );
+        assert_eq!(
+            schema_string_property(mailbox_properties, "selectable", "type"),
+            Some("boolean")
+        );
+        assert_eq!(
+            schema_string_property(mailbox_properties, "provider_managed", "type"),
+            Some("boolean")
+        );
+
+        let mut required = schema_required_properties(&mailbox_schema);
+        required.sort_unstable();
+        assert_eq!(
+            required,
+            ["attributes", "name", "provider_managed", "selectable"]
+        );
+    }
+    fn schema_required_properties(schema: &Map<String, Value>) -> Vec<&str> {
+        schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|value| {
+                value
+                    .as_str()
+                    .expect("required property names must be strings")
+            })
+            .collect()
     }
 
     #[test]
@@ -768,6 +854,97 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    fn assert_schema_nullable_string(
+        root: &Map<String, Value>,
+        properties: &Map<String, Value>,
+        key: &str,
+    ) {
+        let schema = properties
+            .get(key)
+            .unwrap_or_else(|| panic!("{key} schema must exist"));
+        let mut types = Vec::new();
+        collect_schema_types(root, schema, &mut types);
+        types.sort_unstable();
+        types.dedup();
+        assert_eq!(
+            types,
+            ["null", "string"],
+            "{key} must allow only string and null values"
+        );
+    }
+    fn assert_schema_nullable_string_enum<const N: usize>(
+        root: &Map<String, Value>,
+        properties: &Map<String, Value>,
+        key: &str,
+        expected_values: [&str; N],
+    ) {
+        assert_schema_nullable_string(root, properties, key);
+        let schema = properties
+            .get(key)
+            .unwrap_or_else(|| panic!("{key} schema must exist"));
+        let mut values = Vec::new();
+        collect_schema_string_enum_values(root, schema, &mut values);
+        values.sort_unstable();
+        values.dedup();
+        let mut expected_values = expected_values;
+        expected_values.sort_unstable();
+        assert_eq!(values, expected_values, "{key} enum values must match");
+    }
+    fn collect_schema_types<'a>(
+        root: &'a Map<String, Value>,
+        schema: &'a Value,
+        types: &mut Vec<&'a str>,
+    ) {
+        if let Some(resolved) = resolve_local_schema_ref(root, schema) {
+            collect_schema_types(root, resolved, types);
+            return;
+        }
+        match schema.get("type") {
+            Some(Value::String(ty)) => types.push(ty),
+            Some(Value::Array(schema_types)) => {
+                types.extend(schema_types.iter().filter_map(Value::as_str));
+            }
+            _ => {}
+        }
+        if let Some(variants) = schema.get("anyOf").and_then(Value::as_array) {
+            for variant in variants {
+                collect_schema_types(root, variant, types);
+            }
+        }
+    }
+    fn collect_schema_string_enum_values<'a>(
+        root: &'a Map<String, Value>,
+        schema: &'a Value,
+        values: &mut Vec<&'a str>,
+    ) {
+        if let Some(resolved) = resolve_local_schema_ref(root, schema) {
+            collect_schema_string_enum_values(root, resolved, values);
+            return;
+        }
+        if let Some(enum_values) = schema.get("enum").and_then(Value::as_array) {
+            values.extend(enum_values.iter().filter_map(Value::as_str));
+        }
+        if let Some(variants) = schema.get("anyOf").and_then(Value::as_array) {
+            for variant in variants {
+                collect_schema_string_enum_values(root, variant, values);
+            }
+        }
+    }
+    fn resolve_local_schema_ref<'a>(
+        root: &'a Map<String, Value>,
+        schema: &Value,
+    ) -> Option<&'a Value> {
+        let reference = schema.get("$ref")?.as_str()?.strip_prefix("#/")?;
+        let mut segments = reference.split('/');
+        let first = segments.next()?.replace("~1", "/").replace("~0", "~");
+        let mut resolved = root.get(&first)?;
+        for segment in segments {
+            let segment = segment.replace("~1", "/").replace("~0", "~");
+            resolved = resolved.get(&segment)?;
+        }
+        Some(resolved)
     }
 
     fn schema_numeric_property(

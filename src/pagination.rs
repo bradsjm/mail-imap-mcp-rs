@@ -202,6 +202,30 @@ pub struct MailboxCursorEntry {
     pub expires_at: Instant,
 }
 
+/// Failure to atomically claim a mailbox-list continuation page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailboxCursorClaimError {
+    /// The cursor does not exist or its lifetime elapsed.
+    MissingOrExpired,
+    /// The cursor belongs to a different account.
+    AccountMismatch,
+    /// The stored continuation offset exceeds the snapshot length.
+    OffsetOutOfRange,
+}
+
+/// One page claimed from a mailbox-list snapshot.
+#[derive(Debug, Clone)]
+pub struct MailboxCursorPage {
+    /// Mailboxes in stable snapshot order.
+    pub mailboxes: Vec<crate::models::MailboxInfo>,
+    /// Exact source count when known.
+    pub total: Option<usize>,
+    /// Whether the source LIST observation was truncated.
+    pub truncated: bool,
+    /// Whether another page remains available under the same cursor.
+    pub has_more: bool,
+}
+
 /// Cursor store for mailbox-list snapshots.
 ///
 /// This is intentionally distinct from message-search cursors so snapshot
@@ -255,26 +279,49 @@ impl MailboxCursorStore {
         id
     }
 
-    /// Load a cursor and refresh its lifetime.
-    pub fn get(&mut self, cursor: &str) -> Option<MailboxCursorEntry> {
+    /// Atomically validate, claim, and advance one continuation page.
+    pub fn claim_page(
+        &mut self,
+        cursor: &str,
+        account_id: &str,
+        limit: usize,
+    ) -> Result<MailboxCursorPage, MailboxCursorClaimError> {
         self.cleanup();
-        let entry = self.entries.get_mut(cursor)?;
-        entry.expires_at = self.clock.now() + self.ttl;
-        Some(entry.clone())
-    }
 
-    /// Advance a cursor's snapshot offset.
-    pub fn update_offset(&mut self, cursor: &str, offset: usize) {
-        self.cleanup();
-        if let Some(entry) = self.entries.get_mut(cursor) {
-            entry.offset = offset;
-            entry.expires_at = self.clock.now() + self.ttl;
+        let entry = self
+            .entries
+            .get(cursor)
+            .ok_or(MailboxCursorClaimError::MissingOrExpired)?;
+        if entry.account_id != account_id {
+            return Err(MailboxCursorClaimError::AccountMismatch);
         }
-    }
+        if entry.offset > entry.mailboxes.len() {
+            return Err(MailboxCursorClaimError::OffsetOutOfRange);
+        }
 
-    /// Remove a cursor when its snapshot is exhausted or abandoned.
-    pub fn delete(&mut self, cursor: &str) {
-        self.entries.remove(cursor);
+        let end = entry
+            .offset
+            .saturating_add(limit)
+            .min(entry.mailboxes.len());
+        let page = MailboxCursorPage {
+            mailboxes: entry.mailboxes[entry.offset..end].to_vec(),
+            total: entry.total,
+            truncated: entry.truncated,
+            has_more: end < entry.mailboxes.len(),
+        };
+
+        if page.has_more {
+            let entry = self
+                .entries
+                .get_mut(cursor)
+                .expect("validated mailbox cursor must remain present");
+            entry.offset = end;
+            entry.expires_at = self.clock.now() + self.ttl;
+        } else {
+            self.entries.remove(cursor);
+        }
+
+        Ok(page)
     }
 
     fn cleanup(&mut self) {
@@ -306,7 +353,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
-    use super::{CursorEntry, CursorStore, MailboxCursorEntry, MailboxCursorStore};
+    use super::{
+        CursorEntry, CursorStore, MailboxCursorClaimError, MailboxCursorEntry, MailboxCursorStore,
+    };
     use crate::models::MailboxInfo;
     /// Creates a test cursor entry with the given expiration time.
     ///
@@ -387,57 +436,136 @@ mod tests {
         assert_eq!(remaining, 2);
     }
 
+    fn mailbox(name: &str) -> MailboxInfo {
+        MailboxInfo {
+            name: name.to_owned(),
+            delimiter: Some("/".to_owned()),
+            attributes: vec![],
+            role: None,
+            selectable: true,
+            provider_managed: false,
+        }
+    }
+
     fn mailbox_cursor_entry(expires_at: Instant) -> MailboxCursorEntry {
         MailboxCursorEntry {
             account_id: "account-a".to_owned(),
-            mailboxes: vec![MailboxInfo {
-                name: "INBOX".to_owned(),
-                delimiter: Some("/".to_owned()),
-                attributes: vec![],
-                role: None,
-                selectable: true,
-                provider_managed: false,
-            }]
-            .into(),
+            mailboxes: ["INBOX", "Archive", "Sent"]
+                .into_iter()
+                .map(mailbox)
+                .collect::<Vec<_>>()
+                .into(),
             offset: 0,
-            total: Some(1),
+            total: Some(3),
             truncated: false,
             expires_at,
         }
     }
 
     #[test]
-    fn mailbox_cursor_retains_snapshot_account_and_metadata() {
+    fn mailbox_cursor_claims_first_and_terminal_pages_then_deletes() {
         let (mut store, _) = MailboxCursorStore::new_with_manual_clock(60, 2);
         let id = store.create(mailbox_cursor_entry(Instant::now()));
-        let loaded = store.get(&id).expect("mailbox cursor must be present");
 
-        assert_eq!(loaded.account_id, "account-a");
-        assert_eq!(loaded.mailboxes[0].name, "INBOX");
-        assert_eq!(loaded.total, Some(1));
-        assert!(!loaded.truncated);
+        let first = store
+            .claim_page(&id, "account-a", 2)
+            .expect("first page must be claimable");
+        assert_eq!(
+            first
+                .mailboxes
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["INBOX", "Archive"]
+        );
+        assert_eq!(first.total, Some(3));
+        assert!(!first.truncated);
+        assert!(first.has_more);
+
+        let terminal = store
+            .claim_page(&id, "account-a", 2)
+            .expect("terminal page must be claimable");
+        assert_eq!(terminal.mailboxes[0].name, "Sent");
+        assert!(!terminal.has_more);
+        assert!(matches!(
+            store.claim_page(&id, "account-a", 2),
+            Err(MailboxCursorClaimError::MissingOrExpired)
+        ));
     }
 
     #[test]
-    fn mailbox_cursor_updates_offset_and_expires() {
+    fn mailbox_cursor_account_mismatch_does_not_consume() {
+        let (mut store, _) = MailboxCursorStore::new_with_manual_clock(60, 2);
+        let id = store.create(mailbox_cursor_entry(Instant::now()));
+
+        assert!(matches!(
+            store.claim_page(&id, "account-b", 1),
+            Err(MailboxCursorClaimError::AccountMismatch)
+        ));
+        let page = store
+            .claim_page(&id, "account-a", 1)
+            .expect("matching account must retain the first page");
+        assert_eq!(page.mailboxes[0].name, "INBOX");
+    }
+
+    #[test]
+    fn mailbox_cursor_out_of_range_does_not_consume() {
+        let (mut store, _) = MailboxCursorStore::new_with_manual_clock(60, 2);
+        let mut entry = mailbox_cursor_entry(Instant::now());
+        entry.offset = entry.mailboxes.len() + 1;
+        let id = store.create(entry);
+
+        assert!(matches!(
+            store.claim_page(&id, "account-a", 1),
+            Err(MailboxCursorClaimError::OffsetOutOfRange)
+        ));
+        assert!(matches!(
+            store.claim_page(&id, "account-a", 1),
+            Err(MailboxCursorClaimError::OffsetOutOfRange)
+        ));
+    }
+
+    #[test]
+    fn mailbox_cursor_expiry_is_missing_or_expired() {
         let (mut store, offset_ms) = MailboxCursorStore::new_with_manual_clock(1, 2);
         let id = store.create(mailbox_cursor_entry(Instant::now()));
-        store.update_offset(&id, 1);
-        assert_eq!(store.get(&id).expect("cursor must exist").offset, 1);
-
         advance_ms(&offset_ms, 1_100);
-        assert!(store.get(&id).is_none());
+
+        assert!(matches!(
+            store.claim_page(&id, "account-a", 1),
+            Err(MailboxCursorClaimError::MissingOrExpired)
+        ));
     }
 
-    #[test]
-    fn mailbox_cursor_evicts_least_recently_used_snapshot() {
-        let (mut store, offset_ms) = MailboxCursorStore::new_with_manual_clock(60, 1);
-        let id1 = store.create(mailbox_cursor_entry(Instant::now()));
-        advance_ms(&offset_ms, 1);
-        let id2 = store.create(mailbox_cursor_entry(Instant::now()));
+    #[tokio::test]
+    async fn concurrent_mailbox_claims_are_disjoint_and_stable() {
+        let (store, _) = MailboxCursorStore::new_with_manual_clock(60, 2);
+        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let id = store
+            .lock()
+            .await
+            .create(mailbox_cursor_entry(Instant::now()));
 
-        assert!(store.get(&id1).is_none());
-        assert!(store.get(&id2).is_some());
+        let claim = |store: Arc<tokio::sync::Mutex<MailboxCursorStore>>, id: String| async move {
+            store
+                .lock()
+                .await
+                .claim_page(&id, "account-a", 2)
+                .expect("concurrent page must be claimable")
+        };
+        let (left, right) = tokio::join!(
+            claim(Arc::clone(&store), id.clone()),
+            claim(Arc::clone(&store), id)
+        );
+        let mut names = left
+            .mailboxes
+            .into_iter()
+            .chain(right.mailboxes)
+            .map(|item| item.name)
+            .collect::<Vec<_>>();
+        names.sort();
+
+        assert_eq!(names, ["Archive", "INBOX", "Sent"]);
     }
     fn advance_ms(offset_ms: &Arc<AtomicU64>, amount: u64) {
         offset_ms.fetch_add(amount, Ordering::Relaxed);

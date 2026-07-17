@@ -35,7 +35,7 @@ It is the source of truth for tool names, input/output shapes, validation bounds
   - `uidvalidity` and `uid` must be non-negative integers.
   - Parsed `account_id` must match requested account.
 
-### `limit`
+### `limit` (message search)
 
 - Type: integer
 - Range: 1..100
@@ -101,13 +101,30 @@ Purpose: list visible mailboxes/folders.
 
 Input:
 - `account_id` (optional)
+- `cursor?` (string, opaque account-bound continuation token)
+- `limit?` (integer, 1..200, default 100)
+
+When `cursor` is present, the tool resumes the stored mailbox snapshot for the
+same account. The cursor is opaque and cannot be replayed against another
+account.
 
 Output `data`:
 - `status`: `ok|partial|failed`
 - `issues`: array of diagnostic issues
-- `next_action`: `{ instruction, tool, arguments }`
+- `next_action`: `{ instruction, tool, arguments }` (when another page is available, recommends `imap_list_mailboxes` with `account_id` and `next_cursor`)
 - `account_id`
-- `mailboxes`: array (max 200) of `{ name, delimiter? }`
+- `returned` (integer)
+- `total?` (integer; omitted when the server's complete mailbox count is unavailable)
+- `has_more` (boolean)
+- `next_cursor?` (string, opaque; present when `has_more=true`)
+- `truncated` (boolean)
+- `mailboxes`: array (max 200) of:
+  - `name`
+  - `delimiter?`
+  - `attributes` (string[])
+  - `role?` (`inbox|all|archive|drafts|flagged|important|junk|sent|trash`)
+  - `selectable` (boolean)
+  - `provider_managed` (boolean)
 
 ### 3) `imap_search_messages`
 
@@ -197,7 +214,7 @@ Output `data`:
   - `attachments?`: array (max 50) of:
     - `filename?`
     - `content_type`
-    - `size_bytes?` (complete decoded payload size when known; `null`/absent when unavailable or incomplete; never BODYSTRUCTURE encoded octets)
+    - `size_bytes?` (complete decoded payload size when known; `null`/absent when unavailable or incomplete; unknown size is never represented as zero)
     - `part_id`
     - `extracted_text?` (bounded; only when `attachment_mode=extract_text`)
 
@@ -208,8 +225,7 @@ PDF extraction rules:
 - `attachment_mode=metadata` reports attachment metadata without attempting extraction
 - messages with more than 50 attachments return the first 50 plus a truncation issue
 
-Message processing is bounded by the server-wide fetch, decode, MIME-complexity, and attachment-extraction limits listed under [Environment Variables](#environment-variables). Reaching a limit yields a bounded partial result with a diagnostic issue where possible; it does not turn an unknown or incomplete attachment size into zero.
-When the full message exceeds the fetch budget and bounded partial FETCH responses cannot be consumed safely, header-derived fields may be unavailable. In that case, BODYSTRUCTURE-selected content that fits the applicable limits is returned with `partial` status and diagnostic issues.
+Message processing is bounded by the server-wide fetch, decode, MIME-complexity, and attachment-extraction limits listed under [Environment Variables](#environment-variables). A conforming IMAP server is asked for at most the configured raw-message fetch budget. Oversized messages use that bounded raw prefix and return `partial` status with a fetch-budget issue. MIME depth or part-count overflow returns header-only metadata rather than recursively parsing the overflowing structure. Incomplete messages never extract attachment text, and an unknown or incomplete attachment `size_bytes` remains `null`/absent rather than zero.
 
 ### 5) `imap_get_message_raw`
 
@@ -369,9 +385,9 @@ Server-wide:
 - `MAIL_IMAP_OPERATION_MAX_ENTRIES` (default `256`; completed write operations retained in memory)
 - `MAIL_IMAP_MESSAGE_FETCH_BUDGET_BYTES` (default `8388608`; maximum bytes fetched while assembling one message; exhaustion returns bounded partial content and an issue)
 - `MAIL_IMAP_MESSAGE_DECODE_BUDGET_BYTES` (default `16777216`; maximum decoded message payload bytes; exhaustion returns bounded partial content and an issue)
-- `MAIL_IMAP_MIME_MAX_DEPTH` (default `32`; deeper MIME structure is omitted and reported as a partial-result issue)
-- `MAIL_IMAP_MIME_MAX_PARTS` (default `250`; excess MIME parts are omitted and reported as a partial-result issue)
-- `MAIL_IMAP_ATTACHMENT_EXTRACT_BUDGET_BYTES` (default `10485760`; maximum complete attachment payload bytes fetched for extraction per message; attachments that do not fit remain metadata-only and are reported with an issue)
+- `MAIL_IMAP_MIME_MAX_DEPTH` (default `32`; exceeding the MIME depth ceiling returns header-only metadata with a diagnostic issue)
+- `MAIL_IMAP_MIME_MAX_PARTS` (default `250`; exceeding the MIME part-count ceiling returns header-only metadata with a diagnostic issue)
+- `MAIL_IMAP_ATTACHMENT_EXTRACT_BUDGET_BYTES` (default `10485760`; maximum complete decoded attachment payload bytes processed for text extraction per message; attachments that do not fit remain metadata-only and are reported with an issue)
 
 ## Implementation Notes for Next Artifact
 

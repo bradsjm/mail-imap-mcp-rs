@@ -92,16 +92,16 @@ MAIL_IMAP_MIME_MAX_DEPTH=32
 # Default: 250 MIME parts
 MAIL_IMAP_MIME_MAX_PARTS=250
 
-# Default: 10485760 bytes (10 MiB) of complete attachment payloads fetched for extraction
+# Default: 10485760 bytes (10 MiB) of complete decoded attachment payloads processed for text extraction
 MAIL_IMAP_ATTACHMENT_EXTRACT_BUDGET_BYTES=10485760
 ```
 
 Behavior:
-- The fetch budget covers message sections retrieved to assemble a result. If it is exhausted, the tool returns the content assembled within the limit as a partial result and includes a diagnostic issue.
+- A conforming IMAP server is asked for at most the raw-message fetch budget. When a message is larger, `imap_get_message` parses only that bounded prefix and returns `partial` status with a fetch-budget issue.
 - The decode budget bounds decoded MIME payload bytes. Content beyond the limit is omitted or truncated, and the result reports the limit.
-- MIME nesting deeper than the depth limit and parts beyond the part-count limit are omitted and reported as partial-result issues.
-- The attachment extraction budget applies when complete attachment payloads are fetched for extraction. Attachments that do not fit remain metadata-only and produce an issue rather than a partial extraction.
-- Attachment `size_bytes` is the complete decoded payload size when known. It is `null` or absent when the complete decoded size is unavailable; BODYSTRUCTURE encoded octet counts are never reported as decoded sizes, and unknown size is never represented as zero.
+- MIME nesting deeper than the depth limit or a part count beyond the configured maximum returns header-only metadata with a diagnostic issue instead of recursively parsing the overflowing structure.
+- The attachment extraction budget applies only to complete messages. Incomplete messages never extract attachment text; attachments that do not fit the extraction budget remain metadata-only and produce an issue rather than a partial extraction.
+- Attachment `size_bytes` is the complete decoded payload size when known. It is `null` or absent when the complete decoded size is unavailable or incomplete, and unknown size is never represented as zero.
 
 ## Timeout Configuration
 

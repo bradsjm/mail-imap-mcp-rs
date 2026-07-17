@@ -19,7 +19,7 @@
 - Tightened message fetch bounds by reducing `imap_get_message_raw.max_bytes` to `1..64000` with a default of `16000`, and aligning `imap_get_message` body and attachment extraction limits to the current runtime validation ranges.
 - Hardened MCP schema publication and validation so public tool inputs stay client-safe and documented contracts match the current server payloads.
 - Shared mailbox cursors, cached read sessions, tracked operations, write locks, and MIME parsing capacity across MCP transport sessions.
-- Large messages now use BODYSTRUCTURE-selected complete sections within the fetch budget, report omitted content as partial-result issues, and expose unknown attachment sizes as `null`.
+- Large messages now use a bounded raw prefix: a conforming IMAP server is asked for at most the configured fetch budget, oversized messages return `partial` status with a fetch-budget issue, MIME-complexity overflow returns header-only metadata, incomplete messages never extract attachment text, and unknown or incomplete attachment sizes remain `null` rather than zero.
 
 ### Fixed
 
