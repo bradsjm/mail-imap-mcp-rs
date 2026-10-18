@@ -1,14 +1,17 @@
 //! Cursor-based pagination storage
 //!
-//! Manages search cursors with TTL and LRU-ish eviction. Cursors encode
-//! search state (UIDs, offset, filters) for efficient pagination
-//! across large result sets.
+//! Manages grouped search cursors with TTL and LRU-ish eviction. A grouped
+//! cursor stores the ordered mailbox list and its descending UID slices from
+//! one search, so combined pagination can span several mailboxes without
+//! losing per-mailbox UIDVALIDITY.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
+
+use crate::mailbox_codec::normalize_mailbox_name;
 
 #[derive(Debug)]
 enum CursorClock {
@@ -32,26 +35,74 @@ impl CursorClock {
     }
 }
 
-/// Single cursor entry
+/// One mailbox group stored in a grouped search cursor.
+#[derive(Debug, Clone)]
+pub struct SearchCursorGroup {
+    /// Mailbox name as stored by the caller; bindings compare normalized forms.
+    pub mailbox: String,
+    /// Mailbox UIDVALIDITY observed when the search ran.
+    pub uidvalidity: u32,
+    /// Matching UIDs for this mailbox in descending order (newest first).
+    pub uids_desc: Arc<[u32]>,
+}
+
+/// Grouped search cursor entry.
 ///
-/// Captures the full state of a search result page, allowing
-/// subsequent pages to be fetched efficiently.
+/// Captures the ordered mailbox groups, one combined offset, and the
+/// presentation settings needed to serve subsequent pages.
 #[derive(Debug, Clone)]
 pub struct CursorEntry {
-    /// Account identifier
+    /// Account identifier.
     pub account_id: String,
-    /// Mailbox name
-    pub mailbox: String,
-    /// Mailbox UIDVALIDITY at time of search
-    pub uidvalidity: u32,
-    /// All matching UIDs in descending order (newest first)
-    pub uids_desc: Arc<[u32]>,
-    /// Current offset into `uids_desc` (next page starts here)
+    /// Mailbox groups in requested order.
+    pub groups: Arc<[SearchCursorGroup]>,
+    /// Next unread position across all groups in group order.
     pub offset: usize,
-    /// Snippet character limit from original search. `None` means snippets are disabled.
-    pub snippet_max_chars: Option<usize>,
-    /// Expiration timestamp (refreshed on read/write access)
+    /// Preview character limit from the original search.
+    pub preview_max_chars: Option<usize>,
+    /// Conversation discovery method from the original search.
+    pub thread_method: Option<crate::models::ThreadMethod>,
+    /// Expiration timestamp (refreshed on successful claim).
     pub expires_at: Instant,
+}
+
+/// Failure to validate or atomically claim a search continuation page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchCursorClaimError {
+    /// The cursor does not exist or its lifetime elapsed.
+    MissingOrExpired,
+    /// The cursor belongs to a different account.
+    AccountMismatch,
+    /// The requested mailbox list does not match the stored ordered list.
+    MailboxesMismatch,
+    /// The stored combined offset exceeds the stored UID count.
+    OffsetOutOfRange,
+}
+
+/// One non-empty mailbox slice of a claimed search page.
+#[derive(Debug, Clone)]
+pub struct SearchPageGroup {
+    /// Mailbox name for this slice.
+    pub mailbox: String,
+    /// Mailbox UIDVALIDITY observed when the search ran.
+    pub uidvalidity: u32,
+    /// Claimed UIDs in stored descending order.
+    pub uids: Vec<u32>,
+}
+
+/// One claimed page of grouped search results.
+#[derive(Debug, Clone)]
+pub struct SearchCursorPage {
+    /// Non-empty mailbox slices in requested order.
+    pub groups: Vec<SearchPageGroup>,
+    /// Total number of UIDs across every stored group.
+    pub total: usize,
+    /// Whether any UID remains unclaimed after this page.
+    pub has_more: bool,
+    /// Preview character limit stored with the cursor.
+    pub preview_max_chars: Option<usize>,
+    /// Conversation discovery method stored with the cursor.
+    pub thread_method: Option<crate::models::ThreadMethod>,
 }
 
 /// Cursor store with TTL and LRU-ish eviction
@@ -119,28 +170,106 @@ impl CursorStore {
         id
     }
 
-    /// Retrieve cursor by ID
+    /// Validate that a cursor belongs to the account and ordered mailbox list.
     ///
-    /// Returns cloned entry if cursor exists and is not expired.
-    /// Automatically cleans up expired entries before lookup.
-    ///
-    /// Refreshes cursor expiration on successful access.
-    pub fn get(&mut self, cursor: &str) -> Option<CursorEntry> {
+    /// This does not claim a page, move the offset, or refresh expiry, so a
+    /// continuation can be checked before network work begins.
+    pub fn validate_binding(
+        &mut self,
+        id: &str,
+        account_id: &str,
+        mailboxes: &[String],
+    ) -> Result<(), SearchCursorClaimError> {
         self.cleanup();
-        let entry = self.entries.get_mut(cursor)?;
-        entry.expires_at = self.clock.now() + self.ttl;
-        Some(entry.clone())
+        // Stored entry selected by the opaque cursor identifier.
+        let entry = self
+            .entries
+            .get(id)
+            .ok_or(SearchCursorClaimError::MissingOrExpired)?;
+        check_binding(entry, account_id, mailboxes)?;
+        if entry.offset > total_group_uids(&entry.groups) {
+            return Err(SearchCursorClaimError::OffsetOutOfRange);
+        }
+        Ok(())
     }
 
-    /// Update cursor offset (for next page)
+    /// Atomically validate, claim, and advance one search continuation page.
     ///
-    /// Moves cursor forward in search results. Refreshes expiration.
-    /// Silently ignores missing cursors.
-    pub fn update_offset(&mut self, cursor: &str, offset: usize) {
-        if let Some(entry) = self.entries.get_mut(cursor) {
-            entry.offset = offset;
-            entry.expires_at = self.clock.now() + self.ttl;
+    /// The claimed page is a consumed attempt: the stored offset moves forward
+    /// immediately, and a terminal page deletes the cursor. There is no rollback.
+    pub fn claim_page(
+        &mut self,
+        id: &str,
+        account_id: &str,
+        mailboxes: &[String],
+        limit: usize,
+    ) -> Result<SearchCursorPage, SearchCursorClaimError> {
+        self.cleanup();
+
+        // Build the page, settings, and final offset while the entry is immutably borrowed.
+        let (groups, total, end, preview_max_chars, thread_method) = {
+            let entry = self
+                .entries
+                .get(id)
+                .ok_or(SearchCursorClaimError::MissingOrExpired)?;
+            check_binding(entry, account_id, mailboxes)?;
+            // Combined UID count across every stored group.
+            let total = total_group_uids(&entry.groups);
+            if entry.offset > total {
+                return Err(SearchCursorClaimError::OffsetOutOfRange);
+            }
+
+            // Number of UIDs claimed by this page, bounded by the remaining count.
+            let page_size = limit.min(total - entry.offset);
+            // Combined offset after this page; never exceeds the total UID count.
+            let end = entry.offset + page_size;
+            // Non-empty mailbox slices in requested group order.
+            let mut groups = Vec::new();
+            // Combined position of the current group in the overall UID sequence.
+            let mut position = 0usize;
+
+            for group in entry.groups.iter() {
+                // Slice bounds translated from the combined offset into this group.
+                let group_len = group.uids_desc.len();
+                let start = entry.offset.saturating_sub(position);
+                let finish = end.saturating_sub(position).min(group_len);
+                if start < finish {
+                    groups.push(SearchPageGroup {
+                        mailbox: group.mailbox.clone(),
+                        uidvalidity: group.uidvalidity,
+                        uids: group.uids_desc[start..finish].to_vec(),
+                    });
+                }
+                position = position.saturating_add(group_len);
+            }
+
+            (
+                groups,
+                total,
+                end,
+                entry.preview_max_chars,
+                entry.thread_method,
+            )
+        };
+
+        // Whether unclaimed UIDs remain after this page.
+        let has_more = end < total;
+        if has_more {
+            if let Some(entry) = self.entries.get_mut(id) {
+                entry.offset = end;
+                entry.expires_at = self.clock.now() + self.ttl;
+            }
+        } else {
+            self.entries.remove(id);
         }
+
+        Ok(SearchCursorPage {
+            groups,
+            total,
+            has_more,
+            preview_max_chars,
+            thread_method,
+        })
     }
 
     /// Delete cursor
@@ -152,7 +281,7 @@ impl CursorStore {
 
     /// Remove expired cursors
     ///
-    /// Called internally before get/create/update operations to
+    /// Called internally before create, validate, and claim operations to
     /// ensure stale cursors don't accumulate.
     fn cleanup(&mut self) {
         let now = self.clock.now();
@@ -162,7 +291,7 @@ impl CursorStore {
     /// Evict cursors if exceeding max_entries
     ///
     /// Removes oldest entries (by expiration time) until under limit.
-    /// Uses LRU-ish behavior since expiration is refreshed on get/update.
+    /// Uses LRU-ish behavior since expiration is refreshed on a successful claim.
     fn evict_if_needed(&mut self) {
         if self.entries.len() <= self.max_entries {
             return;
@@ -180,6 +309,33 @@ impl CursorStore {
             self.entries.remove(&id);
         }
     }
+}
+
+/// Total number of UIDs across every group in a cursor.
+fn total_group_uids(groups: &[SearchCursorGroup]) -> usize {
+    groups.iter().fold(0usize, |total, group| {
+        total.saturating_add(group.uids_desc.len())
+    })
+}
+
+/// Check the account and ordered mailbox identity of one stored cursor.
+fn check_binding(
+    entry: &CursorEntry,
+    account_id: &str,
+    mailboxes: &[String],
+) -> Result<(), SearchCursorClaimError> {
+    if entry.account_id != account_id {
+        return Err(SearchCursorClaimError::AccountMismatch);
+    }
+    // Ordered mailbox identity after decoding and INBOX canonicalization.
+    let matches = entry.groups.len() == mailboxes.len()
+        && entry.groups.iter().zip(mailboxes).all(|(group, mailbox)| {
+            normalize_mailbox_name(&group.mailbox) == normalize_mailbox_name(mailbox)
+        });
+    if !matches {
+        return Err(SearchCursorClaimError::MailboxesMismatch);
+    }
+    Ok(())
 }
 
 /// Snapshot-backed mailbox-list cursor.
@@ -355,83 +511,438 @@ mod tests {
 
     use super::{
         CursorEntry, CursorStore, MailboxCursorClaimError, MailboxCursorEntry, MailboxCursorStore,
+        SearchCursorClaimError, SearchCursorGroup, SearchCursorPage,
     };
-    use crate::models::MailboxInfo;
-    /// Creates a test cursor entry with the given expiration time.
-    ///
-    /// This helper is used to generate consistent test data for cursor store tests.
-    fn cursor_entry(expires_at: Instant) -> CursorEntry {
-        CursorEntry {
-            account_id: "default".to_owned(),
-            mailbox: "INBOX".to_owned(),
-            uidvalidity: 1,
-            uids_desc: vec![5, 4, 3, 2, 1].into(),
-            offset: 0,
-            snippet_max_chars: None,
-            expires_at,
+    use crate::models::{MailboxInfo, ThreadMethod};
+
+    /// Build one stored mailbox group for tests.
+    fn search_group(mailbox: &str, uidvalidity: u32, uids: &[u32]) -> SearchCursorGroup {
+        SearchCursorGroup {
+            mailbox: mailbox.to_owned(),
+            uidvalidity,
+            uids_desc: Arc::<[u32]>::from(uids),
         }
     }
 
-    /// Tests that a cursor can be created and then retrieved from the store.
-    #[test]
-    fn create_and_get_cursor() {
-        let (mut store, _) = CursorStore::new_with_manual_clock(60, 10);
-        let id = store.create(cursor_entry(Instant::now()));
-        let loaded = store.get(&id).expect("cursor must be present");
-        assert_eq!(loaded.mailbox, "INBOX");
-        assert_eq!(loaded.uids_desc.len(), 5);
+    /// Build a grouped cursor entry with the default account and no settings.
+    fn cursor_entry(groups: Vec<SearchCursorGroup>) -> CursorEntry {
+        CursorEntry {
+            account_id: "default".to_owned(),
+            groups: Arc::<[SearchCursorGroup]>::from(groups),
+            offset: 0,
+            preview_max_chars: None,
+            thread_method: None,
+            expires_at: Instant::now(),
+        }
     }
 
-    /// Tests updating the offset of a cursor and then deleting it.
-    ///
-    /// Verifies that the offset is updated and that deletion removes the cursor.
+    /// Build the ordered mailbox request list used by binding checks.
+    fn requested_mailboxes(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// Flatten a claimed page into combined UID order.
+    fn page_uids(page: &SearchCursorPage) -> Vec<u32> {
+        page.groups
+            .iter()
+            .flat_map(|group| group.uids.iter().copied())
+            .collect()
+    }
+
+    /// Build the two-group fixture shared by the pagination tests.
+    fn two_group_entry() -> CursorEntry {
+        cursor_entry(vec![
+            search_group("INBOX", 1, &[5, 4, 3]),
+            search_group("Archive", 2, &[9, 8]),
+        ])
+    }
+
+    /// Tests that a created cursor can claim its first page.
     #[test]
-    fn update_offset_and_delete_cursor() {
+    fn create_and_claim_cursor() {
         let (mut store, _) = CursorStore::new_with_manual_clock(60, 10);
-        let id = store.create(cursor_entry(Instant::now()));
-        store.update_offset(&id, 3);
-        let loaded = store.get(&id).expect("cursor must exist after update");
-        assert_eq!(loaded.offset, 3);
+        let id = store.create(two_group_entry());
+        let page = store
+            .claim_page(
+                &id,
+                "default",
+                &requested_mailboxes(&["INBOX", "Archive"]),
+                2,
+            )
+            .expect("first page must be claimable");
+        assert_eq!(page_uids(&page), [5, 4]);
+        assert_eq!(page.total, 5);
+        assert!(page.has_more);
 
         store.delete(&id);
-        assert!(store.get(&id).is_none());
+        assert!(matches!(
+            store.validate_binding(&id, "default", &requested_mailboxes(&["INBOX", "Archive"])),
+            Err(SearchCursorClaimError::MissingOrExpired)
+        ));
     }
 
-    /// Tests that cursors expire after their TTL has elapsed.
+    /// Tests that one page can span groups while omitting empty slices.
     #[test]
-    fn expires_old_entries() {
+    fn page_slices_across_groups_in_order() {
+        let (mut store, _) = CursorStore::new_with_manual_clock(60, 10);
+        let mut entry = two_group_entry();
+        entry.offset = 2;
+        let id = store.create(entry);
+
+        let page = store
+            .claim_page(
+                &id,
+                "default",
+                &requested_mailboxes(&["INBOX", "Archive"]),
+                2,
+            )
+            .expect("spanning page must be claimable");
+
+        assert_eq!(page.total, 5);
+        assert!(page.has_more);
+        assert_eq!(page.groups.len(), 2);
+        assert_eq!(page.groups[0].mailbox, "INBOX");
+        assert_eq!(page.groups[0].uidvalidity, 1);
+        assert_eq!(page.groups[0].uids, [3]);
+        assert_eq!(page.groups[1].mailbox, "Archive");
+        assert_eq!(page.groups[1].uidvalidity, 2);
+        assert_eq!(page.groups[1].uids, [9]);
+    }
+
+    /// Tests that sequential claims with different limits are disjoint and ordered.
+    #[test]
+    fn sequential_claims_cover_every_uid_once() {
+        let (mut store, _) = CursorStore::new_with_manual_clock(60, 10);
+        let id = store.create(two_group_entry());
+        let mailboxes = requested_mailboxes(&["INBOX", "Archive"]);
+
+        let first = store
+            .claim_page(&id, "default", &mailboxes, 1)
+            .expect("first page must be claimable");
+        let second = store
+            .claim_page(&id, "default", &mailboxes, 3)
+            .expect("second page must be claimable");
+        let third = store
+            .claim_page(&id, "default", &mailboxes, 2)
+            .expect("third page must be claimable");
+
+        assert_eq!(page_uids(&first), [5]);
+        assert_eq!(page_uids(&second), [4, 3, 9]);
+        assert_eq!(page_uids(&third), [8]);
+        assert!(!third.has_more);
+        assert!(matches!(
+            store.claim_page(&id, "default", &mailboxes, 2),
+            Err(SearchCursorClaimError::MissingOrExpired)
+        ));
+    }
+
+    /// Tests that concurrent claims through a shared store are disjoint.
+    #[tokio::test]
+    async fn concurrent_search_claims_are_disjoint() {
+        let (store, _) = CursorStore::new_with_manual_clock(60, 2);
+        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let id = store.lock().await.create(two_group_entry());
+
+        let claim = |store: Arc<tokio::sync::Mutex<CursorStore>>, id: String| async move {
+            store
+                .lock()
+                .await
+                .claim_page(
+                    &id,
+                    "default",
+                    &requested_mailboxes(&["INBOX", "Archive"]),
+                    2,
+                )
+                .expect("concurrent page must be claimable")
+        };
+        let (left, right) = tokio::join!(
+            claim(Arc::clone(&store), id.clone()),
+            claim(Arc::clone(&store), id)
+        );
+        let mut uids = page_uids(&left)
+            .into_iter()
+            .chain(page_uids(&right))
+            .collect::<Vec<_>>();
+        uids.sort_unstable();
+
+        assert_eq!(uids, [3, 4, 5, 9]);
+    }
+
+    /// Tests that account and mailbox binding failures do not consume a page.
+    #[test]
+    fn binding_mismatches_do_not_consume() {
+        let (mut store, _) = CursorStore::new_with_manual_clock(60, 10);
+        let id = store.create(two_group_entry());
+        let mailboxes = requested_mailboxes(&["INBOX", "Archive"]);
+
+        assert!(matches!(
+            store.claim_page(&id, "other", &mailboxes, 1),
+            Err(SearchCursorClaimError::AccountMismatch)
+        ));
+        assert!(matches!(
+            store.claim_page(&id, "default", &requested_mailboxes(&["INBOX"]), 1),
+            Err(SearchCursorClaimError::MailboxesMismatch)
+        ));
+        assert!(matches!(
+            store.claim_page(
+                &id,
+                "default",
+                &requested_mailboxes(&["Archive", "INBOX"]),
+                1
+            ),
+            Err(SearchCursorClaimError::MailboxesMismatch)
+        ));
+        assert!(matches!(
+            store.validate_binding(
+                &id,
+                "default",
+                &requested_mailboxes(&["INBOX", "Archive", "Sent"])
+            ),
+            Err(SearchCursorClaimError::MailboxesMismatch)
+        ));
+
+        let page = store
+            .claim_page(&id, "default", &mailboxes, 1)
+            .expect("matching binding must retain the first page");
+        assert_eq!(page_uids(&page), [5]);
+    }
+
+    /// Tests that unknown and expired cursor identifiers are rejected.
+    #[test]
+    fn missing_and_expired_cursors_are_rejected() {
         let (mut store, offset_ms) = CursorStore::new_with_manual_clock(1, 10);
-        let id = store.create(cursor_entry(Instant::now()));
+        let id = store.create(two_group_entry());
+        let mailboxes = requested_mailboxes(&["INBOX", "Archive"]);
+
+        assert!(matches!(
+            store.claim_page("unknown", "default", &mailboxes, 1),
+            Err(SearchCursorClaimError::MissingOrExpired)
+        ));
+
         advance_ms(&offset_ms, 1_100);
-        assert!(store.get(&id).is_none());
+        assert!(matches!(
+            store.claim_page(&id, "default", &mailboxes, 1),
+            Err(SearchCursorClaimError::MissingOrExpired)
+        ));
+        assert!(matches!(
+            store.validate_binding(&id, "default", &mailboxes),
+            Err(SearchCursorClaimError::MissingOrExpired)
+        ));
     }
 
-    /// Tests that accessing a cursor refreshes its TTL, preventing expiration.
+    /// Tests that a stored offset beyond the combined UID count is rejected.
     #[test]
-    fn get_refreshes_cursor_ttl() {
-        let (mut store, offset_ms) = CursorStore::new_with_manual_clock(1, 10);
-        let id = store.create(cursor_entry(Instant::now()));
+    fn offset_beyond_total_is_rejected() {
+        let (mut store, _) = CursorStore::new_with_manual_clock(60, 10);
+        let mut entry = two_group_entry();
+        entry.offset = 6;
+        let id = store.create(entry);
+        let mailboxes = requested_mailboxes(&["INBOX", "Archive"]);
 
-        advance_ms(&offset_ms, 700);
-        assert!(store.get(&id).is_some());
+        assert!(matches!(
+            store.claim_page(&id, "default", &mailboxes, 1),
+            Err(SearchCursorClaimError::OffsetOutOfRange)
+        ));
+        assert!(matches!(
+            store.validate_binding(&id, "default", &mailboxes),
+            Err(SearchCursorClaimError::OffsetOutOfRange)
+        ));
+    }
 
-        advance_ms(&offset_ms, 700);
-        assert!(store.get(&id).is_some());
+    /// Tests that an offset equal to the total yields an empty terminal page.
+    #[test]
+    fn offset_equal_to_total_is_terminal() {
+        let (mut store, _) = CursorStore::new_with_manual_clock(60, 10);
+        let mut entry = two_group_entry();
+        entry.offset = 5;
+        let id = store.create(entry);
+        let mailboxes = requested_mailboxes(&["INBOX", "Archive"]);
+
+        let page = store
+            .claim_page(&id, "default", &mailboxes, 1)
+            .expect("terminal empty page must be claimable");
+        assert!(page.groups.is_empty());
+        assert_eq!(page.total, 5);
+        assert!(!page.has_more);
+        assert!(matches!(
+            store.validate_binding(&id, "default", &mailboxes),
+            Err(SearchCursorClaimError::MissingOrExpired)
+        ));
+    }
+
+    /// Tests that a failed claim does not refresh the stored expiry.
+    #[test]
+    fn failed_claim_does_not_refresh_expiry() {
+        let (mut store, offset_ms) = CursorStore::new_with_manual_clock(60, 10);
+        let id = store.create(two_group_entry());
+        let mailboxes = requested_mailboxes(&["INBOX", "Archive"]);
+
+        advance_ms(&offset_ms, 50_000);
+        assert!(matches!(
+            store.claim_page(&id, "other", &mailboxes, 1),
+            Err(SearchCursorClaimError::AccountMismatch)
+        ));
+        advance_ms(&offset_ms, 10_001);
+        assert!(matches!(
+            store.claim_page(&id, "default", &mailboxes, 1),
+            Err(SearchCursorClaimError::MissingOrExpired)
+        ));
+    }
+
+    /// Tests that read-only validation does not refresh the stored expiry.
+    #[test]
+    fn validate_binding_does_not_refresh_expiry() {
+        let (mut store, offset_ms) = CursorStore::new_with_manual_clock(60, 10);
+        let id = store.create(two_group_entry());
+        let mailboxes = requested_mailboxes(&["INBOX", "Archive"]);
+
+        advance_ms(&offset_ms, 50_000);
+        store
+            .validate_binding(&id, "default", &mailboxes)
+            .expect("matching binding must validate");
+        advance_ms(&offset_ms, 10_001);
+        assert!(matches!(
+            store.validate_binding(&id, "default", &mailboxes),
+            Err(SearchCursorClaimError::MissingOrExpired)
+        ));
+    }
+
+    /// Tests that a successful claim refreshes the stored expiry.
+    #[test]
+    fn successful_claim_refreshes_expiry() {
+        let (mut store, offset_ms) = CursorStore::new_with_manual_clock(60, 10);
+        let id = store.create(two_group_entry());
+        let mailboxes = requested_mailboxes(&["INBOX", "Archive"]);
+
+        advance_ms(&offset_ms, 50_000);
+        store
+            .claim_page(&id, "default", &mailboxes, 1)
+            .expect("first claim must succeed");
+        advance_ms(&offset_ms, 20_000);
+        store
+            .claim_page(&id, "default", &mailboxes, 1)
+            .expect("claim must succeed after refreshed expiry");
+    }
+
+    /// Tests that stored preview and thread settings return with every page.
+    #[test]
+    fn stored_settings_return_with_the_page() {
+        let (mut store, _) = CursorStore::new_with_manual_clock(60, 10);
+        let mut entry = two_group_entry();
+        entry.preview_max_chars = Some(120);
+        entry.thread_method = Some(ThreadMethod::Headers);
+        let id = store.create(entry);
+        let mailboxes = requested_mailboxes(&["INBOX", "Archive"]);
+
+        let page = store
+            .claim_page(&id, "default", &mailboxes, 5)
+            .expect("terminal page must be claimable");
+        assert_eq!(page.preview_max_chars, Some(120));
+        assert_eq!(page.thread_method, Some(ThreadMethod::Headers));
+        assert!(!page.has_more);
+    }
+
+    /// Tests INBOX case folding and modified UTF-7 equivalence in bindings.
+    #[test]
+    fn inbox_and_encoded_mailboxes_match_normalized_bindings() {
+        let (mut store, _) = CursorStore::new_with_manual_clock(60, 10);
+
+        let id = store.create(cursor_entry(vec![search_group("INBOX", 1, &[1])]));
+        store
+            .validate_binding(&id, "default", &requested_mailboxes(&["inbox"]))
+            .expect("lowercase INBOX request must match");
+
+        let id = store.create(cursor_entry(vec![search_group("&ZeVnLIqe-", 1, &[1])]));
+        let page = store
+            .claim_page(&id, "default", &requested_mailboxes(&["日本語"]), 1)
+            .expect("decoded request must match encoded stored group");
+        assert_eq!(page.groups[0].mailbox, "&ZeVnLIqe-");
+
+        let id = store.create(cursor_entry(vec![search_group("日本語", 1, &[1])]));
+        store
+            .claim_page(&id, "default", &requested_mailboxes(&["&ZeVnLIqe-"]), 1)
+            .expect("encoded request must match decoded stored group");
+    }
+
+    /// Tests that an empty middle group is skipped in claimed pages.
+    #[test]
+    fn empty_middle_group_is_skipped() {
+        let (mut store, _) = CursorStore::new_with_manual_clock(60, 10);
+        let entry = cursor_entry(vec![
+            search_group("INBOX", 1, &[1, 2]),
+            search_group("Empty", 2, &[]),
+            search_group("Archive", 3, &[3, 4]),
+        ]);
+        let id = store.create(entry);
+        let mailboxes = requested_mailboxes(&["INBOX", "Empty", "Archive"]);
+
+        let first = store
+            .claim_page(&id, "default", &mailboxes, 1)
+            .expect("first page must be claimable");
+        assert_eq!(first.groups.len(), 1);
+        assert_eq!(first.groups[0].mailbox, "INBOX");
+
+        store
+            .claim_page(&id, "default", &mailboxes, 1)
+            .expect("second page must be claimable");
+        let third = store
+            .claim_page(&id, "default", &mailboxes, 1)
+            .expect("third page must skip the empty group");
+        assert_eq!(third.groups.len(), 1);
+        assert_eq!(third.groups[0].mailbox, "Archive");
+        assert_eq!(third.groups[0].uids, [3]);
+    }
+
+    /// Tests that a limit larger than the total returns everything and deletes.
+    #[test]
+    fn oversized_limit_returns_all_and_deletes() {
+        let (mut store, _) = CursorStore::new_with_manual_clock(60, 10);
+        let id = store.create(two_group_entry());
+        let mailboxes = requested_mailboxes(&["INBOX", "Archive"]);
+
+        let page = store
+            .claim_page(&id, "default", &mailboxes, 100)
+            .expect("oversized limit must be bounded by the total");
+        assert_eq!(page_uids(&page), [5, 4, 3, 9, 8]);
+        assert!(!page.has_more);
+        assert!(matches!(
+            store.claim_page(&id, "default", &mailboxes, 1),
+            Err(SearchCursorClaimError::MissingOrExpired)
+        ));
+    }
+
+    /// Tests that a maximum usize limit does not overflow.
+    #[test]
+    fn maximum_limit_does_not_overflow() {
+        let (mut store, _) = CursorStore::new_with_manual_clock(60, 10);
+        let id = store.create(two_group_entry());
+        let mailboxes = requested_mailboxes(&["INBOX", "Archive"]);
+
+        let page = store
+            .claim_page(&id, "default", &mailboxes, usize::MAX)
+            .expect("maximum limit must be bounded by the total");
+        assert_eq!(page_uids(&page), [5, 4, 3, 9, 8]);
+        assert!(!page.has_more);
+        assert!(matches!(
+            store.validate_binding(&id, "default", &mailboxes),
+            Err(SearchCursorClaimError::MissingOrExpired)
+        ));
     }
 
     /// Tests that the store evicts the oldest cursors when exceeding max_entries.
     #[test]
     fn evicts_to_max_entries() {
         let (mut store, offset_ms) = CursorStore::new_with_manual_clock(60, 2);
-        let id1 = store.create(cursor_entry(Instant::now()));
+        let mailboxes = requested_mailboxes(&["INBOX", "Archive"]);
+        let id1 = store.create(two_group_entry());
         advance_ms(&offset_ms, 1);
-        let id2 = store.create(cursor_entry(Instant::now()));
+        let id2 = store.create(two_group_entry());
         advance_ms(&offset_ms, 1);
-        let id3 = store.create(cursor_entry(Instant::now()));
+        let id3 = store.create(two_group_entry());
 
         let remaining = [id1, id2, id3]
             .into_iter()
-            .filter(|id| store.get(id).is_some())
+            .filter(|id| store.validate_binding(id, "default", &mailboxes).is_ok())
             .count();
         assert_eq!(remaining, 2);
     }
@@ -444,6 +955,8 @@ mod tests {
             role: None,
             selectable: true,
             provider_managed: false,
+            total_messages: None,
+            unread_messages: None,
         }
     }
 

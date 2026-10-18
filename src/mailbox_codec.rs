@@ -10,7 +10,6 @@ use base64::Engine;
 /// Decode an IMAP modified UTF-7 mailbox name for user-facing output.
 ///
 /// Falls back to the original input if decoding fails on malformed data.
-#[cfg(test)]
 pub fn decode_mailbox_name_for_display(mailbox: &str) -> String {
     decode_mailbox_name_inner(mailbox).unwrap_or_else(|| mailbox.to_owned())
 }
@@ -29,9 +28,16 @@ pub fn encode_mailbox_name_for_command(mailbox: &str) -> String {
 /// Normalize mailbox identity for equality checks.
 ///
 /// This treats canonical modified UTF-7 and decoded Unicode mailbox names as
-/// equivalent while preserving malformed input as-is.
+/// equivalent while preserving malformed input as-is. The reserved INBOX name
+/// is canonicalized to uppercase so case-insensitive server spellings match.
 pub fn normalize_mailbox_name(mailbox: &str) -> String {
-    decode_mailbox_name_inner(mailbox).unwrap_or_else(|| mailbox.to_owned())
+    // Decoded mailbox identity before reserved-name canonicalization.
+    let decoded = decode_mailbox_name_inner(mailbox).unwrap_or_else(|| mailbox.to_owned());
+    if decoded.eq_ignore_ascii_case("INBOX") {
+        "INBOX".to_owned()
+    } else {
+        decoded
+    }
 }
 
 fn decode_mailbox_name_inner(mailbox: &str) -> Option<String> {
@@ -70,8 +76,10 @@ fn decode_modified_utf7_token(token: &str) -> Option<String> {
     }
 
     let utf16 = bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_be_bytes(*chunk))
         .collect::<Vec<_>>();
     String::from_utf16(&utf16).ok()
 }
@@ -126,6 +134,28 @@ mod tests {
     fn normalizes_encoded_and_decoded_mailbox_names_equally() {
         assert_eq!(normalize_mailbox_name("&ZeVnLIqe-"), "日本語");
         assert_eq!(normalize_mailbox_name("日本語"), "日本語");
+    }
+
+    #[test]
+    fn canonicalizes_inbox_case_insensitively() {
+        assert_eq!(normalize_mailbox_name("inbox"), "INBOX");
+        assert_eq!(normalize_mailbox_name("Inbox"), "INBOX");
+        assert_eq!(normalize_mailbox_name("INBOX"), "INBOX");
+    }
+
+    #[test]
+    fn preserves_malformed_encoded_inbox_like_input() {
+        // This shifted form has an odd decoded byte count, so it stays as-is.
+        assert_eq!(
+            normalize_mailbox_name("&AGkAbgBiAG8AeAA-"),
+            "&AGkAbgBiAG8AeAA-"
+        );
+    }
+
+    #[test]
+    fn preserves_case_of_non_inbox_mailbox_names() {
+        assert_eq!(normalize_mailbox_name("Inbox/Sub"), "Inbox/Sub");
+        assert_eq!(normalize_mailbox_name("Archive"), "Archive");
     }
 
     #[test]

@@ -104,12 +104,18 @@ pub struct MailboxInfo {
     pub selectable: bool,
     /// Whether the provider manages this mailbox and disallows rename/delete.
     pub provider_managed: bool,
+    /// Total messages from a live `STATUS`; present only when `include_counts` was requested and the server reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_messages: Option<u32>,
+    /// Messages without `\Seen` from a live `STATUS`; present only when `include_counts` was requested and the server reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_messages: Option<u32>,
 }
 
 /// Message summary for search results
 ///
-/// Lightweight representation returned by `imap_search_messages`. Includes
-/// optional snippet for preview.
+/// Lightweight representation returned by `imap_search_messages`. Includes an
+/// optional body preview and, on Gmail servers, Gmail labels and identities.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MessageSummary {
     /// Stable, opaque message identifier
@@ -132,8 +138,14 @@ pub struct MessageSummary {
     pub subject: Option<String>,
     /// IMAP flags (e.g., `\Seen`, `\Flagged`)
     pub flags: Option<Vec<String>>,
-    /// Optional subject snippet (present when `snippet_max_chars` was requested)
-    pub snippet: Option<String>,
+    /// Whitespace-normalized body preview, present when `preview_max_chars` was requested and the message has text.
+    pub preview: Option<String>,
+    /// Gmail labels exactly as observed on Gmail servers; absent when the server did not return them.
+    pub gmail_labels: Option<Vec<String>>,
+    /// Gmail message identifier (`X-GM-MSGID`) as a decimal string.
+    pub gmail_message_id: Option<String>,
+    /// Gmail conversation identifier (`X-GM-THRID`) as a decimal string.
+    pub gmail_thread_id: Option<String>,
 }
 
 /// Attachment metadata
@@ -152,6 +164,23 @@ pub struct AttachmentInfo {
     pub part_id: String,
     /// Extracted text from PDF (if enabled and extraction succeeded)
     pub extracted_text: Option<String>,
+}
+
+/// Mutation mode shared by flag and Gmail label updates.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SetOperation {
+    Add,
+    Remove,
+    Replace,
+}
+
+/// Method used to discover the messages of a conversation search.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadMethod {
+    Gmail,
+    Headers,
 }
 
 /// Requested body content mode for `imap_get_message`.
@@ -202,6 +231,12 @@ pub struct MessageDetail {
     pub subject: Option<String>,
     /// IMAP flags (e.g., `\Seen`, `\Flagged`)
     pub flags: Option<Vec<String>>,
+    /// Gmail labels exactly as observed on Gmail servers; absent when the server did not return them.
+    pub gmail_labels: Option<Vec<String>>,
+    /// Gmail message identifier (`X-GM-MSGID`) as a decimal string.
+    pub gmail_message_id: Option<String>,
+    /// Gmail conversation identifier (`X-GM-THRID`) as a decimal string.
+    pub gmail_thread_id: Option<String>,
     /// All headers or curated subset (if `include_headers=true`)
     pub headers: Option<Vec<(String, String)>>,
     /// Plain text body (truncated to `body_max_chars`)
@@ -221,25 +256,28 @@ pub struct ListMailboxesInput {
     pub account_id: String,
     /// Cursor from a previous mailbox-list response.
     pub cursor: Option<String>,
-    /// Maximum mailboxes to return (1..200, default 100).
+    /// Maximum mailboxes to return (1..200, or 1..50 when `include_counts` is true; default 50).
     #[serde(default = "default_mailbox_limit")]
     #[schemars(range(min = 1, max = 200), transform = remove_format)]
     pub limit: usize,
+    /// Include live message and unread counts for the selectable mailboxes of the returned page (default false).
+    #[serde(default)]
+    pub include_counts: bool,
 }
 
 /// Input: search messages with pagination
 ///
-/// Used by `imap_search_messages`. Supports multiple search criteria and
-/// cursor-based pagination.
+/// Used by `imap_search_messages`. Supports multiple search criteria,
+/// several mailboxes, conversation discovery, and cursor-based pagination.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SearchMessagesInput {
     /// Account identifier (defaults to `"default"`)
     #[serde(default = "default_account_id")]
     #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9_-]+$"))]
     pub account_id: String,
-    /// Mailbox to search (e.g., `INBOX`, `Sent`, `Archive`)
-    #[schemars(length(min = 1, max = 256))]
-    pub mailbox: String,
+    /// Distinct mailboxes to search, 1..10 names (e.g., `INBOX`, `Sent`); results are grouped in this order.
+    #[schemars(length(min = 1, max = 10), inner(length(min = 1, max = 256)))]
+    pub mailboxes: Vec<String>,
     /// Pagination cursor from previous search result
     pub cursor: Option<String>,
     /// Full-text search query
@@ -256,6 +294,21 @@ pub struct SearchMessagesInput {
     pub subject: Option<String>,
     /// Filter to unread messages only
     pub unread_only: Option<bool>,
+    /// Filter by the `\Flagged` flag: `true` keeps flagged messages and `false` keeps unflagged messages.
+    pub flagged: Option<bool>,
+    /// Filter by the `\Answered` flag: `true` keeps answered messages and `false` keeps unanswered messages.
+    pub answered: Option<bool>,
+    /// Filter by one custom keyword (1..64 characters, an IMAP atom without a leading backslash).
+    #[schemars(length(min = 1, max = 64))]
+    pub keyword: Option<String>,
+    /// Filter by Message-ID header text (substring match).
+    #[schemars(length(min = 1, max = 256))]
+    pub message_id_header: Option<String>,
+    /// Gmail raw search expression (`X-GM-RAW`), accepted only on servers that advertise `X-GM-EXT-1`.
+    #[schemars(length(min = 1, max = 256))]
+    pub gmail_query: Option<String>,
+    /// Stable message identifier whose conversation is searched; it must belong to the same account.
+    pub thread_of_message_id: Option<String>,
     /// Filter to messages from last N days
     #[schemars(range(min = 1, max = 365), transform = remove_format)]
     pub last_days: Option<u16>,
@@ -269,9 +322,9 @@ pub struct SearchMessagesInput {
     #[serde(default = "default_limit")]
     #[schemars(range(min = 1, max = 100), transform = remove_format)]
     pub limit: usize,
-    /// Maximum snippet length (50..500). When omitted, snippets are not included.
+    /// Maximum body preview length in characters (50..500). When omitted, previews are not included.
     #[schemars(range(min = 50, max = 500), transform = remove_format)]
-    pub snippet_max_chars: Option<usize>,
+    pub preview_max_chars: Option<usize>,
 }
 
 /// Input: get parsed message details
@@ -343,12 +396,28 @@ pub struct UpdateMessageFlagsInput {
     /// Stable message identifiers to mutate
     #[schemars(length(min = 1, max = 250))]
     pub message_ids: Vec<String>,
-    /// Flag mutation mode
-    #[schemars(schema_with = "flag_operation_schema")]
-    pub operation: String,
+    /// Flag mutation mode: `add`, `remove`, or `replace`
+    pub operation: SetOperation,
     /// Standard IMAP system flags or server-defined keywords
     #[schemars(length(min = 1, max = 32))]
     pub flags: Vec<String>,
+}
+
+/// Input: add, remove, or replace Gmail labels on explicit messages.
+///
+/// Requires a server that advertises `X-GM-EXT-1`. Labels are 1..256
+/// characters without ASCII control characters. `add` and `remove` need at
+/// least one label; `replace` may be empty and then clears all labels.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct UpdateMessageLabelsInput {
+    /// Stable message identifiers to mutate
+    #[schemars(length(min = 1, max = 250))]
+    pub message_ids: Vec<String>,
+    /// Label mutation mode: `add`, `remove`, or `replace`
+    pub operation: SetOperation,
+    /// Gmail labels; empty is allowed only for `replace`, which clears all labels
+    #[schemars(length(min = 0, max = 32))]
+    pub labels: Vec<String>,
 }
 
 /// Input: create, rename, or delete a mailbox.
@@ -388,6 +457,76 @@ pub struct GetOperationInput {
     pub include_result: bool,
 }
 
+/// Representation of attachment content requested from `imap_get_attachment`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentContentMode {
+    Text,
+    Bytes,
+}
+
+/// Input: read one attachment of a message as text or base64 bytes.
+///
+/// Text mode accepts only `max_chars`; bytes mode accepts only `offset_bytes`
+/// and `max_bytes`. Fields that do not apply to the chosen mode are rejected.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GetAttachmentInput {
+    /// Stable message identifier
+    pub message_id: String,
+    /// Part ID from `imap_get_message` attachments: `1` followed by dot-separated child indices (max 64 characters)
+    #[schemars(length(min = 1, max = 64))]
+    pub part_id: String,
+    /// Content representation: `text` (extracted text, default) or `bytes` (base64 of decoded bytes)
+    #[serde(default = "default_attachment_content_mode")]
+    pub mode: AttachmentContentMode,
+    /// Text mode only: maximum characters (1..64000, default 10000)
+    #[schemars(range(min = 1, max = 64_000), transform = remove_format)]
+    pub max_chars: Option<usize>,
+    /// Bytes mode only: first decoded byte to return (default 0)
+    #[schemars(transform = remove_format)]
+    pub offset_bytes: Option<usize>,
+    /// Bytes mode only: maximum decoded bytes (1..64000, default 16000)
+    #[schemars(range(min = 1, max = 64_000), transform = remove_format)]
+    pub max_bytes: Option<usize>,
+}
+
+/// Attachment content in the representation that was requested.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "format", rename_all = "snake_case")]
+pub enum AttachmentContent {
+    /// Extracted text cut to the requested character limit.
+    Text {
+        /// Extracted text.
+        text: String,
+        /// True when the text was cut at `max_chars`; request a larger `max_chars` for more.
+        truncated: bool,
+    },
+    /// One page of decoded bytes as standard base64.
+    Base64 {
+        /// Base64 of the returned decoded bytes.
+        content_base64: String,
+        /// Decoded offset of the first returned byte.
+        offset_bytes: usize,
+        /// Number of decoded bytes returned in this page.
+        returned_bytes: usize,
+        /// True when more decoded bytes follow this page.
+        has_more: bool,
+    },
+}
+
+/// One completely decoded attachment with the requested content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AttachmentResult {
+    /// Filename if present in Content-Disposition or Content-Type
+    pub filename: Option<String>,
+    /// Lowercase MIME content type
+    pub content_type: String,
+    /// Complete decoded size in bytes
+    pub size_bytes: usize,
+    /// Requested content
+    pub content: AttachmentContent,
+}
+
 /// Default value for `account_id` field
 pub fn default_account_id() -> String {
     "default".to_owned()
@@ -400,7 +539,7 @@ fn default_true() -> bool {
 
 /// Default value for mailbox-list page size.
 fn default_mailbox_limit() -> usize {
-    100
+    50
 }
 
 /// Default value for `limit` in search
@@ -421,6 +560,11 @@ fn default_body_max_chars() -> usize {
 
 fn default_body_mode() -> BodyMode {
     BodyMode::Text
+}
+
+/// Default content representation of `imap_get_attachment`.
+fn default_attachment_content_mode() -> AttachmentContentMode {
+    AttachmentContentMode::Text
 }
 
 fn default_attachment_mode() -> AttachmentMode {
@@ -446,13 +590,6 @@ fn mailbox_action_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema 
     schemars::json_schema!({
         "type": "string",
         "enum": ["create", "rename", "delete"]
-    })
-}
-
-fn flag_operation_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    schemars::json_schema!({
-        "type": "string",
-        "enum": ["add", "remove", "replace"]
     })
 }
 
@@ -533,9 +670,11 @@ mod tests {
     use serde_json::{Map, Value};
 
     use super::{
-        ApplyToMessagesInput, GetMessageInput, GetMessageRawInput, GetOperationInput,
-        ListMailboxesInput, MailboxInfo, ManageMailboxInput, OperationIdInput, SearchMessagesInput,
-        UpdateMessageFlagsInput, validate_client_safe_input_schema,
+        ApplyToMessagesInput, AttachmentContent, AttachmentContentMode, AttachmentResult,
+        GetAttachmentInput, GetMessageInput, GetMessageRawInput, GetOperationInput,
+        ListMailboxesInput, MailboxInfo, ManageMailboxInput, MessageDetail, MessageSummary,
+        OperationIdInput, SearchMessagesInput, UpdateMessageFlagsInput, UpdateMessageLabelsInput,
+        validate_client_safe_input_schema,
     };
 
     #[test]
@@ -547,9 +686,11 @@ mod tests {
             schema_for_type::<GetMessageRawInput>(),
             schema_for_type::<ApplyToMessagesInput>(),
             schema_for_type::<UpdateMessageFlagsInput>(),
+            schema_for_type::<UpdateMessageLabelsInput>(),
             schema_for_type::<ManageMailboxInput>(),
             schema_for_type::<GetOperationInput>(),
             schema_for_type::<OperationIdInput>(),
+            schema_for_type::<GetAttachmentInput>(),
         ] {
             assert_no_nonstandard_integer_formats(&Value::Object((*schema).clone()));
         }
@@ -583,7 +724,7 @@ mod tests {
             schema_variant_for(properties, "limit")
                 .and_then(|value| value.get("default"))
                 .and_then(Value::as_u64),
-            Some(100)
+            Some(50)
         );
 
         let mailbox_schema = schema_for_type::<MailboxInfo>();
@@ -604,6 +745,8 @@ mod tests {
                 "provider_managed",
                 "role",
                 "selectable",
+                "total_messages",
+                "unread_messages",
             ]
         );
         assert_eq!(
@@ -672,7 +815,8 @@ mod tests {
     fn list_mailboxes_input_defaults_page_size() {
         let input: ListMailboxesInput =
             serde_json::from_str(r#"{"account_id":"default"}"#).expect("input must deserialize");
-        assert_eq!(input.limit, 100);
+        assert_eq!(input.limit, 50);
+        assert!(!input.include_counts);
         assert!(input.cursor.is_none());
     }
 
@@ -704,17 +848,107 @@ mod tests {
             Some(365)
         );
         assert_eq!(
-            schema_numeric_property(properties, "snippet_max_chars", "minimum"),
+            schema_numeric_property(properties, "preview_max_chars", "minimum"),
             Some(50)
         );
         assert_eq!(
-            schema_numeric_property(properties, "snippet_max_chars", "maximum"),
+            schema_numeric_property(properties, "preview_max_chars", "maximum"),
             Some(500)
         );
         assert_eq!(
             schema_string_property(properties, "start_date", "pattern"),
             Some("^\\d{4}-\\d{2}-\\d{2}$")
         );
+        assert!(!properties.contains_key("mailbox"));
+        assert!(!properties.contains_key("snippet_max_chars"));
+        assert!(schema_required_properties(&schema).contains(&"mailboxes"));
+
+        let mailboxes = schema_variant_for(properties, "mailboxes").expect("mailboxes schema");
+        assert_eq!(mailboxes["minItems"], 1);
+        assert_eq!(mailboxes["maxItems"], 10);
+        assert_eq!(mailboxes["items"]["minLength"], 1);
+        assert_eq!(mailboxes["items"]["maxLength"], 256);
+        for property in ["message_id_header", "gmail_query"] {
+            assert_eq!(
+                schema_numeric_property(properties, property, "maxLength"),
+                Some(256),
+                "{property} bound"
+            );
+        }
+        assert_eq!(
+            schema_numeric_property(properties, "keyword", "maxLength"),
+            Some(64)
+        );
+        for property in ["flagged", "answered", "thread_of_message_id"] {
+            assert!(properties.contains_key(property), "{property} missing");
+            assert!(
+                !schema_required_properties(&schema).contains(&property),
+                "{property} must stay optional"
+            );
+        }
+    }
+
+    #[test]
+    fn search_input_requires_mailboxes_and_rejects_the_old_mailbox_field() {
+        let input: SearchMessagesInput = serde_json::from_str(r#"{"mailboxes":["INBOX","Sent"]}"#)
+            .expect("mailboxes input must deserialize");
+        assert_eq!(input.mailboxes, ["INBOX", "Sent"]);
+        assert_eq!(input.limit, 10);
+        assert!(input.preview_max_chars.is_none());
+        serde_json::from_str::<SearchMessagesInput>(r#"{"mailbox":"INBOX"}"#)
+            .expect_err("the single mailbox field was replaced");
+    }
+
+    #[test]
+    fn message_outputs_publish_decimal_string_gmail_ids_and_preview() {
+        for (schema, expect_preview) in [
+            (schema_for_type::<MessageSummary>(), true),
+            (schema_for_type::<MessageDetail>(), false),
+        ] {
+            let properties = schema["properties"]
+                .as_object()
+                .expect("output schema must expose properties");
+            assert_eq!(properties.contains_key("preview"), expect_preview);
+            assert!(!properties.contains_key("snippet"));
+            for property in ["gmail_message_id", "gmail_thread_id"] {
+                assert_eq!(
+                    schema_string_property(properties, property, "type"),
+                    None,
+                    "{property} is a nullable type array"
+                );
+                assert!(
+                    properties[property]["type"]
+                        .as_array()
+                        .is_some_and(|types| types.iter().any(|ty| ty == "string")),
+                    "{property} must be a nullable string"
+                );
+            }
+            assert!(properties.contains_key("gmail_labels"));
+        }
+    }
+
+    #[test]
+    fn gmail_ids_above_two_pow_53_serialize_as_exact_decimal_strings() {
+        let id = (1u64 << 53) + 1;
+        let summary = MessageSummary {
+            message_id: "imap:default:INBOX:1:2".to_owned(),
+            message_uri: String::new(),
+            message_raw_uri: String::new(),
+            mailbox: "INBOX".to_owned(),
+            uidvalidity: 1,
+            uid: 2,
+            date: None,
+            from: None,
+            subject: None,
+            flags: None,
+            preview: None,
+            gmail_labels: None,
+            gmail_message_id: Some(id.to_string()),
+            gmail_thread_id: Some(u64::MAX.to_string()),
+        };
+        let value = serde_json::to_value(&summary).expect("serialize summary");
+        assert_eq!(value["gmail_message_id"], "9007199254740993");
+        assert_eq!(value["gmail_thread_id"], "18446744073709551615");
     }
 
     #[test]
@@ -795,6 +1029,27 @@ mod tests {
             "update_message_flags schema must not publish dry_run"
         );
 
+        let label_schema = schema_for_type::<UpdateMessageLabelsInput>();
+        let label_props = label_schema["properties"]
+            .as_object()
+            .expect("update_message_labels schema must expose properties");
+        assert_eq!(
+            schema_numeric_property(label_props, "message_ids", "minItems"),
+            Some(1)
+        );
+        assert_eq!(
+            schema_numeric_property(label_props, "message_ids", "maxItems"),
+            Some(250)
+        );
+        assert_eq!(
+            schema_numeric_property(label_props, "labels", "minItems"),
+            Some(0)
+        );
+        assert_eq!(
+            schema_numeric_property(label_props, "labels", "maxItems"),
+            Some(32)
+        );
+
         let get_operation_schema = schema_for_type::<GetOperationInput>();
         let get_operation_props = get_operation_schema["properties"]
             .as_object()
@@ -807,13 +1062,126 @@ mod tests {
     }
 
     #[test]
+    fn list_mailboxes_input_publishes_include_counts_and_count_fields() {
+        let schema = schema_for_type::<ListMailboxesInput>();
+        let properties = schema["properties"].as_object().expect("input properties");
+        assert_eq!(
+            schema_string_property(properties, "include_counts", "type"),
+            Some("boolean")
+        );
+        assert!(
+            !schema_required_properties(&schema).contains(&"include_counts"),
+            "include_counts must remain optional"
+        );
+        let input: ListMailboxesInput =
+            serde_json::from_str(r#"{"include_counts":true}"#).expect("input must deserialize");
+        assert!(input.include_counts);
+        assert_eq!(input.limit, 50);
+    }
+
+    #[test]
+    fn mailbox_counts_are_skipped_when_unknown_and_kept_when_zero() {
+        let mailbox = |total_messages, unread_messages| MailboxInfo {
+            name: "INBOX".to_owned(),
+            delimiter: None,
+            attributes: Vec::new(),
+            role: None,
+            selectable: true,
+            provider_managed: false,
+            total_messages,
+            unread_messages,
+        };
+        let unknown = serde_json::to_value(mailbox(None, None)).expect("serialize");
+        assert!(unknown.get("total_messages").is_none());
+        assert!(unknown.get("unread_messages").is_none());
+        let zero = serde_json::to_value(mailbox(Some(0), Some(0))).expect("serialize");
+        assert_eq!(zero["total_messages"], 0);
+        assert_eq!(zero["unread_messages"], 0);
+    }
+
+    #[test]
+    fn get_attachment_input_schema_publishes_modes_and_bounds() {
+        let schema = schema_for_type::<GetAttachmentInput>();
+        let properties = schema["properties"].as_object().expect("input properties");
+        for field in [
+            "message_id",
+            "part_id",
+            "mode",
+            "max_chars",
+            "offset_bytes",
+            "max_bytes",
+        ] {
+            assert!(properties.contains_key(field), "{field} missing");
+        }
+        let mut required = schema_required_properties(&schema);
+        required.sort_unstable();
+        assert_eq!(required, ["message_id", "part_id"]);
+        assert_eq!(
+            schema_numeric_property(properties, "part_id", "maxLength"),
+            Some(64)
+        );
+        assert_eq!(
+            schema_numeric_property(properties, "max_chars", "minimum"),
+            Some(1)
+        );
+        assert_eq!(
+            schema_numeric_property(properties, "max_chars", "maximum"),
+            Some(64_000)
+        );
+        assert_eq!(
+            schema_numeric_property(properties, "max_bytes", "minimum"),
+            Some(1)
+        );
+        assert_eq!(
+            schema_numeric_property(properties, "max_bytes", "maximum"),
+            Some(64_000)
+        );
+        let mode: GetAttachmentInput = serde_json::from_str(r#"{"message_id":"m","part_id":"1"}"#)
+            .expect("input must deserialize");
+        assert_eq!(mode.mode, AttachmentContentMode::Text);
+        let bytes: GetAttachmentInput =
+            serde_json::from_str(r#"{"message_id":"m","part_id":"1.2","mode":"bytes"}"#)
+                .expect("bytes mode must deserialize");
+        assert_eq!(bytes.mode, AttachmentContentMode::Bytes);
+    }
+
+    #[test]
+    fn attachment_content_serializes_with_a_format_tag() {
+        let text = AttachmentResult {
+            filename: Some("a.csv".to_owned()),
+            content_type: "text/csv".to_owned(),
+            size_bytes: 3,
+            content: AttachmentContent::Text {
+                text: "a,b".to_owned(),
+                truncated: false,
+            },
+        };
+        let value = serde_json::to_value(&text).expect("serialize");
+        assert_eq!(value["content"]["format"], "text");
+        assert_eq!(value["content"]["text"], "a,b");
+        let base64 = AttachmentContent::Base64 {
+            content_base64: "AAE=".to_owned(),
+            offset_bytes: 4,
+            returned_bytes: 2,
+            has_more: true,
+        };
+        let value = serde_json::to_value(&base64).expect("serialize");
+        assert_eq!(value["format"], "base64");
+        assert_eq!(value["offset_bytes"], 4);
+        assert_eq!(value["returned_bytes"], 2);
+        assert_eq!(value["has_more"], true);
+    }
+
+    #[test]
     fn formerly_broken_write_tool_model_schemas_are_client_safe() {
         for schema in [
             schema_for_type::<ApplyToMessagesInput>(),
             schema_for_type::<UpdateMessageFlagsInput>(),
+            schema_for_type::<UpdateMessageLabelsInput>(),
             schema_for_type::<ManageMailboxInput>(),
             schema_for_type::<GetOperationInput>(),
             schema_for_type::<OperationIdInput>(),
+            schema_for_type::<GetAttachmentInput>(),
         ] {
             validate_client_safe_input_schema(&Value::Object((*schema).clone()))
                 .expect("write tool input schema must be client-safe");

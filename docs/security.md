@@ -79,7 +79,18 @@ MAIL_IMAP_WRITE_ENABLED=true
 When `MAIL_IMAP_WRITE_ENABLED=false`, these tools return errors:
 - `imap_apply_to_messages` - Bulk message mutation
 - `imap_update_message_flags` - Bulk message flag updates
+- `imap_update_message_labels` - Bulk Gmail label updates
 - `imap_manage_mailbox` - Mailbox lifecycle operations
+
+### Server Capability Requirements
+
+- `imap_apply_to_messages` delete requires `UIDPLUS`.
+- `imap_apply_to_messages` move requires native `MOVE` or `UIDPLUS`.
+- `imap_apply_to_messages` copy requires neither capability.
+- `imap_update_message_labels` requires `X-GM-EXT-1`.
+- The server checks these capabilities in preflight and again on the execution session before mutation.
+- The server never replaces delete with plain `EXPUNGE` or a Trash move.
+- After a sent write with an unknown outcome, the result is `partial` with a non-retryable issue. Check the mailbox before another write.
 
 ## Output Bounding
 
@@ -118,6 +129,39 @@ All potentially large outputs are bounded to prevent resource exhaustion.
 }
 ```
 
+### Search Previews
+
+```json
+{
+  "preview_max_chars": 120  // Range: 50..500; omitted by default
+}
+```
+
+Previews are whitespace-normalized and truncated to the requested Unicode-character count. The server requests at most `min(32768, MAIL_IMAP_MESSAGE_FETCH_BUDGET_BYTES)` message bytes per mailbox group. A missing or oversized body keeps the header summary and adds an issue.
+
+### Attachment Content
+
+```json
+{
+  "mode": "text",
+  "max_chars": 10000  // Range: 1..64000, default: 10000
+}
+```
+
+```json
+{
+  "mode": "bytes",
+  "offset_bytes": 0,
+  "max_bytes": 16000  // Range: 1..64000, default: 16000
+}
+```
+
+- Text mode accepts only `max_chars`.
+- Bytes mode accepts only `offset_bytes` and `max_bytes`.
+- Incomplete or zero-budget content returns `limit_exceeded` with no attachment payload.
+- Only a complete decoded attachment can report `size_bytes` or byte pagination.
+- Unsupported text types return a structured issue and an explicit bytes-mode next action.
+
 ### Attachment Size Limits
 
 PDF text extraction is limited to attachments ≤ 5MB. Larger attachments are skipped but do not fail the tool call.
@@ -128,25 +172,35 @@ All inputs are validated before IMAP operations:
 
 ### Length Bounds
 
-- `query`, `from`, `to`, `subject`: 1..256 characters
+- `query`, `from`, `to`, `subject`, `message_id_header`, `gmail_query`: 1..256 characters
 - `account_id`: 1..64 characters, pattern `^[A-Za-z0-9_-]+$`
 - `mailbox`: 1..256 characters
-- `limit`: 1..100 messages
+- search `mailboxes`: 1..10 distinct names
+- search `limit`: 1..100 messages
+- mailbox-list `limit`: 1..200 without counts, 1..50 with counts
+- `preview_max_chars`: 50..500
+- `keyword`: 1..64 characters, a custom IMAP atom without a leading backslash
+- `part_id`: 1..64 characters
+- Gmail labels: 1..256 characters each, 0..32 labels per update
+- message ids per write: 1..250
+- flags per update: 1..32
 
 ### Content Sanitization
 
 - Search text fields must not contain ASCII control characters
 - Mailbox names must not contain ASCII control characters
+- Gmail labels must not contain ASCII control characters
+- Search keywords must not contain spaces, quotes, brackets, or wildcards
 
 ### Search Result Limits
 
-Searches matching more than 1,000 messages are rejected:
+Searches matching more than 1,000 combined messages across all requested mailboxes are rejected:
 
 ```
-Error: invalid input: search matched 25000 messages; narrow filters to at most 1000 results
+Error: invalid input: search matched 25000 messages so far across the requested mailboxes; narrow filters or mailboxes to at most 1000 results
 ```
 
-Resolution: Add tighter filters (`last_days`, `from`, `subject`, date ranges).
+Resolution: Add tighter filters (`last_days`, `from`, `subject`, date ranges) or remove mailboxes.
 
 ## Timeout Protection
 

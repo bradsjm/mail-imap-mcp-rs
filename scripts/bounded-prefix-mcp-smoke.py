@@ -69,6 +69,8 @@ def reject_forbidden(command):
     upper = command.upper()
     if "BODYSTRUCTURE" in upper:
         raise RuntimeError(f"forbidden BODYSTRUCTURE request: {command}")
+    if "X-GM-" in upper:
+        raise RuntimeError(f"Gmail metadata requested from a non-Gmail peer: {command}")
     if "BODY[" in upper or "BODY.PEEK[" in upper:
         expected = "UID FETCH 42 BODY.PEEK[]<0.256>"
         if upper != expected:
@@ -100,7 +102,8 @@ def serve_imap(listener, context, failures, completed):
                 "EXAMINE INBOX",
                 "UID FETCH 42 (UID RFC822.SIZE)",
                 "UID FETCH 42 BODY.PEEK[]<0.256>",
-                "UID FETCH 42 FLAGS",
+                "CAPABILITY",
+                "UID FETCH 42 (UID FLAGS)",
             )
             while True:
                 item = read_command(stream)
@@ -138,6 +141,10 @@ def serve_imap(listener, context, failures, completed):
                     send_line(stream, f"{tag} OK UID FETCH completed")
                     stage += 1
                 elif stage == 5 and upper == expected[5]:
+                    send_line(stream, "* CAPABILITY IMAP4rev1 UIDPLUS MOVE")
+                    send_line(stream, f"{tag} OK CAPABILITY completed")
+                    stage += 1
+                elif stage == 6 and upper == expected[6]:
                     send_line(stream, "* 1 FETCH (UID 42 FLAGS ())")
                     send_line(stream, f"{tag} OK UID FETCH completed")
                     stage += 1

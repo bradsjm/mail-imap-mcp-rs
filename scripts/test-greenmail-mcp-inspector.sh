@@ -519,20 +519,24 @@ wait_for_terminal_operation_json() {
 echo "Checking MCP tool discovery and parameter contracts"
 TOOLS_JSON=$(run_inspector --method tools/list)
 assert_json "all expected tools are listed" "$TOOLS_JSON" '
-  .tools | map(.name) as $names
+  (.tools | length) == 12
+  and (.tools | map(.name) as $names
   | [
       "imap_list_accounts",
       "imap_list_mailboxes",
       "imap_search_messages",
       "imap_get_message",
       "imap_get_message_raw",
+      "imap_get_attachment",
       "imap_apply_to_messages",
       "imap_update_message_flags",
+      "imap_update_message_labels",
       "imap_manage_mailbox",
       "imap_get_operation",
       "imap_cancel_operation"
     ]
   | all(. as $tool | ($names | index($tool) != null))
+  )
 '
 assert_json "all published input schemas remain client-safe" "$TOOLS_JSON" '
   def unsafe_node:
@@ -555,6 +559,12 @@ assert_json "all published input schemas remain client-safe" "$TOOLS_JSON" '
   and (([.tools[] | .inputSchema | unsafe_node] | length) == 0)
 '
 
+assert_json "all tools publish object output schemas" "$TOOLS_JSON" '
+  .tools | all(
+    .outputSchema.type == "object"
+    and (.outputSchema.properties | type) == "object"
+  )
+'
 assert_tool_schema "imap_list_accounts" "no-input contract" '
   .tools[] | select(.name == $name) | .inputSchema as $schema
   | ($schema.type == "object")
@@ -576,27 +586,56 @@ assert_tool_schema "imap_list_mailboxes" "pagination parameter contract" '
       end
     )
     and ((($schema.required // []) | index("cursor")) == null)
+    and (($schema.properties | has("include_counts")))
+    and ($schema.properties.include_counts.type == "boolean")
+    and ((($schema.required // []) | index("include_counts")) == null)
     and (($schema.properties | has("limit")))
     and ($schema.properties.limit.type == "integer")
     and ($schema.properties.limit.minimum == 1)
     and ($schema.properties.limit.maximum == 200)
-    and ($schema.properties.limit.default == 100)
+    and ($schema.properties.limit.default == 50)
     and ((($schema.required // []) | index("limit")) == null)
 '
 assert_tool_schema "imap_search_messages" "search parameter contract" '
-  def has_type($schema; $type):
-    ($schema.type == $type) or ((($schema.type | type) == "array") and (($schema.type | index($type)) != null));
+  def has_type($schema; $wanted):
+    ($schema.type == $wanted) or ((($schema.type | type) == "array") and (($schema.type | index($wanted)) != null));
   .tools[] | select(.name == $name) | .inputSchema as $schema
   | ($schema.type == "object")
-    and (($schema.required // []) | index("mailbox") != null)
+    and (($schema.required // []) | index("mailboxes") != null)
+    and (($schema.required // []) | index("mailbox") == null)
     and (($schema.properties | has("account_id")))
-    and (($schema.properties | has("mailbox")))
+    and (($schema.properties | has("mailboxes")))
+    and ($schema.properties.mailboxes.type == "array")
+    and ($schema.properties.mailboxes.minItems == 1)
+    and ($schema.properties.mailboxes.maxItems == 10)
+    and ($schema.properties.mailboxes.items.type == "string")
+    and ($schema.properties.mailboxes.items.minLength == 1)
+    and ($schema.properties.mailboxes.items.maxLength == 256)
+    and (($schema.properties | has("mailbox") | not))
     and (($schema.properties | has("cursor")))
     and (($schema.properties | has("query")))
     and (($schema.properties | has("from")))
     and (($schema.properties | has("to")))
     and (($schema.properties | has("subject")))
     and (($schema.properties | has("unread_only")))
+    and (($schema.properties | has("flagged")))
+    and has_type($schema.properties.flagged; "boolean")
+    and (($schema.properties | has("answered")))
+    and has_type($schema.properties.answered; "boolean")
+    and (($schema.properties | has("keyword")))
+    and has_type($schema.properties.keyword; "string")
+    and ($schema.properties.keyword.minLength == 1)
+    and ($schema.properties.keyword.maxLength == 64)
+    and (($schema.properties | has("message_id_header")))
+    and has_type($schema.properties.message_id_header; "string")
+    and ($schema.properties.message_id_header.minLength == 1)
+    and ($schema.properties.message_id_header.maxLength == 256)
+    and (($schema.properties | has("gmail_query")))
+    and has_type($schema.properties.gmail_query; "string")
+    and ($schema.properties.gmail_query.minLength == 1)
+    and ($schema.properties.gmail_query.maxLength == 256)
+    and (($schema.properties | has("thread_of_message_id")))
+    and has_type($schema.properties.thread_of_message_id; "string")
     and (($schema.properties | has("last_days")))
     and ($schema.properties.last_days.minimum == 1)
     and ($schema.properties.last_days.maximum == 365)
@@ -607,10 +646,30 @@ assert_tool_schema "imap_search_messages" "search parameter contract" '
     and has_type($schema.properties.limit; "integer")
     and ($schema.properties.limit.minimum == 1)
     and ($schema.properties.limit.maximum == 100)
-    and (($schema.properties | has("snippet_max_chars")))
-    and ($schema.properties.snippet_max_chars.minimum == 50)
-    and ($schema.properties.snippet_max_chars.maximum == 500)
-    and (($schema.properties | has("include_snippet") | not))
+    and (($schema.properties | has("preview_max_chars")))
+    and ($schema.properties.preview_max_chars.minimum == 50)
+    and ($schema.properties.preview_max_chars.maximum == 500)
+    and (($schema.properties | keys) == [
+      "account_id",
+      "answered",
+      "cursor",
+      "end_date",
+      "flagged",
+      "from",
+      "gmail_query",
+      "keyword",
+      "last_days",
+      "limit",
+      "mailboxes",
+      "message_id_header",
+      "preview_max_chars",
+      "query",
+      "start_date",
+      "subject",
+      "thread_of_message_id",
+      "to",
+      "unread_only"
+    ])
 '
 assert_tool_schema "imap_get_message" "get_message parameter contract" '
   .tools[] | select(.name == $name) | .inputSchema as $schema
@@ -642,6 +701,32 @@ assert_tool_schema "imap_get_message_raw" "get_message_raw parameter contract" '
     and ($schema.properties.max_bytes.maximum == 64000)
     and (($schema.properties | has("offset_bytes")))
 '
+assert_tool_schema "imap_get_attachment" "get_attachment parameter contract" '
+  def resolved($root; $node):
+    if (($node | type) == "object") and ($node | has("$ref"))
+    then $root | getpath(($node["$ref"] | ltrimstr("#/") | split("/")))
+    else $node
+    end;
+  .tools[] | select(.name == $name) | .inputSchema as $schema
+  | ($schema.type == "object")
+    and (($schema.required // []) | index("message_id") != null)
+    and (($schema.required // []) | index("part_id") != null)
+    and (($schema.properties | has("account_id") | not))
+    and (($schema.properties | has("message_id")))
+    and (($schema.properties | has("part_id")))
+    and ($schema.properties.part_id.type == "string")
+    and ($schema.properties.part_id.minLength == 1)
+    and ($schema.properties.part_id.maxLength == 64)
+    and (($schema.properties | has("mode")))
+    and (resolved($schema; $schema.properties.mode).enum == ["text", "bytes"])
+    and (($schema.properties | has("max_chars")))
+    and ($schema.properties.max_chars.minimum == 1)
+    and ($schema.properties.max_chars.maximum == 64000)
+    and (($schema.properties | has("offset_bytes")))
+    and (($schema.properties | has("max_bytes")))
+    and ($schema.properties.max_bytes.minimum == 1)
+    and ($schema.properties.max_bytes.maximum == 64000)
+'
 assert_tool_schema "imap_apply_to_messages" "apply_to_messages parameter contract" '
   .tools[] | select(.name == $name) | .inputSchema as $schema
   | ($schema.type == "object")
@@ -658,6 +743,11 @@ assert_tool_schema "imap_apply_to_messages" "apply_to_messages parameter contrac
     and (($schema.properties | has("dry_run") | not))
 '
 assert_tool_schema "imap_update_message_flags" "update_message_flags parameter contract" '
+  def resolved($root; $node):
+    if (($node | type) == "object") and ($node | has("$ref"))
+    then $root | getpath(($node["$ref"] | ltrimstr("#/") | split("/")))
+    else $node
+    end;
   .tools[] | select(.name == $name) | .inputSchema as $schema
   | ($schema.type == "object")
     and (($schema.required // []) | index("message_ids") != null)
@@ -669,11 +759,37 @@ assert_tool_schema "imap_update_message_flags" "update_message_flags parameter c
     and ($schema.properties.message_ids.maxItems == 250)
     and ($schema.properties.message_ids.items.type == "string")
     and (($schema.properties | has("operation")))
-    and ($schema.properties.operation.enum == ["add", "remove", "replace"])
+    and (resolved($schema; $schema.properties.operation).enum == ["add", "remove", "replace"])
     and (($schema.properties | has("flags")))
     and ($schema.properties.flags.minItems == 1)
     and ($schema.properties.flags.maxItems == 32)
     and ($schema.properties.flags.items.type == "string")
+    and (($schema.properties | has("dry_run") | not))
+'
+assert_tool_schema "imap_update_message_labels" "update_message_labels parameter contract" '
+  def resolved($root; $node):
+    if (($node | type) == "object") and ($node | has("$ref"))
+    then $root | getpath(($node["$ref"] | ltrimstr("#/") | split("/")))
+    else $node
+    end;
+  .tools[] | select(.name == $name) | .inputSchema as $schema
+  | ($schema.type == "object")
+    and (($schema.required // []) | index("message_ids") != null)
+    and (($schema.required // []) | index("operation") != null)
+    and (($schema.required // []) | index("labels") != null)
+    and (($schema.properties | has("account_id") | not))
+    and (($schema.properties | has("message_ids")))
+    and ($schema.properties.message_ids.minItems == 1)
+    and ($schema.properties.message_ids.maxItems == 250)
+    and ($schema.properties.message_ids.items.type == "string")
+    and (($schema.properties | has("operation")))
+    and (resolved($schema; $schema.properties.operation).enum == ["add", "remove", "replace"])
+    and (($schema.properties | has("labels")))
+    and ((($schema.properties.labels.minItems == null) or ($schema.properties.labels.minItems == 0)))
+    and ($schema.properties.labels.maxItems == 32)
+    and ($schema.properties.labels.items.type == "string")
+    and ((($schema.properties.labels.items.minLength == null) or ($schema.properties.labels.items.minLength == 1)))
+    and ((($schema.properties.labels.items.maxLength == null) or ($schema.properties.labels.items.maxLength == 256)))
     and (($schema.properties | has("dry_run") | not))
 '
 assert_tool_schema "imap_manage_mailbox" "manage_mailbox parameter contract" '
@@ -756,7 +872,9 @@ assert_json "imap_list_mailboxes first page output contract" "$MAILBOXES_JSON" '
     and (.attributes | all(type == "string"))
     and ((.role == null) or (.role == "inbox") or (.role == "all") or (.role == "archive") or (.role == "drafts") or (.role == "flagged") or (.role == "important") or (.role == "junk") or (.role == "sent") or (.role == "trash"))
     and ((.selectable | type) == "boolean")
-    and ((.provider_managed | type) == "boolean");
+    and ((.provider_managed | type) == "boolean")
+    and (.total_messages == null)
+    and (.unread_messages == null);
   (.structuredContent.data // .data) as $data
   | envelope_ok
     and ($data.status == "ok")
@@ -778,6 +896,7 @@ assert_json "imap_list_mailboxes first page output contract" "$MAILBOXES_JSON" '
     and ($data.next_action.arguments.account_id == "default")
     and ($data.next_action.arguments.cursor == $data.next_cursor)
     and ($data.next_action.arguments.limit == 1)
+    and (($data.next_action.arguments | has("include_counts")) | not)
 '
 MAILBOX_CURSOR=$(printf '%s\n' "$MAILBOXES_JSON" | jq -r '(.structuredContent.data // .data).next_cursor // empty')
 FIRST_MAILBOX_NAME=$(printf '%s\n' "$MAILBOXES_JSON" | jq -r '(.structuredContent.data // .data).mailboxes[0].name // empty')
@@ -796,7 +915,9 @@ assert_json "imap_list_mailboxes second page output contract" "$MAILBOXES_SECOND
     and (.attributes | all(type == "string"))
     and ((.role == null) or (.role == "inbox") or (.role == "all") or (.role == "archive") or (.role == "drafts") or (.role == "flagged") or (.role == "important") or (.role == "junk") or (.role == "sent") or (.role == "trash"))
     and ((.selectable | type) == "boolean")
-    and ((.provider_managed | type) == "boolean");
+    and ((.provider_managed | type) == "boolean")
+    and (.total_messages == null)
+    and (.unread_messages == null);
   (.structuredContent.data // .data) as $data
   | envelope_ok
     and ($data.status == "ok")
@@ -814,14 +935,43 @@ assert_json "imap_list_mailboxes second page output contract" "$MAILBOXES_SECOND
     and ($data.mailboxes[0].name != $first_name)
 ' --arg first_name "$FIRST_MAILBOX_NAME"
 
+echo "Checking imap_list_mailboxes count mode"
+MAILBOX_COUNTS_JSON=$(run_inspector \
+  --method tools/call \
+  --tool-name imap_list_mailboxes \
+  --tool-arg account_id=default \
+  --tool-arg include_counts=true \
+  --tool-arg limit=1)
+assert_json "imap_list_mailboxes count mode output contract" "$MAILBOX_COUNTS_JSON" '
+  def envelope_ok:
+    (.isError != true)
+    and ((.structuredContent.summary // .summary) | type == "string")
+    and (((.structuredContent.meta // .meta).now_utc | type) == "string")
+    and (((.structuredContent.meta // .meta).duration_ms | type) == "number");
+  (.structuredContent.data // .data) as $data
+  | envelope_ok
+    and (($data.status == "ok") or ($data.status == "partial"))
+    and (($data.issues | type) == "array")
+    and ($data.account_id == "default")
+    and (($data.mailboxes | type) == "array")
+    and (($data.mailboxes | length) == 1)
+    and (($data.returned | type) == "number")
+    and ($data.returned == 1)
+    and (($data.mailboxes[0].total_messages == null) or (($data.mailboxes[0].total_messages | type) == "number"))
+    and (($data.mailboxes[0].unread_messages == null) or (($data.mailboxes[0].unread_messages | type) == "number"))
+    and (($data.has_more != true) or ($data.next_action.arguments.include_counts == true))
+'
+
 echo "Checking imap_search_messages output contract"
 SEARCH_JSON=$(run_inspector \
   --method tools/call \
   --tool-name imap_search_messages \
   --tool-arg account_id=default \
-  --tool-arg mailbox=INBOX \
-  --tool-arg limit=2 \
-  --tool-arg snippet_max_chars=120)
+  --tool-arg 'mailboxes=["INBOX"]' \
+  --tool-arg limit=2)
+# GreenMail 2.1.8 answers partial body fetches with the non-conforming `BODY[]<0>{N}` (no space
+# before the literal), which no RFC 3501 parser accepts. Previews are therefore not requested here;
+# the strict conforming peer in scripts/bounded-prefix-mcp-smoke.py covers bounded prefix fetches.
 assert_json "imap_search_messages first page output contract" "$SEARCH_JSON" '
   def envelope_ok:
     (.isError != true)
@@ -835,22 +985,24 @@ assert_json "imap_search_messages first page output contract" "$SEARCH_JSON" '
     and (($data.next_action.instruction | type) == "string")
     and ($data.next_action.tool == "imap_search_messages")
     and ($data.account_id == "default")
-    and ($data.mailbox == "INBOX")
+    and ($data.mailboxes == ["INBOX"])
     and (($data.total | type) == "number")
     and (($data.attempted | type) == "number")
     and (($data.returned | type) == "number")
     and (($data.failed | type) == "number")
+    and ($data.thread_method == null)
+    and ($data.thread_possibly_incomplete == false)
     and (($data.messages | type) == "array")
     and (($data.messages | length) == $data.returned)
     and (($data.messages | length) == 2)
     and ($data.has_more == true)
     and (($data.next_cursor | type) == "string")
     and ($data.next_action.arguments.account_id == "default")
-    and ($data.next_action.arguments.mailbox == "INBOX")
+    and ($data.next_action.arguments.mailboxes == ["INBOX"])
     and ($data.next_action.arguments.cursor == $data.next_cursor)
     and ($data.next_action.arguments.limit == 2)
-    and (($data.next_action.arguments | has("include_snippet") | not))
-    and (($data.next_action.arguments | has("snippet_max_chars") | not))
+    and (($data.next_action.arguments | has("mailbox") | not))
+    and (($data.next_action.arguments | keys) == ["account_id", "cursor", "limit", "mailboxes"])
     and (($data.messages[0].message_id | type) == "string")
     and (($data.messages[0].message_uri | type) == "string")
     and (($data.messages[0].message_raw_uri | type) == "string")
@@ -861,7 +1013,10 @@ assert_json "imap_search_messages first page output contract" "$SEARCH_JSON" '
     and (($data.messages[0].from | type) == "string")
     and (($data.messages[0].subject | type) == "string")
     and (($data.messages[0].flags | type) == "array")
-    and (($data.messages[0].snippet | type) == "string")
+    and ($data.messages[0].preview == null)
+    and ($data.messages[0].gmail_labels == null)
+    and ($data.messages[0].gmail_message_id == null)
+    and ($data.messages[0].gmail_thread_id == null)
 '
 
 MESSAGE_ID=$(printf '%s\n' "$SEARCH_JSON" | jq -r '(.structuredContent.data // .data).messages[0].message_id // empty')
@@ -904,6 +1059,10 @@ assert_json "imap_get_message conforming bounded raw prefix output contract" "$G
     and (($data.issues | type) == "array")
     and ($data.issues | any(.code == "limit_exceeded" and .stage == "fetch_budget"))
     and ($data.message.subject == "Build Alert")
+    and (($data.message.flags | type) == "array")
+    and ($data.message.gmail_labels == null)
+    and ($data.message.gmail_message_id == null)
+    and ($data.message.gmail_thread_id == null)
     and (($data.message.attachments | type) == "array")
     and ($data.message.attachments | all(.extracted_text == null))
     and ($data.message.attachments | any(
@@ -971,7 +1130,8 @@ assert_json "imap_apply_to_messages copy terminal result contract" "$APPLY_COPY_
     and ($result.action == "copy")
     and ($result.matched == 1)
     and ($result.attempted == 1)
-    and ((($result.succeeded + $result.failed) == 1))
+    and (($result.partial | type) == "number")
+    and ((($result.succeeded + $result.partial + $result.failed) == 1))
     and (($result.results | type) == "array")
     and (($result.results | length) == 1)
     and (($result.results[0].message_id | type) == "string")
@@ -979,24 +1139,27 @@ assert_json "imap_apply_to_messages copy terminal result contract" "$APPLY_COPY_
     and (($result.results[0].source_mailbox | type) == "string")
     and ($result.results[0].destination_mailbox == $mailbox)
     and (($result.results[0].flags == null) or (($result.results[0].flags | type) == "array"))
+    and ($result.results[0].labels == null)
+    and ((($result.results[0].new_message_id == null) or (($result.results[0].new_message_id | type) == "string")))
 ' --arg mailbox "$MAILBOX_COPY"
 
 COPIED_MESSAGE_SEARCH_JSON=$(run_inspector \
   --method tools/call \
   --tool-name imap_search_messages \
   --tool-arg account_id=default \
-  --tool-arg "mailbox=${MAILBOX_COPY}" \
+  --tool-arg "mailboxes=[\"${MAILBOX_COPY}\"]" \
   --tool-arg limit=1)
 assert_json "imap_search_messages follow-up next_action for single copied message" "$COPIED_MESSAGE_SEARCH_JSON" '
   (.structuredContent.data // .data) as $data
   | ($data.status == "ok")
+    and ($data.mailboxes == [$mailbox])
     and (($data.messages | type) == "array")
     and (($data.messages | length) == 1)
     and ($data.has_more == false)
     and ($data.next_action.tool == "imap_get_message")
     and ($data.next_action.arguments.message_id == $data.messages[0].message_id)
     and (($data.next_action.arguments | has("account_id")) | not)
-'
+' --arg mailbox "$MAILBOX_COPY"
 COPIED_MESSAGE_ID=$(printf '%s\n' "$COPIED_MESSAGE_SEARCH_JSON" | jq -r '(.structuredContent.data // .data).messages[0].message_id // empty')
 if [[ -z "$COPIED_MESSAGE_ID" ]]; then
   echo "Failed to capture copied message id from ${MAILBOX_COPY}" >&2
@@ -1018,12 +1181,15 @@ assert_json "imap_apply_to_messages delete terminal result contract" "$APPLY_DEL
     and ($result.action == "delete")
     and ($result.matched == 1)
     and ($result.attempted == 1)
-    and ((($result.succeeded + $result.failed) == 1))
+    and (($result.partial | type) == "number")
+    and ((($result.succeeded + $result.partial + $result.failed) == 1))
     and (($result.results | type) == "array")
     and (($result.results | length) == 1)
     and (($result.results[0].issues | type) == "array")
     and (($result.results[0].source_mailbox | type) == "string")
     and (($result.results[0].destination_mailbox == null) or ($result.results[0].destination_mailbox == ""))
+    and ($result.results[0].labels == null)
+    and ($result.results[0].new_message_id == null)
 '
 
 echo "Checking imap_update_message_flags output contracts"
@@ -1043,6 +1209,7 @@ assert_json "imap_update_message_flags terminal result contract" "$UPDATE_FLAGS_
     and ($result.matched == 1)
     and ($result.attempted == 1)
     and (($result.succeeded | type) == "number")
+    and (($result.partial | type) == "number")
     and (($result.failed | type) == "number")
     and (($result.results | type) == "array")
     and (($result.results | length) == 1)
@@ -1050,7 +1217,16 @@ assert_json "imap_update_message_flags terminal result contract" "$UPDATE_FLAGS_
     and (($result.results[0].issues | type) == "array")
     and (($result.results[0].source_mailbox | type) == "string")
     and (($result.results[0].flags == null) or (($result.results[0].flags | type) == "array"))
+    and ($result.results[0].labels == null)
 '
+
+echo "Checking imap_update_message_labels server requirement"
+expect_failure_with_text "Gmail labels require a server that advertises X-GM-EXT-1" \
+  --method tools/call \
+  --tool-name imap_update_message_labels \
+  --tool-arg "message_ids=[\"${MESSAGE_ID}\"]" \
+  --tool-arg operation=add \
+  --tool-arg 'labels=["Work"]'
 
 MANAGE_RENAME_JSON=$(run_inspector \
   --method tools/call \
@@ -1102,6 +1278,13 @@ expect_failure_with_text "write tools are disabled; set MAIL_IMAP_WRITE_ENABLED=
   --tool-arg "message_ids=[\"${MESSAGE_ID}\"]" \
   --tool-arg operation=add \
   --tool-arg 'flags=["\\Seen"]'
+
+expect_failure_with_text "write tools are disabled; set MAIL_IMAP_WRITE_ENABLED=true" \
+  --method tools/call \
+  --tool-name imap_update_message_labels \
+  --tool-arg "message_ids=[\"${MESSAGE_ID}\"]" \
+  --tool-arg operation=replace \
+  --tool-arg 'labels=[]'
 
 expect_failure_with_text "write tools are disabled; set MAIL_IMAP_WRITE_ENABLED=true" \
   --method tools/call \

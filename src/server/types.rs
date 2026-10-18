@@ -9,7 +9,10 @@ use tracing::{error, warn};
 
 use crate::errors::{AppError, AppResult};
 use crate::message_id::MessageId;
-use crate::models::{AccountInfo, MailboxInfo, MessageDetail, MessageSummary, Meta, ToolEnvelope};
+use crate::models::{
+    AccountInfo, AttachmentResult, MailboxInfo, MessageDetail, MessageSummary, Meta, SetOperation,
+    ThreadMethod, ToolEnvelope,
+};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 pub(super) struct ListAccountsData {
@@ -33,14 +36,23 @@ pub(super) struct ListMailboxesData {
     pub(super) truncated: bool,
 }
 
+/// Output of `imap_search_messages`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 pub(super) struct SearchResultData {
     pub(super) status: String,
     pub(super) issues: Vec<ToolIssue>,
     pub(super) next_action: NextAction,
     pub(super) account_id: String,
-    pub(super) mailbox: String,
-    pub(super) total: usize,
+    /// Searched mailboxes in request order, with canonical names.
+    pub(super) mailboxes: Vec<String>,
+    /// Combined match count across all mailboxes; absent when a mailbox search failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) total: Option<usize>,
+    /// Conversation discovery method when the search used `thread_of_message_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) thread_method: Option<ThreadMethod>,
+    /// True when conversation discovery used headers and may miss related messages.
+    pub(super) thread_possibly_incomplete: bool,
     pub(super) attempted: usize,
     pub(super) returned: usize,
     pub(super) failed: usize,
@@ -71,6 +83,27 @@ pub(super) struct GetMessageRawData {
     pub(super) truncated: bool,
     pub(super) raw_source_base64: Option<String>,
     pub(super) raw_source_encoding: Option<String>,
+}
+
+/// Output of `imap_get_attachment`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub(super) struct GetAttachmentData {
+    /// Outcome label: `ok`, `partial`, or `failed`.
+    pub(super) status: String,
+    /// Problems found while reading the attachment.
+    pub(super) issues: Vec<ToolIssue>,
+    /// Account that owns the message.
+    pub(super) account_id: String,
+    /// Stable identifier of the message that was read.
+    pub(super) message_id: String,
+    /// Part identifier of the requested attachment.
+    pub(super) part_id: String,
+    /// Attachment content; absent unless the attachment was read completely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) attachment: Option<AttachmentResult>,
+    /// Suggested follow-up call, such as the next byte page or bytes mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) next_action: Option<NextAction>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
@@ -115,18 +148,60 @@ impl ToolIssue {
         self
     }
 
+    /// Marks the issue as not retryable, as required when a sent write has an unknown outcome.
+    pub(super) fn non_retryable(mut self) -> Self {
+        self.retryable = false;
+        self
+    }
+
+    /// Appends a short explanation to the issue message.
+    pub(super) fn with_detail(mut self, detail: &str) -> Self {
+        self.message = format!("{}; {detail}", self.message);
+        self
+    }
+
     pub(super) fn with_message_id(mut self, message_id: &str) -> Self {
         self.message_id = Some(message_id.to_owned());
         self
     }
 }
 
-#[derive(Debug)]
+/// Summaries, issues, and counts built for one or more claimed mailbox slices.
+#[derive(Debug, Default)]
 pub(super) struct SummaryBuildResult {
     pub(super) messages: Vec<MessageSummary>,
     pub(super) issues: Vec<ToolIssue>,
     pub(super) attempted: usize,
     pub(super) failed: usize,
+    /// Whether an IMAP command failed, so the session must not be used again.
+    pub(super) command_failed: bool,
+}
+
+impl SummaryBuildResult {
+    /// Appends the outcome of another slice and keeps any command failure flag.
+    pub(super) fn merge(&mut self, other: Self) {
+        self.messages.extend(other.messages);
+        self.issues.extend(other.issues);
+        self.attempted += other.attempted;
+        self.failed += other.failed;
+        self.command_failed |= other.command_failed;
+    }
+
+    /// Counts a whole slice as attempted and failed, with one issue explaining why.
+    pub(super) fn fail_slice(&mut self, uid_count: usize, issue: ToolIssue) {
+        self.issues.push(issue);
+        self.attempted += uid_count;
+        self.failed += uid_count;
+    }
+}
+
+/// Conversation criterion that a new search adds to its ordinary filters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SearchThreadQuery {
+    /// Gmail conversation identifier searched with `X-GM-THRID`.
+    Gmail(u64),
+    /// Message-ID values searched in Message-ID, References, and In-Reply-To headers.
+    Headers(Vec<String>),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
@@ -137,6 +212,8 @@ pub(super) struct MessageMutationResult {
     pub(super) source_mailbox: String,
     pub(super) destination_mailbox: Option<String>,
     pub(super) flags: Option<Vec<String>>,
+    /// Gmail labels returned by the server after a label update.
+    pub(super) labels: Option<Vec<String>>,
     pub(super) new_message_id: Option<String>,
 }
 
@@ -150,6 +227,8 @@ pub(super) struct BulkMessageOperationData {
     pub(super) matched: usize,
     pub(super) attempted: usize,
     pub(super) succeeded: usize,
+    /// Number of messages whose operation was applied but not fully verified or identified.
+    pub(super) partial: usize,
     pub(super) failed: usize,
     pub(super) results: Vec<MessageMutationResult>,
 }
@@ -202,17 +281,32 @@ pub(super) enum MessageActionInput {
     Delete,
 }
 
+/// Property mutation applied to explicit messages; values are decoded text.
 #[derive(Debug, Clone)]
-pub(super) enum FlagOperation {
-    Add,
-    Remove,
-    Replace,
+pub(super) enum PropertyUpdate {
+    /// Change IMAP flags with the given mutation mode.
+    Flags {
+        /// Mutation mode.
+        operation: SetOperation,
+        /// Validated flag atoms.
+        flags: Vec<String>,
+    },
+    /// Change Gmail labels with the given mutation mode.
+    GmailLabels {
+        /// Mutation mode.
+        operation: SetOperation,
+        /// Validated, deduplicated label text.
+        labels: Vec<String>,
+    },
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct FlagUpdateRequest {
-    pub(super) operation: FlagOperation,
-    pub(super) flags: Vec<String>,
+impl PropertyUpdate {
+    /// Returns the mutation mode shared by both property kinds.
+    pub(super) fn operation(&self) -> SetOperation {
+        match self {
+            Self::Flags { operation, .. } | Self::GmailLabels { operation, .. } => *operation,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -322,7 +416,8 @@ pub(super) struct StoredOperation {
 #[derive(Debug, Clone)]
 pub(super) enum StoredOperationSpec {
     ApplyMessages(ApplyMessagesOperation),
-    UpdateFlags(UpdateFlagsOperation),
+    /// Flag or Gmail label update on explicit messages.
+    UpdateProperties(UpdatePropertiesOperation),
     ManageMailbox(ManageMailboxOperation),
 }
 
@@ -336,10 +431,12 @@ pub(super) struct ApplyMessagesOperation {
     pub(super) result_by_id: BTreeMap<String, MessageMutationResult>,
 }
 
+/// Stored state of a flag or Gmail label update operation.
 #[derive(Debug, Clone)]
-pub(super) struct UpdateFlagsOperation {
+pub(super) struct UpdatePropertiesOperation {
     pub(super) account_id: String,
-    pub(super) request: FlagUpdateRequest,
+    /// Property change applied to every group.
+    pub(super) update: PropertyUpdate,
     pub(super) message_ids: Vec<MessageId>,
     pub(super) groups: Vec<MessageMutationGroup>,
     pub(super) next_group_index: usize,
@@ -361,9 +458,10 @@ pub(super) enum OperationStep {
         action: MessageActionInput,
         group: MessageMutationGroup,
     },
-    UpdateFlagsGroup {
+    /// Applies one property update to one mailbox group.
+    UpdatePropertiesGroup {
         account_id: String,
-        request: FlagUpdateRequest,
+        update: PropertyUpdate,
         group: MessageMutationGroup,
     },
     ManageMailbox {
@@ -376,7 +474,7 @@ impl OperationStep {
     pub(super) fn account_id(&self) -> &str {
         match self {
             Self::ApplyMessagesGroup { account_id, .. }
-            | Self::UpdateFlagsGroup { account_id, .. }
+            | Self::UpdatePropertiesGroup { account_id, .. }
             | Self::ManageMailbox { account_id, .. } => account_id,
         }
     }
@@ -486,29 +584,58 @@ pub(super) fn next_action_list_mailboxes(account_id: &str) -> NextAction {
     )
 }
 
+/// Suggests the next mailbox page; count mode and page size carry over from the request.
 pub(super) fn next_action_continue_list_mailboxes(
     account_id: &str,
     cursor: &str,
     limit: usize,
+    include_counts: bool,
 ) -> NextAction {
+    // Arguments of the continuation call.
+    let mut arguments = serde_json::json!({
+        "account_id": account_id,
+        "cursor": cursor,
+        "limit": limit,
+    });
+    if include_counts {
+        arguments["include_counts"] = serde_json::Value::Bool(true);
+    }
     next_action(
         "Continue pagination to discover more mailboxes.",
         "imap_list_mailboxes",
+        arguments,
+    )
+}
+
+/// Suggests reading decoded attachment bytes from `offset_bytes`, at most `max_bytes` per page.
+pub(super) fn next_action_get_attachment_bytes(
+    instruction: &str,
+    message_id: &str,
+    part_id: &str,
+    offset_bytes: usize,
+    max_bytes: usize,
+) -> NextAction {
+    next_action(
+        instruction,
+        "imap_get_attachment",
         serde_json::json!({
-            "account_id": account_id,
-            "cursor": cursor,
-            "limit": limit,
+            "message_id": message_id,
+            "part_id": part_id,
+            "mode": "bytes",
+            "offset_bytes": offset_bytes,
+            "max_bytes": max_bytes,
         }),
     )
 }
 
+/// Suggests searching one mailbox; the suggestion is the shape of a new search.
 pub(super) fn next_action_search_mailbox(account_id: &str, mailbox: &str) -> NextAction {
     next_action(
         "Search for messages in the selected mailbox.",
         "imap_search_messages",
         serde_json::json!({
             "account_id": account_id,
-            "mailbox": mailbox,
+            "mailboxes": [mailbox],
             "limit": 10,
         }),
     )
@@ -549,10 +676,11 @@ pub(super) fn preferred_mailbox_name(mailboxes: &[MailboxInfo]) -> Option<String
         .map(|mailbox| mailbox.name.clone())
 }
 
+/// Chooses the next step after a search page; continuations carry only the binding and paging arguments.
 pub(super) fn next_action_for_search_result(
     status: &str,
     account_id: &str,
-    mailbox: &str,
+    mailboxes: &[String],
     limit: usize,
     cursor: Option<&str>,
     messages: &[MessageSummary],
@@ -563,7 +691,7 @@ pub(super) fn next_action_for_search_result(
             "imap_search_messages",
             serde_json::json!({
                 "account_id": account_id,
-                "mailbox": mailbox,
+                "mailboxes": mailboxes,
                 "cursor": cursor,
                 "limit": limit,
             }),
@@ -589,7 +717,7 @@ pub(super) fn next_action_for_search_result(
         "imap_search_messages",
         serde_json::json!({
             "account_id": account_id,
-            "mailbox": mailbox,
+            "mailboxes": mailboxes,
             "limit": limit,
         }),
     )
@@ -638,22 +766,28 @@ pub(super) fn operation_summary(status: &str, kind: &str) -> String {
     }
 }
 
+/// Returns the tool name that started an operation.
 pub(super) fn operation_kind_label(spec: &StoredOperationSpec) -> &'static str {
     match spec {
         StoredOperationSpec::ApplyMessages(_) => "imap_apply_to_messages",
-        StoredOperationSpec::UpdateFlags(_) => "imap_update_message_flags",
+        StoredOperationSpec::UpdateProperties(spec) => match spec.update {
+            PropertyUpdate::Flags { .. } => "imap_update_message_flags",
+            PropertyUpdate::GmailLabels { .. } => "imap_update_message_labels",
+        },
         StoredOperationSpec::ManageMailbox(_) => "imap_manage_mailbox",
     }
 }
 
+/// Returns the number of group steps that an operation executes.
 pub(super) fn operation_total_units(spec: &StoredOperationSpec) -> usize {
     match spec {
         StoredOperationSpec::ApplyMessages(spec) => spec.groups.len(),
-        StoredOperationSpec::UpdateFlags(spec) => spec.groups.len(),
+        StoredOperationSpec::UpdateProperties(spec) => spec.groups.len(),
         StoredOperationSpec::ManageMailbox(_) => 1,
     }
 }
 
+/// Claims the next unit of work and updates the progress phase text.
 pub(super) fn next_operation_step(operation: &mut StoredOperation) -> Option<OperationStep> {
     if operation.state == OperationState::CancelRequested {
         return None;
@@ -669,16 +803,14 @@ pub(super) fn next_operation_step(operation: &mut StoredOperation) -> Option<Ope
                 group,
             })
         }
-        StoredOperationSpec::UpdateFlags(spec) => {
+        StoredOperationSpec::UpdateProperties(spec) => {
             let group = spec.groups.get(spec.next_group_index)?.clone();
             operation.progress.current_mailbox = Some(group.mailbox.clone());
-            operation.progress.phase = format!(
-                "processing_{}",
-                flag_operation_name(&spec.request.operation)
-            );
-            Some(OperationStep::UpdateFlagsGroup {
+            operation.progress.phase =
+                format!("processing_{}", set_operation_name(spec.update.operation()));
+            Some(OperationStep::UpdatePropertiesGroup {
                 account_id: spec.account_id.clone(),
-                request: spec.request.clone(),
+                update: spec.update.clone(),
                 group,
             })
         }
@@ -705,11 +837,12 @@ pub(super) fn message_action_name(action: &MessageActionInput) -> &'static str {
     }
 }
 
-pub(super) fn flag_operation_name(operation: &FlagOperation) -> &'static str {
+/// Returns the lowercase wire name of a property mutation mode.
+pub(super) fn set_operation_name(operation: SetOperation) -> &'static str {
     match operation {
-        FlagOperation::Add => "add",
-        FlagOperation::Remove => "remove",
-        FlagOperation::Replace => "replace",
+        SetOperation::Add => "add",
+        SetOperation::Remove => "remove",
+        SetOperation::Replace => "replace",
     }
 }
 
@@ -798,8 +931,12 @@ pub(super) fn build_message_raw_uri(
 
 #[cfg(test)]
 mod tests {
-    use super::preferred_mailbox_name;
-    use crate::models::{MailboxInfo, MailboxRole};
+    use super::{
+        NextAction, SearchResultData, SummaryBuildResult, ToolIssue,
+        next_action_continue_list_mailboxes, next_action_for_search_result,
+        next_action_get_attachment_bytes, next_action_search_mailbox, preferred_mailbox_name,
+    };
+    use crate::models::{MailboxInfo, MailboxRole, ThreadMethod};
 
     fn mailbox(name: &str, selectable: bool, role: Option<MailboxRole>) -> MailboxInfo {
         MailboxInfo {
@@ -809,7 +946,51 @@ mod tests {
             role,
             selectable,
             provider_managed: false,
+            total_messages: None,
+            unread_messages: None,
         }
+    }
+
+    #[test]
+    fn mailbox_continuation_keeps_count_mode_only_when_requested() {
+        let plain = next_action_continue_list_mailboxes("default", "c1", 50, false);
+        assert_eq!(plain.tool, "imap_list_mailboxes");
+        assert_eq!(
+            plain.arguments,
+            serde_json::json!({"account_id": "default", "cursor": "c1", "limit": 50})
+        );
+        let counted = next_action_continue_list_mailboxes("default", "c1", 20, true);
+        assert_eq!(
+            counted.arguments,
+            serde_json::json!({
+                "account_id": "default",
+                "cursor": "c1",
+                "limit": 20,
+                "include_counts": true,
+            })
+        );
+    }
+
+    #[test]
+    fn attachment_bytes_action_names_mode_ids_and_window() {
+        let action = next_action_get_attachment_bytes(
+            "Read the next page.",
+            "imap:default:INBOX:7:42",
+            "1.2",
+            16_000,
+            8_000,
+        );
+        assert_eq!(action.tool, "imap_get_attachment");
+        assert_eq!(
+            action.arguments,
+            serde_json::json!({
+                "message_id": "imap:default:INBOX:7:42",
+                "part_id": "1.2",
+                "mode": "bytes",
+                "offset_bytes": 16_000,
+                "max_bytes": 8_000,
+            })
+        );
     }
 
     #[test]
@@ -836,5 +1017,125 @@ mod tests {
             preferred_mailbox_name(&mailboxes).as_deref(),
             Some("Primary")
         );
+    }
+
+    fn mailboxes(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn search_continuation_carries_only_binding_and_paging_arguments() {
+        let action = next_action_for_search_result(
+            "ok",
+            "default",
+            &mailboxes(&["INBOX", "Sent"]),
+            25,
+            Some("cursor-1"),
+            &[],
+        );
+        assert_eq!(action.tool, "imap_search_messages");
+        assert_eq!(
+            action.arguments,
+            serde_json::json!({
+                "account_id": "default",
+                "mailboxes": ["INBOX", "Sent"],
+                "cursor": "cursor-1",
+                "limit": 25,
+            })
+        );
+    }
+
+    #[test]
+    fn empty_search_retry_and_mailbox_suggestions_use_the_mailboxes_array() {
+        let retry =
+            next_action_for_search_result("ok", "default", &mailboxes(&["INBOX"]), 10, None, &[]);
+        assert_eq!(retry.arguments["mailboxes"], serde_json::json!(["INBOX"]));
+        assert!(retry.arguments.get("mailbox").is_none());
+
+        let suggestion = next_action_search_mailbox("default", "Archive");
+        assert_eq!(
+            suggestion.arguments["mailboxes"],
+            serde_json::json!(["Archive"])
+        );
+        assert!(suggestion.arguments.get("mailbox").is_none());
+
+        let failed = next_action_for_search_result(
+            "failed",
+            "default",
+            &mailboxes(&["INBOX"]),
+            10,
+            None,
+            &[],
+        );
+        assert_eq!(failed.tool, "imap_list_mailboxes");
+    }
+
+    fn search_result(total: Option<usize>, method: Option<ThreadMethod>) -> SearchResultData {
+        SearchResultData {
+            status: "ok".to_owned(),
+            issues: Vec::new(),
+            next_action: NextAction {
+                instruction: String::new(),
+                tool: "imap_search_messages".to_owned(),
+                arguments: serde_json::json!({}),
+            },
+            account_id: "default".to_owned(),
+            mailboxes: mailboxes(&["INBOX"]),
+            total,
+            thread_method: method,
+            thread_possibly_incomplete: method == Some(ThreadMethod::Headers),
+            attempted: 0,
+            returned: 0,
+            failed: 0,
+            messages: Vec::new(),
+            next_cursor: None,
+            has_more: false,
+        }
+    }
+
+    #[test]
+    fn unknown_search_total_is_absent_and_known_zero_is_serialized() {
+        let unknown = serde_json::to_value(search_result(None, None)).expect("serialize");
+        assert!(unknown.get("total").is_none());
+        assert!(unknown.get("thread_method").is_none());
+        assert_eq!(unknown["thread_possibly_incomplete"], false);
+
+        let zero = serde_json::to_value(search_result(Some(0), Some(ThreadMethod::Headers)))
+            .expect("serialize");
+        assert_eq!(zero["total"], 0);
+        assert_eq!(zero["thread_method"], "headers");
+        assert_eq!(zero["thread_possibly_incomplete"], true);
+
+        let gmail = serde_json::to_value(search_result(Some(1), Some(ThreadMethod::Gmail)))
+            .expect("serialize");
+        assert_eq!(gmail["thread_method"], "gmail");
+        assert_eq!(gmail["thread_possibly_incomplete"], false);
+    }
+
+    #[test]
+    fn summary_results_merge_counts_and_keep_the_command_failure_flag() {
+        let issue = || ToolIssue {
+            code: "internal".to_owned(),
+            stage: "fetch".to_owned(),
+            message: "boom".to_owned(),
+            retryable: true,
+            uid: None,
+            message_id: None,
+        };
+        let mut total = SummaryBuildResult::default();
+        total.fail_slice(3, issue());
+        total.merge(SummaryBuildResult {
+            attempted: 2,
+            failed: 1,
+            command_failed: true,
+            ..SummaryBuildResult::default()
+        });
+        total.merge(SummaryBuildResult {
+            attempted: 4,
+            ..SummaryBuildResult::default()
+        });
+        assert_eq!((total.attempted, total.failed), (9, 4));
+        assert!(total.command_failed);
+        assert_eq!(total.issues.len(), 1);
     }
 }

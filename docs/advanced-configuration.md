@@ -21,6 +21,8 @@ MAIL_IMAP_CURSOR_TTL_SECONDS=600
 
 Maximum number of cursors stored in memory. When exceeded, oldest unused cursors are evicted (LRU).
 
+One search cursor stores the ordered mailbox groups and at most 1,000 combined UIDs, plus the preview limit and thread method. The filters are already applied to the stored UIDs.
+
 ```bash
 # Default: 512 entries
 MAIL_IMAP_CURSOR_MAX_ENTRIES=512
@@ -77,7 +79,7 @@ Behavior:
 
 ## Message Processing Limits
 
-These server-wide limits bound work performed by `imap_get_message`:
+These server-wide limits bound work performed by `imap_get_message` and `imap_get_attachment`:
 
 ```bash
 # Default: 8388608 bytes (8 MiB) fetched while assembling one message
@@ -98,9 +100,11 @@ MAIL_IMAP_ATTACHMENT_EXTRACT_BUDGET_BYTES=10485760
 
 Behavior:
 - A conforming IMAP server is asked for at most the raw-message fetch budget. When a message is larger, `imap_get_message` parses only that bounded prefix and returns `partial` status with a fetch-budget issue.
+- `imap_get_attachment` requires a complete message for attachment content. A zero or exhausted fetch budget returns `limit_exceeded` with no payload.
 - The decode budget bounds decoded MIME payload bytes. Content beyond the limit is omitted or truncated, and the result reports the limit.
 - MIME nesting deeper than the depth limit or a part count beyond the configured maximum returns header-only metadata with a diagnostic issue instead of recursively parsing the overflowing structure.
-- The attachment extraction budget applies only to complete messages. Incomplete messages never extract attachment text; attachments that do not fit the extraction budget remain metadata-only and produce an issue rather than a partial extraction.
+- For `imap_get_message`, the attachment extraction budget applies only to complete messages. Incomplete messages never extract attachment text; attachments that do not fit the extraction budget remain metadata-only and produce an issue rather than a partial extraction.
+- `imap_get_attachment` transfer-decodes only the selected part once. It returns no text payload when charset conversion or extraction exceeds its budget.
 - Attachment `size_bytes` is the complete decoded payload size when known. It is `null` or absent when the complete decoded size is unavailable or incomplete, and unknown size is never represented as zero.
 
 ## Timeout Configuration
@@ -186,7 +190,10 @@ MAIL_IMAP_WRITE_ENABLED=true
 **Enables:**
 - `imap_apply_to_messages` - Bulk message mutation
 - `imap_update_message_flags` - Bulk message flag updates
+- `imap_update_message_labels` - Bulk Gmail label updates
 - `imap_manage_mailbox` - Mailbox lifecycle operations
+
+Message delete requires `UIDPLUS`. Message move requires native `MOVE` or `UIDPLUS`. Message copy requires neither. Gmail label updates require `X-GM-EXT-1`.
 
 **Security consideration:** Only enable if you need these operations. The server is safer with writes disabled.
 

@@ -3,11 +3,10 @@
 //! Provides timeout-bounded wrappers around `async-imap` operations. All network
 //! calls are enforced to use TLS, and timeouts are derived from server config.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_imap::types::{Fetch, Flag, Name};
+use async_imap::types::{Fetch, Name};
 use async_imap::{Client, Session};
 use futures::{StreamExt, TryStreamExt};
 use rustls::ClientConfig;
@@ -26,6 +25,14 @@ use crate::mailbox_codec::normalize_mailbox_name;
 use crate::models::MailboxInfo;
 use crate::server::provider;
 
+mod commands;
+
+pub use commands::{
+    CommandFailure, CopyMoveOutcome, CopyUidMapping, MessageMetadata, MetadataProjection,
+    fetch_message_metadata, mailbox_status, store_message_labels, uid_copy_sequence,
+    uid_expunge_sequence, uid_move_sequence, uid_store_sequence,
+};
+
 /// Maximum LIST observations: 2,000 retained mailboxes plus one truncation sentinel.
 pub const MAILBOX_LIST_OBSERVATION_LIMIT: usize = 2_001;
 const MAX_MAILBOXES_RETAINED: usize = MAILBOX_LIST_OBSERVATION_LIMIT - 1;
@@ -40,12 +47,6 @@ fn bounded_mailbox_observation<T>(mut items: Vec<T>) -> (Vec<T>, bool) {
     let truncated = items.len() >= MAILBOX_LIST_OBSERVATION_LIMIT;
     items.truncate(MAX_MAILBOXES_RETAINED);
     (items, truncated)
-}
-
-#[derive(Debug, Clone)]
-pub struct HeaderAndFlags {
-    pub header_bytes: Vec<u8>,
-    pub flags: Vec<String>,
 }
 
 /// Type alias for authenticated IMAP session over TLS
@@ -512,129 +513,6 @@ pub async fn fetch_one(
     }
 }
 
-/// Fetch curated headers and flags
-///
-/// Returns standard headers (Date, From, To, CC, Subject) and message flags.
-/// Uses `BODY.PEEK` to avoid marking the message as read.
-#[allow(dead_code)]
-pub async fn fetch_headers_and_flags(
-    server: &ServerConfig,
-    session: &mut ImapSession,
-    uid: u32,
-) -> AppResult<(Vec<u8>, Vec<String>)> {
-    let fetch = fetch_one(
-        server,
-        session,
-        uid,
-        "(FLAGS BODY.PEEK[HEADER.FIELDS (DATE FROM TO CC SUBJECT)])",
-    )
-    .await?;
-    let header_bytes = fetch
-        .header()
-        .or_else(|| fetch.body())
-        .ok_or_else(|| AppError::Internal("message headers not available".to_owned()))?
-        .to_vec();
-    Ok((header_bytes, flags_to_strings(&fetch)))
-}
-
-/// Fetch curated headers and flags for a UID set in one round trip.
-pub async fn fetch_headers_and_flags_by_uid_set(
-    server: &ServerConfig,
-    session: &mut ImapSession,
-    uid_set: &str,
-) -> AppResult<HashMap<u32, HeaderAndFlags>> {
-    let stream = timeout(
-        socket_timeout(server),
-        session.uid_fetch(
-            uid_set,
-            "(UID FLAGS BODY.PEEK[HEADER.FIELDS (DATE FROM TO CC SUBJECT)])",
-        ),
-    )
-    .await
-    .map_err(|_| AppError::Timeout("UID FETCH timed out".to_owned()))
-    .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid fetch failed: {e}"))))?;
-    let fetches: Vec<Fetch> = timeout(socket_timeout(server), stream.try_collect())
-        .await
-        .map_err(|_| AppError::Timeout("UID FETCH stream timed out".to_owned()))
-        .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid fetch stream failed: {e}"))))?;
-
-    let mut by_uid = HashMap::new();
-    for fetch in fetches {
-        let Some(uid) = fetch.uid else {
-            continue;
-        };
-        let Some(header_bytes) = fetch.header().or_else(|| fetch.body()).map(|v| v.to_vec()) else {
-            continue;
-        };
-        by_uid.insert(
-            uid,
-            HeaderAndFlags {
-                header_bytes,
-                flags: flags_to_strings(&fetch),
-            },
-        );
-    }
-    Ok(by_uid)
-}
-
-/// Fetch message flags only
-///
-/// Returns IMAP flags (e.g., `\Seen`, `\Flagged`, `\Draft`) as strings.
-pub async fn fetch_flags(
-    server: &ServerConfig,
-    session: &mut ImapSession,
-    uid: u32,
-) -> AppResult<Vec<String>> {
-    let fetch = fetch_one(server, session, uid, "FLAGS").await?;
-    Ok(flags_to_strings(&fetch))
-}
-
-/// Fetch flags for a UID set in one round trip.
-pub async fn fetch_flags_by_uid_set(
-    server: &ServerConfig,
-    session: &mut ImapSession,
-    uid_set: &str,
-) -> AppResult<HashMap<u32, Vec<String>>> {
-    let stream = timeout(
-        socket_timeout(server),
-        session.uid_fetch(uid_set, "(UID FLAGS)"),
-    )
-    .await
-    .map_err(|_| AppError::Timeout("UID FETCH timed out".to_owned()))
-    .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid fetch failed: {e}"))))?;
-    let fetches: Vec<Fetch> = timeout(socket_timeout(server), stream.try_collect())
-        .await
-        .map_err(|_| AppError::Timeout("UID FETCH stream timed out".to_owned()))
-        .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid fetch stream failed: {e}"))))?;
-    let mut by_uid = HashMap::new();
-    for fetch in fetches {
-        if let Some(uid) = fetch.uid {
-            by_uid.insert(uid, flags_to_strings(&fetch));
-        }
-    }
-    Ok(by_uid)
-}
-
-/// Convert fetch flags to IMAP string representation
-///
-/// Helper to serialize flag types to IMAP wire-format strings.
-pub fn flags_to_strings(fetch: &Fetch) -> Vec<String> {
-    fetch.flags().map(flag_to_string).collect()
-}
-
-fn flag_to_string(flag: Flag<'_>) -> String {
-    match flag {
-        Flag::Seen => "\\Seen".to_owned(),
-        Flag::Answered => "\\Answered".to_owned(),
-        Flag::Flagged => "\\Flagged".to_owned(),
-        Flag::Deleted => "\\Deleted".to_owned(),
-        Flag::Draft => "\\Draft".to_owned(),
-        Flag::Recent => "\\Recent".to_owned(),
-        Flag::MayCreate => "\\*".to_owned(),
-        Flag::Custom(value) => value.into_owned(),
-    }
-}
-
 /// Search for messages matching query
 ///
 /// Runs `UID SEARCH` and returns matching UIDs in descending order (newest
@@ -706,129 +584,66 @@ fn validate_raw_body_range_length(actual: usize, requested: usize) -> AppResult<
     Ok(())
 }
 
-/// Store flags on a message
+/// Builds an IMAP UID set from UIDs in any order.
 ///
-/// Runs `UID STORE` with a flag query string. Use `+FLAGS.SILENT` to add
-/// flags or `-FLAGS.SILENT` to remove flags.
-#[cfg_attr(not(test), allow(dead_code))]
+/// UIDs are sorted and deduplicated, and consecutive UIDs are compressed into
+/// `first:last` ranges joined by commas. Empty input returns an empty string.
+pub fn build_uid_set(uids: impl IntoIterator<Item = u32>) -> String {
+    // Sorted, unique UIDs.
+    let mut sorted: Vec<u32> = uids.into_iter().collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut iter = sorted.into_iter();
+    let Some(first) = iter.next() else {
+        return String::new();
+    };
+    // Formatted ranges completed so far.
+    let mut ranges: Vec<String> = Vec::new();
+    // First and last UID of the range being built.
+    let (mut start, mut end) = (first, first);
+    for uid in iter {
+        if end.checked_add(1) == Some(uid) {
+            end = uid;
+            continue;
+        }
+        ranges.push(format_uid_range(start, end));
+        start = uid;
+        end = uid;
+    }
+    ranges.push(format_uid_range(start, end));
+    ranges.join(",")
+}
+
+/// Formats one inclusive UID range as `n` or `start:end`.
+fn format_uid_range(start: u32, end: u32) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}:{end}")
+    }
+}
+
+/// Stores flags on a single message (test helper).
+#[cfg(test)]
 pub async fn uid_store(
     server: &ServerConfig,
     session: &mut ImapSession,
     uid: u32,
     query: &str,
 ) -> AppResult<()> {
-    uid_store_sequence(server, session, &uid.to_string(), query).await
-}
-
-/// Store flags on a UID sequence.
-pub async fn uid_store_sequence(
-    server: &ServerConfig,
-    session: &mut ImapSession,
-    uid_set: &str,
-    query: &str,
-) -> AppResult<()> {
-    let stream = timeout(socket_timeout(server), session.uid_store(uid_set, query))
+    uid_store_sequence(server, session, &[uid], query)
         .await
-        .map_err(|_| AppError::Timeout("UID STORE timed out".to_owned()))
-        .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid store failed: {e}"))))?;
-    let _: Vec<Fetch> = timeout(socket_timeout(server), stream.try_collect())
-        .await
-        .map_err(|_| AppError::Timeout("UID STORE stream timed out".to_owned()))
-        .and_then(|r| r.map_err(|e| AppError::Internal(format!("uid store stream failed: {e}"))))?;
-    Ok(())
+        .map_err(AppError::from)
 }
 
-/// Copy message to another mailbox
-///
-/// Runs `UID COPY` to duplicate the message. Returns the new UID on success
-/// (currently not captured due to protocol limitations).
-#[cfg_attr(not(test), allow(dead_code))]
-pub async fn uid_copy(
-    server: &ServerConfig,
-    session: &mut ImapSession,
-    uid: u32,
-    mailbox: &str,
-) -> AppResult<()> {
-    uid_copy_sequence(server, session, &uid.to_string(), mailbox).await
-}
-
-/// Copy a UID sequence to another mailbox.
-pub async fn uid_copy_sequence(
-    server: &ServerConfig,
-    session: &mut ImapSession,
-    uid_set: &str,
-    mailbox: &str,
-) -> AppResult<()> {
-    let encoded_mailbox = encode_mailbox_name_for_command(mailbox);
-    timeout(
-        socket_timeout(server),
-        session.uid_copy(uid_set, &encoded_mailbox),
-    )
-    .await
-    .map_err(|_| AppError::Timeout("UID COPY timed out".to_owned()))
-    .and_then(|r| r.map_err(|e| AppError::Internal(format!("UID COPY failed: {e}"))))
-}
-
-/// Move message to another mailbox
-///
-/// Runs `UID MOVE` if server supports it (RFC 6851). More efficient than
-/// copy+delete as it's atomic.
-#[cfg_attr(not(test), allow(dead_code))]
-pub async fn uid_move(
-    server: &ServerConfig,
-    session: &mut ImapSession,
-    uid: u32,
-    mailbox: &str,
-) -> AppResult<()> {
-    uid_move_sequence(server, session, &uid.to_string(), mailbox).await
-}
-
-/// Move a UID sequence to another mailbox.
-pub async fn uid_move_sequence(
-    server: &ServerConfig,
-    session: &mut ImapSession,
-    uid_set: &str,
-    mailbox: &str,
-) -> AppResult<()> {
-    let encoded_mailbox = encode_mailbox_name_for_command(mailbox);
-    timeout(
-        socket_timeout(server),
-        session.uid_mv(uid_set, &encoded_mailbox),
-    )
-    .await
-    .map_err(|_| AppError::Timeout("UID MOVE timed out".to_owned()))
-    .and_then(|r| r.map_err(|e| AppError::Internal(format!("UID MOVE failed: {e}"))))
-}
-
-/// Permanently delete a message
-///
-/// Runs `UID EXPUNGE` to immediately remove the message marked as `\Deleted`.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Permanently deletes a single message already marked `\Deleted` (test helper).
+#[cfg(test)]
 pub async fn uid_expunge(
     server: &ServerConfig,
     session: &mut ImapSession,
     uid: u32,
 ) -> AppResult<()> {
-    uid_expunge_sequence(server, session, &uid.to_string()).await
-}
-
-/// Permanently delete a UID sequence already marked as `\Deleted`.
-pub async fn uid_expunge_sequence(
-    server: &ServerConfig,
-    session: &mut ImapSession,
-    uid_set: &str,
-) -> AppResult<()> {
-    let stream = timeout(socket_timeout(server), session.uid_expunge(uid_set))
-        .await
-        .map_err(|_| AppError::Timeout("UID EXPUNGE timed out".to_owned()))
-        .and_then(|r| r.map_err(|e| AppError::Internal(format!("UID EXPUNGE failed: {e}"))))?;
-    let _: Vec<u32> = timeout(socket_timeout(server), stream.try_collect())
-        .await
-        .map_err(|_| AppError::Timeout("UID EXPUNGE stream timed out".to_owned()))
-        .and_then(|r| {
-            r.map_err(|e| AppError::Internal(format!("UID EXPUNGE stream failed: {e}")))
-        })?;
-    Ok(())
+    uid_expunge_sequence(server, session, &[uid]).await
 }
 
 /// Append raw RFC822 message to mailbox
@@ -871,10 +686,11 @@ mod tests {
     use crate::mailbox_codec::encode_mailbox_name_for_command;
 
     use super::{
-        append, bounded_mailbox_observation, build_mailbox_parent_paths, fetch_flags,
-        list_all_mailboxes, raw_body_range_length, raw_body_range_query, rename_mailbox,
-        select_mailbox_readonly, select_mailbox_readwrite, socket_timeout, uid_copy, uid_expunge,
-        uid_move, uid_search, uid_store, validate_raw_body_range_length,
+        CopyMoveOutcome, MetadataProjection, append, bounded_mailbox_observation,
+        build_mailbox_parent_paths, build_uid_set, fetch_message_metadata, list_all_mailboxes,
+        mailbox_status, raw_body_range_length, raw_body_range_query, rename_mailbox,
+        select_mailbox_readonly, select_mailbox_readwrite, socket_timeout, uid_copy_sequence,
+        uid_expunge, uid_move_sequence, uid_search, uid_store, validate_raw_body_range_length,
     };
     use crate::config::{AccountConfig, ServerConfig};
 
@@ -954,6 +770,47 @@ mod tests {
             Err(crate::errors::AppError::Internal(message))
                 if message == "IMAP server returned more than the requested body range"
         ));
+    }
+
+    #[test]
+    fn uid_set_sorts_deduplicates_and_compresses_ranges() {
+        assert_eq!(build_uid_set(Vec::<u32>::new()), "");
+        assert_eq!(build_uid_set([7]), "7");
+        assert_eq!(build_uid_set([9, 4, 5, 4, 1, 2, 3]), "1:5,9");
+        assert_eq!(build_uid_set([10, 12, 14]), "10,12,14");
+        assert_eq!(build_uid_set([2, 1]), "1:2");
+        assert_eq!(
+            build_uid_set([u32::MAX - 1, u32::MAX]),
+            "4294967294:4294967295"
+        );
+    }
+
+    /// Asserts that a destination mapping, when the server reported one, names the real message.
+    ///
+    /// A server that reports no mapping passes; a reported mapping must be valid and match.
+    fn assert_native_mapping(
+        outcome: &CopyMoveOutcome,
+        source_uid: u32,
+        destination_uidvalidity: u32,
+        destination_uids: &[u32],
+    ) {
+        assert!(
+            outcome.mapping_issue.is_none(),
+            "server mapping must be valid when present: {:?}",
+            outcome.mapping_issue
+        );
+        let Some(mapping) = &outcome.mapping else {
+            return;
+        };
+        assert_eq!(mapping.uidvalidity, destination_uidvalidity);
+        let destination_uid = mapping
+            .source_to_destination
+            .get(&source_uid)
+            .expect("mapping must name the source UID");
+        assert!(
+            destination_uids.contains(destination_uid),
+            "mapped destination UID {destination_uid} must exist in {destination_uids:?}"
+        );
     }
 
     /// Constructs a ServerConfig for GreenMail integration tests.
@@ -1233,6 +1090,34 @@ mod tests {
             inbox_uids.len()
         );
 
+        // STATUS must report the live total and unread counts of the seeded INBOX.
+        let counts = mailbox_status(&config, &mut session, "INBOX")
+            .await
+            .expect("STATUS should succeed for INBOX");
+        assert_eq!(counts.total_messages as usize, inbox_uids.len());
+        assert!(counts.unread_messages >= 1 && counts.unread_messages <= counts.total_messages);
+
+        // The Summary projection returns headers and flags keyed by UID. A bounded body prefix
+        // is not requested because GreenMail answers `BODY[]<0>{N}` without the RFC 3501 space
+        // before the literal; the strict-peer unit tests cover the prefix projection.
+        let summaries = fetch_message_metadata(
+            &config,
+            &mut session,
+            &inbox_uids,
+            MetadataProjection::Summary {
+                preview_bytes: None,
+            },
+            false,
+        )
+        .await
+        .expect("Summary projection should succeed");
+        assert_eq!(summaries.len(), inbox_uids.len());
+        assert!(summaries.values().all(|metadata| {
+            metadata.header_bytes.is_some()
+                && metadata.flags.is_some()
+                && metadata.gmail_labels.is_none()
+        }));
+
         let unseen_uids = uid_search(&config, &mut session, "UNSEEN")
             .await
             .expect("UID SEARCH UNSEEN should succeed");
@@ -1337,9 +1222,19 @@ mod tests {
         uid_store(&config, &mut session, source_uid, "+FLAGS.SILENT (\\Seen)")
             .await
             .expect("UID STORE should set \\Seen flag");
-        let flags = fetch_flags(&config, &mut session, source_uid)
-            .await
-            .expect("fetch_flags should succeed after UID STORE");
+        let mut state = fetch_message_metadata(
+            &config,
+            &mut session,
+            &[source_uid],
+            MetadataProjection::State,
+            false,
+        )
+        .await
+        .expect("State metadata fetch should succeed after UID STORE");
+        let flags = state
+            .remove(&source_uid)
+            .and_then(|metadata| metadata.flags)
+            .expect("State metadata should include flags");
         assert!(
             flags.iter().any(|f| f == "\\Seen"),
             "expected \\Seen in flags after UID STORE"
@@ -1349,11 +1244,11 @@ mod tests {
             .await
             .expect("CREATE destination mailbox should succeed");
 
-        uid_copy(&config, &mut session, source_uid, &destination_mailbox)
-            .await
-            .expect("UID COPY should succeed");
+        let copy_outcome =
+            uid_copy_sequence(&config, &mut session, &[source_uid], &destination_mailbox).await;
+        assert!(copy_outcome.completion.is_ok(), "UID COPY should succeed");
 
-        select_mailbox_readonly(&config, &mut session, &destination_mailbox)
+        let copy_uidvalidity = select_mailbox_readonly(&config, &mut session, &destination_mailbox)
             .await
             .expect("destination mailbox should be selectable");
         let copied_uids = uid_search(&config, &mut session, &format!("SUBJECT \"{subject}\""))
@@ -1364,13 +1259,14 @@ mod tests {
             1,
             "expected one copied message in destination mailbox"
         );
+        assert_native_mapping(&copy_outcome, source_uid, copy_uidvalidity, &copied_uids);
 
         select_mailbox_readwrite(&config, &mut session, "INBOX")
             .await
             .expect("INBOX should be selectable read-write for move");
-        uid_move(&config, &mut session, source_uid, &destination_mailbox)
-            .await
-            .expect("UID MOVE should succeed");
+        let move_outcome =
+            uid_move_sequence(&config, &mut session, &[source_uid], &destination_mailbox).await;
+        assert!(move_outcome.completion.is_ok(), "UID MOVE should succeed");
 
         select_mailbox_readonly(&config, &mut session, "INBOX")
             .await
@@ -1384,9 +1280,10 @@ mod tests {
             "expected no source messages after UID MOVE"
         );
 
-        select_mailbox_readwrite(&config, &mut session, &destination_mailbox)
-            .await
-            .expect("destination mailbox should be selectable read-write");
+        let move_uidvalidity =
+            select_mailbox_readwrite(&config, &mut session, &destination_mailbox)
+                .await
+                .expect("destination mailbox should be selectable read-write");
         let moved_and_copied = uid_search(&config, &mut session, &format!("SUBJECT \"{subject}\""))
             .await
             .expect("UID SEARCH in destination after move should succeed");
@@ -1394,6 +1291,12 @@ mod tests {
             moved_and_copied.len(),
             2,
             "expected two messages in destination after copy+move"
+        );
+        assert_native_mapping(
+            &move_outcome,
+            source_uid,
+            move_uidvalidity,
+            &moved_and_copied,
         );
 
         let uid_to_delete = moved_and_copied[0];

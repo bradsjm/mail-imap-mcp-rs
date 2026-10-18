@@ -6,12 +6,16 @@ A secure, efficient Model Context Protocol (MCP) server for IMAP email access ov
 
 - **Secure by default**: TLS-only connections, password secrets never logged or returned
 - **Structured output**: Consistent tool response envelope with summaries and metadata
-- **Cursor-based pagination**: Efficient message searching across large mailboxes
-- **Message parsing**: Extract text, HTML, headers, and attachments with sanitization
+- **Cursor-based pagination**: Search 1 to 10 mailboxes with grouped, cursor-based pages
+- **Message parsing**: Extract text, HTML, headers, body previews, and attachments with sanitization
+- **Gmail metadata**: Read Gmail labels, message IDs, and thread IDs; write labels on Gmail servers
+- **Conversation search**: Find related messages with Gmail thread IDs or bounded header discovery
+- **Attachment access**: Read one attachment as bounded text or paginated decoded bytes
+- **Mailbox counts**: Request live message and unread counts for the returned mailbox page
 - **Multi-account support**: Configure multiple IMAP accounts via environment variables
 - **PDF text extraction**: Optional text extraction from PDF attachments
 - **Rust-powered**: Fast, memory-safe async/await implementation with tokio
-- **Write operations**: Message mutations and mailbox management require explicit enable
+- **Write operations**: Message mutations, label updates, and mailbox management require explicit enable
 
 ## Installation
 
@@ -194,15 +198,18 @@ All tools return a consistent envelope:
 }
 ```
 
+The server exposes 12 tools.
+
 ### Read Operations
 
 | Tool | Purpose |
 |------|---------|
 | `imap_list_accounts` | List configured accounts without exposing credentials |
-| `imap_list_mailboxes` | List all visible mailboxes/folders |
-| `imap_search_messages` | Search with cursor-based pagination |
-| `imap_get_message` | Get parsed message details |
+| `imap_list_mailboxes` | List visible mailboxes/folders, with optional page counts |
+| `imap_search_messages` | Search 1 to 10 mailboxes with filters, previews, conversations, and cursor-based pagination |
+| `imap_get_message` | Get parsed message details, flags, and Gmail metadata |
 | `imap_get_message_raw` | Get RFC822 source for diagnostics |
+| `imap_get_attachment` | Get one attachment as bounded text or paginated decoded bytes |
 
 ### Write Operations
 
@@ -210,11 +217,17 @@ All tools return a consistent envelope:
 |------|---------|
 | `imap_apply_to_messages` | Apply one action (`move`, `copy`, `delete`) to explicit messages |
 | `imap_update_message_flags` | Add, remove, or replace flags on explicit messages |
+| `imap_update_message_labels` | Add, remove, or replace Gmail labels on explicit messages |
 | `imap_manage_mailbox` | Create, rename, or delete a mailbox |
 | `imap_get_operation` | Poll a write operation status and optionally fetch its terminal result |
 | `imap_cancel_operation` | Request cancellation for a running write operation |
 
 Write operations require `MAIL_IMAP_WRITE_ENABLED=true`.
+
+`imap_update_message_labels` also requires a server that advertises `X-GM-EXT-1`.
+`imap_apply_to_messages` requires `UIDPLUS` for delete and either native `MOVE` or `UIDPLUS` for move. Copy needs neither capability.
+
+Gmail-specific label, message-ID, and thread-ID behavior is implemented from the IMAP extensions. It is not verified against a live Gmail account in this repository.
 
 For complete tool contracts, input/output schemas, and validation rules, see [Tool Contract](docs/tool-contract.md).
 
@@ -257,10 +270,10 @@ Rerun the search without a cursor. See [Cursor Pagination](docs/cursor-paginatio
 ### Search Too Broad
 
 ```
-Error: invalid input: search matched 25000 messages; narrow filters to at most 1000 results
+Error: invalid input: search matched 25000 messages so far across the requested mailboxes; narrow filters or mailboxes to at most 1000 results
 ```
 
-Add tighter filters (`last_days`, `from`, `subject`, date ranges) and rerun.
+Add tighter filters (`last_days`, `from`, `subject`, date ranges), remove mailboxes, and rerun.
 
 ### Mailbox Snapshot Changed
 

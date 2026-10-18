@@ -22,16 +22,16 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::config::ServerConfig;
 use crate::models::{
-    AccountInfo, ApplyToMessagesInput, GetMessageInput, GetMessageRawInput, GetOperationInput,
-    ListMailboxesInput, ManageMailboxInput, OperationIdInput, SearchMessagesInput,
-    UpdateMessageFlagsInput,
+    AccountInfo, ApplyToMessagesInput, GetAttachmentInput, GetMessageInput, GetMessageRawInput,
+    GetOperationInput, ListMailboxesInput, ManageMailboxInput, OperationIdInput,
+    SearchMessagesInput, UpdateMessageFlagsInput, UpdateMessageLabelsInput,
 };
 use crate::pagination::{CursorStore, MailboxCursorStore};
 
 use self::session_cache::{ReadSessionCache, ReadSessionLease};
 use self::types::{
-    GetMessageData, GetMessageRawData, ListAccountsData, ListMailboxesData, OperationStatusData,
-    SearchResultData, StoredOperation, finalize_tool, operation_summary,
+    GetAttachmentData, GetMessageData, GetMessageRawData, ListAccountsData, ListMailboxesData,
+    OperationStatusData, SearchResultData, StoredOperation, finalize_tool, operation_summary,
 };
 
 /// Maximum messages per search result page.
@@ -119,7 +119,7 @@ impl MailImapServer {
 
     #[tool(
         name = "imap_list_mailboxes",
-        description = "List mailboxes for an account"
+        description = "List mailboxes for an account; include_counts adds live message and unread counts"
     )]
     async fn list_mailboxes(
         &self,
@@ -137,7 +137,7 @@ impl MailImapServer {
 
     #[tool(
         name = "imap_search_messages",
-        description = "Search messages with cursor pagination"
+        description = "Search 1-10 mailboxes with filters, conversation lookup, body previews, and cursor pagination"
     )]
     async fn search_messages(
         &self,
@@ -184,6 +184,25 @@ impl MailImapServer {
         )
     }
 
+    /// Reads one attachment of a message as text or base64 bytes.
+    #[tool(
+        name = "imap_get_attachment",
+        description = "Read one attachment of a message as text or base64 bytes"
+    )]
+    async fn get_attachment(
+        &self,
+        Parameters(input): Parameters<GetAttachmentInput>,
+    ) -> Result<Json<crate::models::ToolEnvelope<GetAttachmentData>>, ErrorData> {
+        let started = Instant::now();
+        finalize_tool(
+            started,
+            "imap_get_attachment",
+            self.get_attachment_impl(input)
+                .await
+                .map(|data| ("Attachment read".to_owned(), data)),
+        )
+    }
+
     #[tool(
         name = "imap_apply_to_messages",
         description = "Apply one mutation action to explicit messages"
@@ -215,6 +234,25 @@ impl MailImapServer {
             started,
             "imap_update_message_flags",
             self.update_message_flags_impl(input)
+                .await
+                .map(|data| (operation_summary(&data.status, &data.operation.kind), data)),
+        )
+    }
+
+    /// Starts a Gmail label update operation for explicit messages.
+    #[tool(
+        name = "imap_update_message_labels",
+        description = "Add, remove, or replace Gmail labels on explicit messages; requires Gmail X-GM-EXT-1"
+    )]
+    async fn update_message_labels(
+        &self,
+        Parameters(input): Parameters<UpdateMessageLabelsInput>,
+    ) -> Result<Json<crate::models::ToolEnvelope<OperationStatusData>>, ErrorData> {
+        let started = Instant::now();
+        finalize_tool(
+            started,
+            "imap_update_message_labels",
+            self.update_message_labels_impl(input)
                 .await
                 .map(|data| (operation_summary(&data.status, &data.operation.kind), data)),
         )
@@ -322,9 +360,10 @@ mod tests {
         GetOperationInput, OperationIdInput, ToolEnvelope, validate_client_safe_input_schema,
     };
     use crate::server::types::{
-        GetMessageData, GetMessageRawData, ListAccountsData, ListMailboxesData, MailboxAction,
-        MailboxManagementResult, ManageMailboxOperation, OperationResultData, OperationState,
-        OperationStatusData, SearchResultData, StoredOperation, StoredOperationSpec,
+        GetAttachmentData, GetMessageData, GetMessageRawData, ListAccountsData, ListMailboxesData,
+        MailboxAction, MailboxManagementResult, ManageMailboxOperation, OperationResultData,
+        OperationState, OperationStatusData, SearchResultData, StoredOperation,
+        StoredOperationSpec,
     };
 
     #[test]
@@ -411,6 +450,152 @@ mod tests {
     }
 
     #[test]
+    fn label_tool_is_registered_with_output_schema() {
+        let server = MailImapServer::new(schema_test_server_config());
+        let tool = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "imap_update_message_labels")
+            .expect("labels tool must be registered");
+        assert!(tool.output_schema.is_some());
+    }
+
+    /// Resolves the published enum values of one input property through a local `$ref`.
+    fn published_enum_values(tool_name: &str, property: &str) -> Vec<String> {
+        let server = MailImapServer::new(schema_test_server_config());
+        let tool = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == tool_name)
+            .unwrap_or_else(|| panic!("missing tool {tool_name}"));
+        let root = serde_json::Value::Object(tool.input_schema.as_ref().clone());
+        let mut schema = root["properties"][property].clone();
+        if let Some(reference) = schema.get("$ref").and_then(serde_json::Value::as_str) {
+            let pointer = reference.trim_start_matches('#');
+            schema = root
+                .pointer(pointer)
+                .unwrap_or_else(|| panic!("unresolved reference {reference}"))
+                .clone();
+        }
+        schema["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{tool_name}.{property} must publish enum values"))
+            .iter()
+            .map(|value| value.as_str().expect("enum value must be text").to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn property_update_tools_publish_set_operation_values() {
+        for tool in ["imap_update_message_flags", "imap_update_message_labels"] {
+            assert_eq!(
+                published_enum_values(tool, "operation"),
+                ["add", "remove", "replace"],
+                "{tool} operation values"
+            );
+        }
+    }
+
+    #[test]
+    fn operation_status_schema_includes_partial_and_labels_properties() {
+        let schema =
+            schema_for_output::<ToolEnvelope<OperationStatusData>>().expect("valid schema");
+        let root = serde_json::Value::Object(schema.as_ref().clone());
+        let bulk = &root["$defs"]["BulkMessageOperationData"]["properties"];
+        assert!(
+            bulk.get("partial").is_some(),
+            "bulk result must publish partial"
+        );
+        let message = &root["$defs"]["MessageMutationResult"]["properties"];
+        assert!(
+            message.get("labels").is_some(),
+            "message result must publish labels"
+        );
+        assert!(message.get("flags").is_some());
+    }
+
+    #[test]
+    fn search_tool_publishes_mailboxes_previews_and_filters() {
+        let server = MailImapServer::new(schema_test_server_config());
+        let tool = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "imap_search_messages")
+            .expect("search tool must be registered");
+        let input = serde_json::Value::Object(tool.input_schema.as_ref().clone());
+        let properties = input["properties"].as_object().expect("input properties");
+        for present in [
+            "mailboxes",
+            "preview_max_chars",
+            "flagged",
+            "answered",
+            "keyword",
+            "message_id_header",
+            "gmail_query",
+            "thread_of_message_id",
+        ] {
+            assert!(properties.contains_key(present), "{present} missing");
+        }
+        for removed in ["mailbox", "snippet_max_chars"] {
+            assert!(!properties.contains_key(removed), "{removed} must be gone");
+        }
+        let required = input["required"].as_array().expect("required list");
+        assert!(required.iter().any(|name| name == "mailboxes"));
+        assert_eq!(properties["mailboxes"]["minItems"], 1);
+        assert_eq!(properties["mailboxes"]["maxItems"], 10);
+    }
+
+    #[test]
+    fn search_and_message_output_schemas_publish_new_fields() {
+        let schema = schema_for_output::<ToolEnvelope<SearchResultData>>().expect("valid schema");
+        let root = serde_json::Value::Object(schema.as_ref().clone());
+        let data = &root["$defs"]["SearchResultData"];
+        let properties = data["properties"].as_object().expect("search properties");
+        for present in [
+            "mailboxes",
+            "total",
+            "thread_method",
+            "thread_possibly_incomplete",
+        ] {
+            assert!(properties.contains_key(present), "{present} missing");
+        }
+        assert!(!properties.contains_key("mailbox"));
+        let required = data["required"].as_array().expect("required list");
+        assert!(required.iter().any(|name| name == "mailboxes"));
+        assert!(
+            required
+                .iter()
+                .any(|name| name == "thread_possibly_incomplete")
+        );
+        assert!(
+            !required.iter().any(|name| name == "total"),
+            "total is optional because it can be unknown"
+        );
+
+        let summary = &root["$defs"]["MessageSummary"]["properties"];
+        assert!(summary.get("preview").is_some());
+        assert!(summary.get("snippet").is_none());
+        let detail = schema_for_output::<ToolEnvelope<GetMessageData>>().expect("valid schema");
+        let detail = serde_json::Value::Object(detail.as_ref().clone());
+        for properties in [summary, &detail["$defs"]["MessageDetail"]["properties"]] {
+            for field in ["gmail_labels", "gmail_message_id", "gmail_thread_id"] {
+                assert!(properties.get(field).is_some(), "{field} missing");
+            }
+            for field in ["gmail_message_id", "gmail_thread_id"] {
+                let kinds = properties[field]["type"].as_array().expect("nullable type");
+                assert!(kinds.iter().any(|kind| kind == "string"), "{field} is text");
+                assert!(
+                    !kinds.iter().any(|kind| kind == "integer"),
+                    "{field} is not numeric"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn tool_output_schemas_match_concrete_envelope_types() {
         let server = MailImapServer::new(schema_test_server_config());
         let expected = [
@@ -443,6 +628,10 @@ mod tests {
                 schema_for_output::<ToolEnvelope<OperationStatusData>>().expect("valid schema"),
             ),
             (
+                "imap_update_message_labels",
+                schema_for_output::<ToolEnvelope<OperationStatusData>>().expect("valid schema"),
+            ),
+            (
                 "imap_manage_mailbox",
                 schema_for_output::<ToolEnvelope<OperationStatusData>>().expect("valid schema"),
             ),
@@ -454,7 +643,26 @@ mod tests {
                 "imap_cancel_operation",
                 schema_for_output::<ToolEnvelope<OperationStatusData>>().expect("valid schema"),
             ),
+            (
+                "imap_get_attachment",
+                schema_for_output::<ToolEnvelope<GetAttachmentData>>().expect("valid schema"),
+            ),
         ];
+
+        let mut registered = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        registered.sort_unstable();
+        let mut expected_names = expected
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect::<Vec<_>>();
+        expected_names.sort_unstable();
+        assert_eq!(registered.len(), 12, "the final tool count is 12");
+        assert_eq!(registered, expected_names);
 
         for (name, schema) in expected {
             let tool = server
@@ -472,6 +680,113 @@ mod tests {
                 "tool {name} output schema differs from concrete envelope type"
             );
         }
+    }
+
+    #[test]
+    fn attachment_tool_publishes_modes_and_flat_inputs() {
+        assert_eq!(
+            published_enum_values("imap_get_attachment", "mode"),
+            ["text", "bytes"]
+        );
+        let server = MailImapServer::new(schema_test_server_config());
+        let tool = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "imap_get_attachment")
+            .expect("attachment tool must be registered");
+        let input = serde_json::Value::Object(tool.input_schema.as_ref().clone());
+        let properties = input["properties"].as_object().expect("input properties");
+        for field in [
+            "message_id",
+            "part_id",
+            "mode",
+            "max_chars",
+            "offset_bytes",
+            "max_bytes",
+        ] {
+            assert!(properties.contains_key(field), "{field} missing");
+        }
+        assert_eq!(properties["part_id"]["maxLength"], 64);
+    }
+
+    #[test]
+    fn mailbox_list_tool_publishes_count_input_and_optional_count_outputs() {
+        let server = MailImapServer::new(schema_test_server_config());
+        let tool = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "imap_list_mailboxes")
+            .expect("list tool must be registered");
+        let input = serde_json::Value::Object(tool.input_schema.as_ref().clone());
+        assert_eq!(input["properties"]["include_counts"]["type"], "boolean");
+        assert_eq!(input["properties"]["limit"]["default"], 50);
+
+        let schema = schema_for_output::<ToolEnvelope<ListMailboxesData>>().expect("valid schema");
+        let root = serde_json::Value::Object(schema.as_ref().clone());
+        let mailbox = &root["$defs"]["MailboxInfo"];
+        for field in ["total_messages", "unread_messages"] {
+            assert!(
+                mailbox["properties"].get(field).is_some(),
+                "{field} missing"
+            );
+            let required = mailbox["required"].as_array().expect("required list");
+            assert!(
+                !required.iter().any(|name| name == field),
+                "{field} is optional because counts can be unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_output_schema_publishes_tagged_text_and_base64_alternatives() {
+        let schema = schema_for_output::<ToolEnvelope<GetAttachmentData>>().expect("valid schema");
+        let root = serde_json::Value::Object(schema.as_ref().clone());
+        let data = &root["$defs"]["GetAttachmentData"];
+        for field in [
+            "status",
+            "issues",
+            "account_id",
+            "message_id",
+            "part_id",
+            "attachment",
+            "next_action",
+        ] {
+            assert!(data["properties"].get(field).is_some(), "{field} missing");
+        }
+        let required = data["required"].as_array().expect("required list");
+        for optional in ["attachment", "next_action"] {
+            assert!(!required.iter().any(|name| name == optional), "{optional}");
+        }
+
+        let result = &root["$defs"]["AttachmentResult"];
+        for field in ["filename", "content_type", "size_bytes", "content"] {
+            assert!(result["properties"].get(field).is_some(), "{field} missing");
+        }
+        let alternatives = root["$defs"]["AttachmentContent"]["oneOf"]
+            .as_array()
+            .expect("tagged enum publishes alternatives");
+        let by_format = |format: &str| {
+            alternatives
+                .iter()
+                .find(|variant| variant["properties"]["format"]["const"] == format)
+                .unwrap_or_else(|| panic!("missing {format} alternative"))
+        };
+        let text = by_format("text");
+        for field in ["text", "truncated"] {
+            assert!(text["properties"].get(field).is_some(), "{field} missing");
+        }
+        let base64 = by_format("base64");
+        for field in [
+            "content_base64",
+            "offset_bytes",
+            "returned_bytes",
+            "has_more",
+        ] {
+            assert!(base64["properties"].get(field).is_some(), "{field} missing");
+        }
+        assert_eq!(alternatives.len(), 2);
     }
 
     pub(super) fn schema_test_server_config() -> ServerConfig {

@@ -54,6 +54,8 @@ pub(crate) fn mailbox_info_from_parts(
         role,
         selectable,
         provider_managed,
+        total_messages: None,
+        unread_messages: None,
     }
 }
 
@@ -118,7 +120,7 @@ mod tests {
         ];
         let mailbox = mailbox_info_from_parts("inbox", Some("/"), &attributes, true);
 
-        assert_eq!(mailbox.name, "inbox");
+        assert_eq!(mailbox.name, "INBOX");
         assert_eq!(mailbox.role, Some(MailboxRole::Inbox));
         assert!(!mailbox.selectable);
         assert!(mailbox.provider_managed);
