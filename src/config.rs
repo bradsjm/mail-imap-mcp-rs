@@ -201,17 +201,13 @@ fn load_account(segment: &str) -> AppResult<AccountConfig> {
     })
 }
 
-/// Read a required environment variable, returning error if missing or empty
+/// Read a required environment variable, returning an error naming the key if missing or empty.
 fn required_env(key: &str) -> AppResult<String> {
     match env::var(key) {
         Ok(v) if !v.trim().is_empty() => Ok(v),
-        _ => {
-            let var_name = key.strip_prefix("MAIL_IMAP_").unwrap_or(key);
-            let suffix = var_name.split('_').next_back().unwrap_or(var_name);
-            Err(AppError::InvalidInput(format!(
-                "No IMAP accounts configured. Set MAIL_IMAP_<ID>_HOST/USER/PASS.\nmail-imap-mcp-rs startup error: missing {suffix}."
-            )))
-        }
+        _ => Err(AppError::InvalidInput(format!(
+            "missing required environment variable: {key}"
+        ))),
     }
 }
 
@@ -398,6 +394,19 @@ mod tests {
         assert!(err.to_string().contains("must not be empty"));
 
         unsafe { std::env::remove_var(key) };
+    }
+
+    #[test]
+    fn required_env_names_the_missing_key() {
+        let _guard = env_lock().lock().expect("env lock");
+        let key = "MAIL_IMAP_TEST_REQUIRED_USER";
+        unsafe { std::env::remove_var(key) };
+
+        let err = super::required_env(key).expect_err("missing variable must fail");
+        assert_eq!(
+            err.to_string(),
+            format!("invalid input: missing required environment variable: {key}")
+        );
     }
 
     #[test]

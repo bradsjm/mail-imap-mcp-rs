@@ -424,6 +424,20 @@ async fn reject_nonselect_mailbox(
     Ok(())
 }
 
+/// Convert a failed `EXAMINE` or `SELECT` into an application error.
+///
+/// Only a tagged `NO` reply means the server refused the mailbox name, so only
+/// that reply is reported as `NotFound`. Transport, parse, and other failures
+/// stay `Internal` so callers do not treat them as a missing mailbox.
+fn mailbox_open_error(verb: &str, mailbox: &str, error: async_imap::error::Error) -> AppError {
+    match error {
+        async_imap::error::Error::No(_) => AppError::NotFound(format!(
+            "cannot open mailbox '{mailbox}' with {verb}: {error}"
+        )),
+        _ => AppError::Internal(format!("{verb} failed for mailbox '{mailbox}': {error}")),
+    }
+}
+
 /// Select mailbox in read-only mode
 ///
 /// Uses `EXAMINE` command to fetch mailbox state without marking messages
@@ -439,12 +453,10 @@ pub async fn select_mailbox_readonly(
     let selected = timeout(socket_timeout(server), session.examine(&encoded_mailbox))
         .await
         .map_err(|_| AppError::Timeout(format!("EXAMINE timed out for mailbox '{mailbox}'")))
-        .and_then(|r| {
-            r.map_err(|e| AppError::NotFound(format!("cannot examine mailbox '{mailbox}': {e}")))
-        })?;
+        .and_then(|r| r.map_err(|e| mailbox_open_error("EXAMINE", mailbox, e)))?;
     selected
         .uid_validity
-        .ok_or_else(|| AppError::Internal("mailbox missing UIDVALIDITY".to_owned()))
+        .ok_or_else(|| AppError::Internal(format!("mailbox '{mailbox}' missing UIDVALIDITY")))
 }
 
 /// Select mailbox in read-write mode
@@ -462,12 +474,10 @@ pub async fn select_mailbox_readwrite(
     let selected = timeout(socket_timeout(server), session.select(&encoded_mailbox))
         .await
         .map_err(|_| AppError::Timeout(format!("SELECT timed out for mailbox '{mailbox}'")))
-        .and_then(|r| {
-            r.map_err(|e| AppError::NotFound(format!("cannot select mailbox '{mailbox}': {e}")))
-        })?;
+        .and_then(|r| r.map_err(|e| mailbox_open_error("SELECT", mailbox, e)))?;
     selected
         .uid_validity
-        .ok_or_else(|| AppError::Internal("mailbox missing UIDVALIDITY".to_owned()))
+        .ok_or_else(|| AppError::Internal(format!("mailbox '{mailbox}' missing UIDVALIDITY")))
 }
 
 /// Fetch a single message with custom query
@@ -720,6 +730,24 @@ mod tests {
             imap_port: parse_test_port("GREENMAIL_IMAP_PORT", 3143),
             user: std::env::var("GREENMAIL_USER").unwrap_or_else(|_| "test@localhost".to_owned()),
             pass: std::env::var("GREENMAIL_PASS").unwrap_or_else(|_| "test".to_owned()),
+        }
+    }
+
+    #[test]
+    fn mailbox_open_error_reports_not_found_only_for_no_replies() {
+        use super::mailbox_open_error;
+        use crate::errors::AppError;
+        use async_imap::error::Error as ImapError;
+
+        let no = mailbox_open_error(
+            "SELECT",
+            "Gone",
+            ImapError::No("no such mailbox".to_owned()),
+        );
+        assert!(matches!(no, AppError::NotFound(_)), "{no:?}");
+        for error in [ImapError::ConnectionLost, ImapError::Bad("bad".to_owned())] {
+            let mapped = mailbox_open_error("EXAMINE", "INBOX", error);
+            assert!(matches!(mapped, AppError::Internal(_)), "{mapped:?}");
         }
     }
 

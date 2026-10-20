@@ -38,6 +38,7 @@ use rmcp::transport::{
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::net::IpAddr;
+use std::process::ExitCode;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::level_filters::LevelFilter;
@@ -90,7 +91,19 @@ enum HttpBindPolicy {
 ///
 /// See [`ServerConfig::load_from_env`] for full configuration options.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            // Print the readable message to stderr, which stdout-based MCP framing does not use.
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run the server after argument parsing, tracing setup, and config loading.
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
     let args = match CliArgs::try_parse() {
